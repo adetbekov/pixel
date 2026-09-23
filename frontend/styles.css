@@ -324,6 +324,19 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
 .metric-lead b { color: var(--accent); }
 .metric b.muted { font-size: 15px; font-weight: 600; color: var(--text-dim); }
 
+/* Главная метрика занимает всю ширину панели: полоса обучения читается в длину,
+   а в колонке 150px от неё остаётся огрызок. */
+.metric-share { grid-column: 1 / -1; }
+.metric-share b { font-size: 30px; }
+.metric-bar {
+  height: 8px; margin: 8px 0 6px; border-radius: 999px; overflow: hidden;
+  background: var(--surface); border: 1px solid var(--line);
+}
+.metric-bar i { display: block; height: 100%; background: var(--accent); transition: width .35s ease; }
+.metric-share small { font-size: 12px; color: var(--text-dim); }
+
+@media (prefers-reduced-motion: reduce) { .metric-bar i { transition: none; } }
+
 .cols { display: grid; gap: 20px; align-items: start; }
 @media (min-width: 900px) { .cols { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); } }
 

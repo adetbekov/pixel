@@ -9,17 +9,17 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import timedelta
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, StringConstraints
 
-from . import db
+from . import db, feedback
 from .actions import Action, validate_plan
 from .brain.engine import get_engine
 from .brain.router import RouterHit, route
 from .brain.skill import load_skills, parse_skill
+from .metrics import collect as collect_metrics
 from .miner import mine_once, mining_due
 from .state import apply_actions, iso, read_state, utcnow
 from .teacher import get_teacher, log_case
@@ -27,6 +27,11 @@ from .teacher import get_teacher, log_case
 router = APIRouter(prefix="/api")
 
 LOW_ENERGY_FOR_PLAY = 20.0
+
+#: How much chat `GET /api/history` redraws after a reload, and the ceiling a
+#: caller may ask for — the chat is a conversation, not an archive.
+DEFAULT_HISTORY = 30
+MAX_HISTORY = 200
 
 # A chat call costs a forward pass behind the engine's single lock, so an unbounded
 # body is one caller stalling every other chat. Laya's context is 1024 tokens and a
@@ -126,6 +131,21 @@ class SkillCard(BaseModel):
     uses: int = 0
     likes: int = 0
     dislikes: int = 0
+    #: Why a disabled skill is off — `"dislike_rate"` is the only automatic one.
+    disabled_reason: str | None = None
+
+
+class HistoryItem(BaseModel):
+    """One past interaction, enough to redraw its chat bubble and its vote."""
+
+    interaction_id: int
+    user_text: str
+    reply: str
+    engine: str
+    skill_id: str | None = None
+    confidence: float | None = None
+    latency_ms: int = 0
+    feedback: int | None = None
 
 
 class Proposal(BaseModel):
@@ -146,6 +166,11 @@ class Metrics(BaseModel):
     #: Teacher calls in the last 24h — Gemini is the only thing here that costs
     #: money, so the spend is visible without opening the console.
     teacher_calls_24h: int = 0
+    #: The same headline share over the last 24h: the lifetime number moves
+    #: slowly once there is history behind it, this one shows today's trend.
+    laya_share_24h: float = 0.0
+    gemini_calls_24h: int = 0
+    skills_disabled: int = 0
 
 
 def _log_interaction(
@@ -336,16 +361,50 @@ def post_chat(payload: ChatIn) -> dict:
 
 @router.post("/feedback", response_model=Ok)
 def post_feedback(payload: FeedbackIn) -> dict:
+    """Store the vote — and, on a 👎, let it cost the skill behind it.
+
+    Re-rating the same interaction overwrites the earlier value; the skill's
+    health is recounted from the table afterwards, so a flipped vote flips the
+    verdict with it. See `backend/feedback.py`.
+    """
     conn = db.get_conn()
     with db.lock:
-        cursor = conn.execute(
-            "UPDATE interactions SET feedback = ? WHERE id = ?",
-            (payload.value, payload.interaction_id),
+        known = feedback.record(
+            conn, interaction_id=payload.interaction_id, value=payload.value
         )
-        conn.commit()
-    if cursor.rowcount == 0:
+    if not known:
         raise HTTPException(status_code=404, detail="unknown interaction_id")
     return {"ok": True}
+
+
+@router.get("/history", response_model=list[HistoryItem])
+def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
+    """The last interactions, oldest first — what the chat redraws after a reload.
+
+    Without this the votes survive the reload in the database but vanish from
+    the screen, which reads as "my 👎 was not saved".
+    """
+    limit = max(1, min(limit, MAX_HISTORY))
+    conn = db.get_conn()
+    with db.lock:
+        rows = conn.execute(
+            "SELECT id, user_text, reply_text, engine, skill_id, confidence, latency_ms,"
+            " feedback FROM interactions ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "interaction_id": row["id"],
+            "user_text": row["user_text"],
+            "reply": row["reply_text"],
+            "engine": row["engine"],
+            "skill_id": row["skill_id"],
+            "confidence": row["confidence"],
+            "latency_ms": row["latency_ms"],
+            "feedback": row["feedback"],
+        }
+        for row in reversed(rows)
+    ]
 
 
 @router.get("/skills", response_model=list[SkillCard])
@@ -354,14 +413,25 @@ def get_skills() -> list[dict]:
     conn = db.get_conn()
     with db.lock:
         skills = load_skills(conn)
+        reasons = {
+            row["id"]: row["disabled_reason"]
+            for row in conn.execute("SELECT id, disabled_reason FROM skills")
+        }
         stats = conn.execute(
             # `IS` rather than `=` so an un-rated interaction (feedback NULL)
             # counts as 0 instead of turning the whole SUM into NULL.
-            "SELECT skill_id,"
+            #
+            # `i.ts >= s.created_at` is the same incarnation boundary
+            # `backend/feedback.py` judges a skill over: a skill re-mined and
+            # accepted under an id it once held must not open its card on the
+            # previous life's "👎 4 · использован 10 раз". The join also replaces
+            # the old `skill_id IS NOT NULL` — a Gemini answer joins to no skill.
+            "SELECT i.skill_id AS skill_id,"
             " COUNT(*) AS uses,"
-            " SUM(feedback IS 1) AS likes,"
-            " SUM(feedback IS -1) AS dislikes"
-            " FROM interactions WHERE skill_id IS NOT NULL GROUP BY skill_id"
+            " SUM(i.feedback IS 1) AS likes,"
+            " SUM(i.feedback IS -1) AS dislikes"
+            " FROM interactions i JOIN skills s ON s.id = i.skill_id"
+            " WHERE i.ts >= s.created_at GROUP BY i.skill_id"
         ).fetchall()
 
     unused = {"uses": 0, "likes": 0, "dislikes": 0}
@@ -373,6 +443,7 @@ def get_skills() -> list[dict]:
             "description": skill.description,
             "status": skill.status,
             "origin": skill.origin,
+            "disabled_reason": reasons.get(skill.id),
             **counts.get(skill.id, unused),
         }
         for skill in skills
@@ -413,6 +484,12 @@ def accept_proposal(proposal_id: str) -> dict:
     reads the library with `load_skills` on every request, so the next command
     is already routed against the new skill. It lands at the end of the option
     list — which is exactly the order the backtest tried it in.
+
+    A **disabled** skill's id is free, so a retry of a skill stage 5 turned off
+    overwrites that row instead of colliding with its primary key. The miner is
+    the other half of that rule (`backend/miner/run.py`, `_taken_ids`): without
+    both, the retry is either refused before it is drafted or accepted into a
+    500.
     """
     conn = db.get_conn()
     with db.lock:
@@ -426,12 +503,22 @@ def accept_proposal(proposal_id: str) -> dict:
         skill = parse_skill(json.loads(row["skill_json"]))
         if skill is None:
             raise HTTPException(status_code=422, detail="the proposed skill no longer validates")
-        if conn.execute("SELECT 1 FROM skills WHERE id = ?", (skill.id,)).fetchone():
+        # Only a row that says `disabled` may be overwritten — a NULL status is
+        # not a free id, it is a row nobody can vouch for.
+        existing = conn.execute(
+            "SELECT status FROM skills WHERE id = ?", (skill.id,)
+        ).fetchone()
+        if existing is not None and existing["status"] != "disabled":
             raise HTTPException(status_code=409, detail=f"skill {skill.id} already exists")
 
         skill = skill.model_copy(update={"status": "active", "origin": "mined"})
+        # `disabled_at` / `disabled_reason` are written back as NULL rather than
+        # left behind: the row is a different skill now, and a fresh card
+        # carrying the old one's "отключён из-за дизлайков" is a lie.
         conn.execute(
-            "INSERT INTO skills (id, json, status, origin, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO skills"
+            " (id, json, status, origin, created_at, disabled_at, disabled_reason)"
+            " VALUES (?, ?, ?, ?, ?, NULL, NULL)",
             (skill.id, skill.model_dump_json(), skill.status, skill.origin, iso(utcnow())),
         )
         conn.execute("UPDATE skill_proposals SET status = 'accepted' WHERE id = ?", (proposal_id,))
@@ -471,41 +558,7 @@ def post_mine() -> dict:
 
 @router.get("/metrics", response_model=Metrics)
 def get_metrics() -> dict:
+    """Every number the learning panel shows. The SQL lives in `backend/metrics.py`."""
     conn = db.get_conn()
     with db.lock:
-        rows = conn.execute(
-            "SELECT engine, COUNT(*) AS n, AVG(latency_ms) AS avg_ms"
-            " FROM interactions GROUP BY engine"
-        ).fetchall()
-        skills_active = conn.execute(
-            "SELECT COUNT(*) AS n FROM skills WHERE status = 'active'"
-        ).fetchone()["n"]
-        # `teacher_log` has no timestamp column, so the age comes from the
-        # interaction it belongs to. `iso()` always renders UTC with a fixed
-        # date-time prefix, so comparing the strings orders the instants — the
-        # optional `.ffffff` only ever appears after the part that differs.
-        since = iso(utcnow() - timedelta(hours=24))
-        teacher_calls = conn.execute(
-            "SELECT COUNT(*) AS n FROM teacher_log t"
-            " JOIN interactions i ON i.id = t.interaction_id"
-            " WHERE i.ts >= ?",
-            (since,),
-        ).fetchone()["n"]
-
-    by_engine = {row["engine"]: row for row in rows}
-    laya = by_engine.get("laya")
-    gemini = by_engine.get("gemini")
-    laya_n = laya["n"] if laya else 0
-    gemini_n = gemini["n"] if gemini else 0
-    total = sum(row["n"] for row in rows)
-    routed = laya_n + gemini_n
-
-    return {
-        # The headline learning metric: share of understood commands Laya handled alone.
-        "laya_share": round(laya_n / routed, 3) if routed else 0.0,
-        "avg_latency_laya_ms": round(laya["avg_ms"], 1) if laya else 0.0,
-        "avg_latency_gemini_ms": round(gemini["avg_ms"], 1) if gemini else 0.0,
-        "skills_active": int(skills_active),
-        "total_commands": int(total),
-        "teacher_calls_24h": int(teacher_calls),
-    }
+        return collect_metrics(conn)

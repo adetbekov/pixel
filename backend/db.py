@@ -1,7 +1,8 @@
 """SQLite access. Single-user prototype: one connection, one module-level lock.
 
 The whole schema is created up front — including the tables stages 2-4 will fill
-— so no stage needs a migration.
+— so no stage needs a *table*. Columns a later stage turned out to need are added
+by :func:`migrate`, which runs on every connect and is a no-op once applied.
 """
 
 from __future__ import annotations
@@ -66,9 +67,37 @@ CREATE TABLE IF NOT EXISTS skill_proposals (
 );
 """
 
+#: Columns added after the schema above was frozen, as ``table -> column -> type``.
+#: Applied on every connect, so a ``pixel.db`` written by an earlier stage is
+#: upgraded in place instead of having to be deleted.
+MIGRATIONS: dict[str, dict[str, str]] = {
+    # Stage 5 turns a skill off when its dislike rate is too high. `status` alone
+    # cannot say *when* that happened or *why*, and the skills panel has to tell
+    # the user both — an unexplained disappearance reads as a bug.
+    "skills": {
+        "disabled_at": "TEXT",
+        "disabled_reason": "TEXT",
+    },
+}
+
 lock = threading.Lock()
 
 _conn: sqlite3.Connection | None = None
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Add every missing column from :data:`MIGRATIONS`. Idempotent by design.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so the columns already present
+    are read from ``PRAGMA table_info`` first. Running this twice is a no-op,
+    which is what lets it sit on the ordinary connect path.
+    """
+    for table, columns in MIGRATIONS.items():
+        present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, column_type in columns.items():
+            if column not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    conn.commit()
 
 
 def db_path() -> str:
@@ -84,6 +113,7 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    migrate(conn)
     conn.execute(
         "INSERT OR IGNORE INTO robot_state (id, mood, energy, fullness, face, last_tick_at)"
         " VALUES (1, ?, ?, ?, ?, ?)",

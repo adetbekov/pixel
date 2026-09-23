@@ -25,6 +25,7 @@ export const getState     = () => request('/state');
 export const chat         = (text) => post('/chat', { text });
 export const action       = (name) => post('/action', { name });
 export const feedback     = (interactionId, value) => post('/feedback', { interaction_id: interactionId, value });
+export const getHistory   = () => request('/history');
 export const getSkills    = () => request('/skills');
 export const getProposals = () => request('/proposals');
 export const getMetrics   = () => request('/metrics');
