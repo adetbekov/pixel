@@ -6,7 +6,9 @@ pipeline: the real clustering, the real draft schema, the real backtest and the
 real endpoints.
 """
 
+import inspect
 import json
+import math
 
 import httpx
 import pytest
@@ -15,8 +17,10 @@ from backend.brain.engine import set_engine
 from backend.brain.skill import load_skills
 from backend.main import app
 from backend.miner import MineResult, mine_once, set_generator
+from backend.miner.generate import TIMEOUT_S, GeminiSkillGenerator
+from backend.teacher.client import MIN_SERVER_DEADLINE_S
 
-from .fakes import FakeEngine
+from .fakes import FakeEngine, FakeGeminiClient
 from .trick_cluster import (
     LATER_TRICK,
     TRICK_COMMANDS,
@@ -275,7 +279,7 @@ async def test_a_second_attempt_is_given_the_reason_the_first_failed(
     fake = generator(draft_json(description="ц" * 200), draft_json())
     fill_pool(seeded)
     assert (await client.post("/api/mine")).json()["proposals"] == 1
-    assert "Предыдущий ответ не прошёл проверку" in fake.calls[1]["input"]
+    assert "Предыдущий ответ не прошёл проверку" in fake.calls[1]["contents"]
 
 
 @pytest.mark.anyio
@@ -287,9 +291,10 @@ async def test_the_generator_is_asked_with_the_miner_model_and_the_skill_schema(
     await client.post("/api/mine")
 
     call = fake.calls[0]
+    config = call["config"]
     assert call["model"] == "fake-model"
-    assert call["response_format"]["mime_type"] == "application/json"
-    assert set(call["response_format"]["schema"]["properties"]) == {
+    assert config["response_mime_type"] == "application/json"
+    assert set(config["response_schema"]["properties"]) == {
         "id",
         "name",
         "description",
@@ -299,8 +304,130 @@ async def test_the_generator_is_asked_with_the_miner_model_and_the_skill_schema(
     # The cluster and the teacher's plans both go in — the plans are what make
     # the generated rules resemble what the teacher actually did.
     for command in TRICK_COMMANDS:
-        assert command in call["input"]
-    assert "spin(), set_face(happy)" in call["input"]
+        assert command in call["contents"]
+    assert "spin(), set_face(happy)" in call["contents"]
+
+
+@pytest.mark.anyio
+async def test_the_miner_budget_reaches_the_api_in_milliseconds_and_as_a_floor(
+    client, seeded, miner_engine, generator
+):
+    """The two numbers JEB-1540 exists to get right.
+
+    `http_options.timeout` is milliseconds on this path — passing `TIMEOUT_S`
+    raw would cut every miner call to 30 ms. And `X-Server-Timeout` is a floor,
+    not `MIN_SERVER_DEADLINE_S`: the miner's budget is 30 s, three times the
+    API's minimum, so pinning the header at 10 would have the server abandon a
+    call httpx is still waiting out — the one place the teacher's constant would
+    have been wrong here.
+    """
+    fake = generator(draft_json())
+    fill_pool(seeded)
+    await client.post("/api/mine")
+
+    http_options = fake.calls[0]["config"]["http_options"]
+    assert http_options["timeout"] == int(TIMEOUT_S * 1000)
+    assert TIMEOUT_S > MIN_SERVER_DEADLINE_S, "otherwise this test proves nothing"
+    assert http_options["headers"]["X-Server-Timeout"] == str(math.ceil(TIMEOUT_S))
+
+
+def test_the_sdk_still_has_the_surface_the_miner_calls():
+    """That the *real* SDK takes what `GeminiSkillGenerator._call` passes it.
+
+    `FakeGeminiClient` accepts any keyword, so every other test here proves only
+    that the code *sends* the argument. `config` is a plain dict, so a renamed
+    field would not even raise — it would ride along to the API, the draft would
+    come back fenced, `propose` would return `None`, and the miner would go
+    silent with CI still green. That is exactly the defect JEB-1513 found in the
+    teacher and this task's sibling of it. Constructing the client needs no
+    network and no real key.
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key="not-a-real-key-and-never-sent")
+    parameters = inspect.signature(type(client.models).generate_content).parameters
+    assert {"model", "contents", "config"} <= set(parameters)
+
+    assert {
+        "system_instruction",
+        "response_mime_type",
+        "response_schema",
+        "http_options",
+    } <= set(types.GenerateContentConfig.model_fields)
+    assert {"timeout", "headers"} <= set(types.HttpOptions.model_fields)
+    assert hasattr(types.GenerateContentResponse, "text")
+
+    # The floor only holds because the SDK fills `X-Server-Timeout` from the
+    # timeout *only* when we have not set it ourselves.
+    from google.genai._api_client import populate_server_timeout_header
+
+    headers = {"X-Server-Timeout": "30"}
+    populate_server_timeout_header(headers, 30.0)
+    assert headers["X-Server-Timeout"] == "30"
+
+
+@pytest.mark.anyio
+async def test_a_fenced_draft_is_not_parsed(client, seeded, miner_engine, generator, caplog):
+    """The fences stay a failure here too, deliberately.
+
+    ` ```json ` around an otherwise valid draft is what `interactions.create`
+    returned on `models/gemini-2.5-flash-lite`, and it is the *whole* visible
+    symptom of the wrong call shape on this path: offline there is no timeout
+    and no error page, only a cluster that quietly goes back in the pool and a
+    `/api/proposals` that stays empty forever. So a fenced answer must still be
+    retried and still end without a proposal — stripping the fence in `_parse`
+    would hide a regression back onto `interactions.create` instead of failing
+    on it, which is why this test exists rather than a lenient parser.
+
+    The mirror of `tests/test_teacher.py::test_a_fenced_response_is_not_parsed`.
+    """
+    fake = generator(f"```json\n{draft_json()}\n```")
+    fill_pool(seeded)
+
+    with caplog.at_level("WARNING", logger="backend.miner.generate"):
+        assert (await client.post("/api/mine")).json()["proposals"] == 0
+    assert (await client.get("/api/proposals")).json() == []
+
+    assert len(fake.calls) == 2, "a fenced draft is retried like any other bad response"
+    assert "did not match the schema" in caplog.text
+
+
+def test_the_fallback_grouping_goes_out_the_same_way():
+    """`group()` shares `_call`, so it shared the defect — and hides it better.
+
+    The fallback grouping only runs when the local Laya vectors are unavailable,
+    so a broken call shape here shows up as nothing at all: `group` swallows the
+    parse error and returns `[]`, which reads as "no clusters" rather than as a
+    failure. Pin both halves — the shape that goes out, and that a bare-JSON
+    answer comes back parsed.
+    """
+    fake = FakeGeminiClient(json.dumps({"groups": [[0, 1], [2]]}))
+    generator = GeminiSkillGenerator(client=fake, model="fake-model")
+
+    assert generator.group(["покажи фокус", "сделай фокус", "станцуй"]) == [[0, 1], [2]]
+
+    call = fake.calls[0]
+    assert call["model"] == "fake-model"
+    assert call["config"]["response_mime_type"] == "application/json"
+    assert "groups" in call["config"]["response_schema"]["properties"]
+    assert "покажи фокус" in call["contents"]
+
+
+def test_a_fenced_grouping_is_not_parsed():
+    """And the fence is a failure on this path too — an empty, silent one."""
+    fake = FakeGeminiClient('```json\n{"groups": [[0, 1]]}\n```')
+    generator = GeminiSkillGenerator(client=fake, model="fake-model")
+
+    assert generator.group(["покажи фокус", "сделай фокус"]) == []
+
+
+@pytest.mark.anyio
+async def test_the_same_draft_unfenced_is_proposed(client, seeded, miner_engine, generator):
+    """The control for the test above: the fence is the only thing wrong."""
+    generator(draft_json())
+    fill_pool(seeded)
+    assert (await client.post("/api/mine")).json()["proposals"] == 1
 
 
 @pytest.mark.anyio

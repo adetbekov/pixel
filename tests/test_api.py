@@ -233,3 +233,12 @@ async def test_metrics(client):
     assert body["total_commands"] == 0
     # No Laya and no Gemini yet — the share must not divide by zero.
     assert body["laya_share"] == 0.0
+
+
+@pytest.mark.anyio
+async def test_favicon_is_served(client):
+    # The browser asks for /favicon.ico on every page load, with or without a
+    # <link rel="icon">; without the file StaticFiles answers 404 and that red
+    # line is the only thing in the console (JEB-1526).
+    assert (await client.get("/favicon.ico")).status_code == 200
+    assert (await client.get("/favicon.svg")).status_code == 200

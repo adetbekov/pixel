@@ -10,6 +10,7 @@ exception, and none of them show the user a traceback. The worst case is
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import Callable
@@ -36,14 +37,23 @@ log = logging.getLogger(__name__)
 #: Careful if a thinking budget is ever added here: `models/gemini-2.5-flash-lite`
 #: rejects `thinking_budget=1` with `400 INVALID_ARGUMENT` and wants >= 512
 #: (measured in split the bill, `src/services/gemini_thinking_budget.py`). The
-#: teacher passes no budget today — don't add one without that floor.
+#: teacher passes no budget today, and measured live that costs nothing:
+#: `thoughts_token_count` came back 0-2 on real teacher prompts.
 #:
-#: TODO: once `GEMINI_API_KEY` lands (JEB-1508), confirm against
-#: `client.models.list()` that the model is visible and that this is the id form
-#: the live call accepts. Overridable via `GEMINI_TEACHER_MODEL` either way.
+#: Confirmed live on 2026-09-24 against `client.models.list()`: this exact id,
+#: `models/` prefix included, is in the listing — 61 models, and the only
+#: 2.5-flash-lite entry among them. The call also accepts the bare
+#: `gemini-2.5-flash-lite`, so the prefix here is the catalog's own spelling
+#: rather than a requirement. Overridable via `GEMINI_TEACHER_MODEL` either way.
 DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
 
 #: Per-call ceiling, as JEB-1500 specifies.
+#:
+#: Confirmed live on 2026-09-24 that `_call` converts this correctly:
+#: `http_options.timeout` is in MILLISECONDS. A bare `timeout=1`, `3` or `5`
+#: aborts the request client-side, while `timeout=2000`/`3000` completes in
+#: ~1.4 s. The 3 and the 5 are what settle it: as seconds both would have been
+#: ample for a ~1.4 s call, and both aborted anyway.
 TIMEOUT_S = 8.0
 
 #: Ceiling across *all* attempts. Without it a retried timeout costs the user
@@ -65,7 +75,8 @@ MIN_CALL_BUDGET_S = 1.0
 #: ``models/gemini-2.5-flash-lite``: anything that rounds below 10 s is rejected
 #: outright — ``400 INVALID_ARGUMENT: Manually set deadline 8s is too short.
 #: Minimum allowed deadline is 10s`` — so our 8 s budget cannot be the header.
-#: 9400 ms passes, 9000 ms does not.
+#: 9400 ms passes, 9000 ms does not. Re-confirmed 2026-09-24: drop the header
+#: and an 8000 ms call still fails with exactly that 400.
 #:
 #: The SDK only fills the header in when it is absent, so :meth:`_call` sets it
 #: explicitly: the server gets its legal minimum, httpx still aborts at *our*
@@ -163,8 +174,8 @@ class GeminiTeacher:
         :data:`FALLBACK_PLAN` behind a single ``log.warning`` while
         ``teacher_log`` filled with fallbacks and starved the miner. The same
         model on ``models.generate_content`` with ``response_schema`` returns
-        bare JSON. The miner made the same move for the same reason
-        (``backend/miner/generate.py``).
+        bare JSON. The miner made the same move for the same reason in JEB-1540
+        (``backend/miner/generate.py``), so the two halves call alike.
 
         The fences are a symptom of the wrong call shape, not a response format
         to support: ``_parse`` stays strict — it is what made this visible.
@@ -191,7 +202,18 @@ class GeminiTeacher:
                     # which has a 10 s floor. See `MIN_SERVER_DEADLINE_S`: this
                     # header keeps the request legal without lengthening the
                     # client-side wait above.
-                    "headers": {"X-Server-Timeout": str(MIN_SERVER_DEADLINE_S)},
+                    #
+                    # It is a floor, not a constant. With today's `TIMEOUT_S`
+                    # the budget never reaches 10 s, so the floor always wins —
+                    # but raise `TIMEOUT_S` above 10 and announcing a flat 10 s
+                    # would have the server cut the call short of a budget httpx
+                    # is still happily waiting out. `ceil` because the SDK
+                    # rounds the same way (`populate_server_timeout_header`),
+                    # and two roundings that differ are one more way for these
+                    # numbers to drift apart.
+                    "headers": {
+                        "X-Server-Timeout": str(max(MIN_SERVER_DEADLINE_S, math.ceil(timeout))),
+                    },
                 },
             },
         )

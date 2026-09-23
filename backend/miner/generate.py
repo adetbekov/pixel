@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any, Protocol
 
@@ -26,10 +27,14 @@ from pydantic import ValidationError
 from ..actions import ACTIONS, MAX_PLAN_LEN
 from ..brain.skill import STATE_KEYS, STATE_VALUES, Skill
 
-# The library description the teacher is handed, verbatim. Two prompts listing
-# the same eight primitives would drift apart on the very next stage, and this
-# one is the more dangerous place to drift: what the teacher gets wrong costs one
-# reply, what the miner gets wrong is baked into a skill.
+# `MIN_SERVER_DEADLINE_S` is a property of the API, not of either caller, so both
+# halves read it from the one place it was measured.
+#
+# `ACTION_LIST` is the library description the teacher is handed, verbatim. Two
+# prompts listing the same eight primitives would drift apart on the very next
+# stage, and this one is the more dangerous place to drift: what the teacher gets
+# wrong costs one reply, what the miner gets wrong is baked into a skill.
+from ..teacher.client import MIN_SERVER_DEADLINE_S
 from ..teacher.prompt import ACTION_LIST
 from .case import Case
 from .schema import MAX_DESCRIPTION_LEN, MAX_RULES, Grouping, SkillDraft
@@ -163,18 +168,49 @@ class GeminiSkillGenerator:
         return self._client
 
     def _call(self, system: str, prompt: str, schema: dict[str, Any]) -> str:
-        interaction = self._ensure_client().interactions.create(
+        """One round trip, over ``models.generate_content``.
+
+        Not ``interactions.create``, which is what this used to call — the same
+        move the teacher made in JEB-1513, for the same measured reason: on
+        ``models/gemini-2.5-flash-lite`` that call shape ignores
+        ``response_format`` and answers inside a ```` ```json ```` fence, which
+        :func:`_parse` rejects on both attempts. Offline, that failure is
+        *silent*: :meth:`propose` returns ``None``, the cluster goes back in the
+        pool, and no proposal ever appears — the one metric the project is
+        judged on simply stops moving. ``response_schema`` on this path returns
+        bare JSON.
+
+        ``config`` is a plain dict rather than ``types.GenerateContentConfig``
+        so that ``google.genai`` stays off the import path of a key-less app,
+        exactly like the lazy client construction above.
+        ``tests/test_proposals_api.py::test_the_sdk_still_has_the_surface_the_miner_calls``
+        asserts the field names against the installed package instead.
+        """
+        response = self._ensure_client().models.generate_content(
             model=self._model,
-            input=prompt,
-            system_instruction=system,
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": schema,
+            contents=prompt,
+            config={
+                "system_instruction": system,
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+                "http_options": {
+                    # On this path the timeout lives in `http_options`, and there
+                    # it is in MILLISECONDS — `TIMEOUT_S` seconds x 1000.
+                    "timeout": int(TIMEOUT_S * 1000),
+                    # The same value also becomes the server deadline, which has
+                    # a 10 s floor (`MIN_SERVER_DEADLINE_S`). A floor, not a
+                    # constant: the miner's budget is 30 s, well above it, and
+                    # announcing a flat 10 s would have the server cut the call
+                    # short of a budget httpx is still happily waiting out.
+                    # `ceil` because the SDK rounds the same way
+                    # (`populate_server_timeout_header`).
+                    "headers": {
+                        "X-Server-Timeout": str(max(MIN_SERVER_DEADLINE_S, math.ceil(TIMEOUT_S))),
+                    },
+                },
             },
-            timeout=TIMEOUT_S,
         )
-        return interaction.output_text or ""
+        return response.text or ""
 
     def propose(self, cases: list[Case], skills: list[Skill]) -> Skill | None:
         prompt = build_input(cases, skills)

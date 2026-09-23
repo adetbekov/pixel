@@ -4,8 +4,7 @@
 client inside :class:`backend.teacher.client.GeminiTeacher` and
 :class:`backend.miner.generate.GeminiSkillGenerator`, both of which take their
 client as an argument precisely so the retry and fallback paths are testable.
-One instance carries both call surfaces — ``models`` for the teacher,
-``interactions`` for the miner — off a single script.
+Both now call ``models.generate_content``, so one scripted surface serves both.
 """
 
 import hashlib
@@ -90,11 +89,6 @@ class FakeEngine(SingleQuestionMixin):
 
 
 @dataclass
-class FakeInteraction:
-    output_text: str
-
-
-@dataclass
 class FakeResponse:
     text: str
 
@@ -119,18 +113,8 @@ class FakeScript:
         return answer
 
 
-class FakeInteractions:
-    """``client.interactions`` — the miner's call surface."""
-
-    def __init__(self, script: FakeScript) -> None:
-        self._script = script
-
-    def create(self, **kwargs: Any) -> FakeInteraction:
-        return FakeInteraction(output_text=self._script.answer(kwargs))
-
-
 class FakeModels:
-    """``client.models`` — the teacher's, which the cheap tier forced it onto."""
+    """``client.models`` — the one surface, which the cheap tier forced both onto."""
 
     def __init__(self, script: FakeScript) -> None:
         self._script = script
@@ -142,7 +126,6 @@ class FakeModels:
 class FakeGeminiClient:
     def __init__(self, *script: Any) -> None:
         self._script = FakeScript(list(script))
-        self.interactions = FakeInteractions(self._script)
         self.models = FakeModels(self._script)
 
     @property

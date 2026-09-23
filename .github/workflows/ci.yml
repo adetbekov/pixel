@@ -83,6 +83,17 @@ jobs:
       - name: Lint JS
         run: npx eslint frontend
 
+      # JEB-1521: статус отключённого навыка и причина отключения читались на
+      # 1.70:1 и 2.18:1 — `opacity` на карточке гасила ровно тот текст, ради
+      # которого карточка и нужна. Считать это глазами нельзя: контраст здесь
+      # складывается из альфа-заливок и накопленной opacity предков, поэтому
+      # гейт открывает страницу в Chromium и меряет вычисленные стили.
+      - name: Install Chromium for the contrast gate
+        run: npx playwright install --with-deps chromium
+
+      - name: Contrast (WCAG AA)
+        run: npm run contrast
+
       # Fixtures are fetched verbatim by mock.js — a broken one fails only at runtime.
       - name: Validate mock fixtures
         run: |
@@ -156,9 +167,11 @@ jobs:
         run: python .github/scripts/verify_image_deps.py "$IMAGE"
 
       # PIXEL_SKIP_MODEL=1 starts in ~2 s and downloads no weights. `/` and `/app.js`
-      # are the load-bearing part: `pip install -e .` is what keeps them served, and a
-      # non-editable install 404s the whole UI silently, with the API still answering
-      # 200 and not one error in the log.
+      # are the load-bearing part: an image that lost the frontend — a dropped
+      # `COPY frontend/`, a bad .dockerignore — 404s the whole UI silently, with
+      # `/api/state` still answering 200 and not one error in the log. (JEB-1530: the
+      # `-e` in the Dockerfile is *not* what this catches; a non-editable build serves
+      # all three paths fine, because /app/backend shadows site-packages anyway.)
       - name: Smoke-run the image
         run: |
           docker run -d --name pixel-ci -e PIXEL_SKIP_MODEL=1 -p 127.0.0.1:8000:8000 "$IMAGE"

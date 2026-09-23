@@ -66,7 +66,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
 | `ROUTER_THRESHOLD` | `0.6` | Confidence a skill needs to win the router. Below it, the command is a miss. |
 | `MINER_BATCH` | `5` | Mine on every N-th unmined case. |
-| `MINER_SIM` | `0.75` | Cosine similarity that joins two commands into one cluster. |
+| `MINER_SIM` | `0.88` | Cosine similarity that joins two commands into one cluster. Narrow usable band — see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
@@ -127,8 +127,10 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
 
 1. **Cluster.** Sentence vectors come from the Laya checkpoint already in memory
    (`DecisionEngine.embed`) — local, free, and still no `import laya` outside `engine.py`.
-   Single-link agglomerative clustering on cosine >= `MINER_SIM` (0.75), which is connected
-   components of the similarity graph, in numpy. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
+   Single-link agglomerative clustering on cosine >= `MINER_SIM` (0.88), which is connected
+   components of the similarity graph, in numpy. The default is measured against the real
+   checkpoint: these vectors are anisotropic, so the band that separates "same request" from
+   "different request" sits high and is narrow. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
    pool and ripen. Without embeddings the commands are grouped by one Gemini call instead — a
    degraded path, not the default one.
 2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-2.5-flash-lite`,
@@ -232,6 +234,13 @@ docker compose -p pixel up -d --force-recreate     # or: redeploy the `pixel` st
 PRs target `dev`; `main` is the release branch. CI runs lint + tests, the frontend lint and an
 `image build` gate on every PR, and emits `check_suite`, which is the review hand-off gate.
 
+The `frontend lint` job also runs a **contrast gate**: it serves `frontend/` on a local port, opens
+`index.html?mock=1` in headless Chromium under both `prefers-color-scheme` values and measures every
+text node from the *computed* styles — alpha fills composited layer by layer, ancestor `opacity`
+multiplied down the branch — failing on anything below WCAG AA (4.5:1, or 3:1 for large text). It
+needs no backend: `frontend/mocks/` already contains a disabled skill and a rated interaction, so the
+states that regressed in JEB-1521 are on screen. Run it locally with `npm run contrast`.
+
 `image build` covers both halves of the deployment — `Dockerfile` **and** `docker-compose.yml`.
 
 It starts with the compose file, because that check costs under a second and needs no image:
@@ -246,6 +255,9 @@ instead of the stand. It asks the built image what it actually installed: torch 
 pin in `requirements-torch.txt` — the one file the image *and* the test job install from — it must
 not be a CUDA wheel, and `laya` must land inside the range in `pyproject.toml`. Then it smoke-runs
 the container with `PIXEL_SKIP_MODEL=1` and asserts 200 from `/api/state`, `/` and `/app.js`. The
-last one is the editable-install regression: a non-editable `pip install .` moves the package into
-site-packages, `/frontend` stops existing and the whole UI 404s while the API still answers.
-Nothing is pushed to a registry — the image is a gate, not a deploy.
+last two are the missing-frontend regression: an image that lost `frontend/` — a dropped `COPY`, a
+bad `.dockerignore` — 404s the whole UI while `/api/state` still answers 200. It is *not* an
+editable-install gate: JEB-1530 measured an image built with plain `pip install .` serving all
+three paths, because `WORKDIR /app` plus uvicorn's default `--app-dir ""` make `/app/backend`
+shadow the site-packages copy either way. Nothing is pushed to a registry — the image is a gate,
+not a deploy.

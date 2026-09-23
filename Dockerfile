@@ -25,10 +25,15 @@ COPY pyproject.toml README.md ./
 COPY backend/ backend/
 COPY frontend/ frontend/
 
-# Editable on purpose: `backend/main.py` resolves the static frontend as
-# `parents[1] / "frontend"`. A non-editable install moves the package into
-# site-packages, that path stops existing, and the UI silently 404s while the
-# API still answers.
+# What keeps `backend/main.py`'s `parents[1] / "frontend"` resolvable is the layout
+# above — `COPY backend/` and `COPY frontend/` as siblings under `WORKDIR /app` —
+# not the `-e`. uvicorn's default `--app-dir ""` puts the cwd first on `sys.path`,
+# so /app/backend shadows any site-packages copy either way: JEB-1530 measured the
+# same image with plain `pip install .` still serving `/api/state`, `/` and
+# `/app.js` with 200.
+#
+# Drop `COPY frontend/` and the UI really does 404 while the API still answers 200.
+# That is the regression CI's smoke step catches.
 RUN pip install -e .
 
 # Weights (~650 MB) and the SQLite file both live here. Without a volume every
