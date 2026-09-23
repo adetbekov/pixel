@@ -118,20 +118,37 @@ async def test_chat_respects_the_robot_state(client, seeded, engine, conn):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "text", ["", "а" * (MAX_CHAT_TEXT + 1)], ids=["empty", "over-the-limit"]
+    "text",
+    ["", "а" * (MAX_CHAT_TEXT + 1), "          ", " \t\r\n "],
+    ids=["empty", "over-the-limit", "spaces", "tabs-and-newlines"],
 )
 async def test_chat_rejects_empty_and_oversized_text(client, seeded, engine, text):
     # The point of the cap: a rejected body must never reach the engine, whose
-    # single lock every other chat request is queued behind.
+    # single lock every other chat request is queued behind. Whitespace-only text
+    # costs the same forward pass as a real command and is worth exactly nothing.
     assert (await client.post("/api/chat", json={"text": text})).status_code == 422
     assert engine.calls == []
 
 
 @pytest.mark.anyio
 async def test_chat_accepts_text_at_the_limit(client, seeded, engine):
-    response = await client.post("/api/chat", json={"text": "а" * MAX_CHAT_TEXT})
+    # Padded past the cap: `max_length` counts what is left after trimming, which
+    # is what the model is actually given.
+    padded = "  " + "а" * MAX_CHAT_TEXT + "  "
+    response = await client.post("/api/chat", json={"text": padded})
     assert response.status_code == 200
     assert engine.calls
+
+
+@pytest.mark.anyio
+async def test_chat_trims_surrounding_whitespace(client, seeded, engine, conn):
+    engine.pick, engine.confidence = "greet", 0.93
+    response = await client.post("/api/chat", json={"text": "  привет  "})
+
+    assert response.status_code == 200
+    assert engine.prompts == ['Команда пользователя: "привет"']
+    stored = conn.execute("SELECT user_text FROM interactions ORDER BY id DESC LIMIT 1")
+    assert stored.fetchone()["user_text"] == "привет"
 
 
 @pytest.mark.anyio
