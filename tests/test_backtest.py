@@ -1,0 +1,205 @@
+"""The two checks a candidate has to survive before the user ever sees it."""
+
+import json
+
+import pytest
+
+from backend.brain.skill import Skill, load_seed_skills
+from backend.miner.backtest import backtest, check_regressions, min_match_rate
+from backend.miner.case import Case
+from backend.miner.schema import MAX_DESCRIPTION_LEN, SkillDraft
+from backend.state import RobotState
+
+from .fakes import FakeEngine
+from .trick_cluster import (
+    MID_STATE,
+    TEACHER_PLANS,
+    TRICK_COMMANDS,
+    TRICK_DRAFT,
+    TRICK_ROUTES,
+    draft_json,
+)
+
+TIRED = RobotState(mood=50.0, energy=5.0, fullness=50.0, face="sleepy")
+
+
+@pytest.fixture()
+def active():
+    return load_seed_skills()
+
+
+@pytest.fixture()
+def candidate():
+    return SkillDraft.model_validate(TRICK_DRAFT).to_skill()
+
+
+@pytest.fixture()
+def cases():
+    return [
+        Case(id=index + 1, user_text=command, state=MID_STATE, actions=TEACHER_PLANS[index])
+        for index, command in enumerate(TRICK_COMMANDS)
+    ]
+
+
+def engine(**overrides):
+    return FakeEngine(routes={**TRICK_ROUTES, **overrides})
+
+
+def test_a_candidate_that_covers_its_cluster_is_publishable(active, candidate, cases):
+    report = backtest(engine(), active, candidate, cases)
+    assert report.matched == 5
+    assert report.match_rate == pytest.approx(1.0)
+    assert report.regression is None
+    assert report.publishable
+
+
+def test_a_different_plan_is_not_a_match(active, candidate, cases):
+    """The router reaches the candidate, but a tired robot does something else."""
+    tired = [Case(case.id, case.user_text, TIRED, case.actions) for case in cases]
+    report = backtest(engine(), active, candidate, tired)
+    assert report.matched == 0
+    assert not report.publishable
+
+
+def test_wording_differences_do_not_break_a_match(active, candidate, cases):
+    """Every teacher reply is phrased differently; only the primitives count."""
+    assert len({json.dumps(case.actions, ensure_ascii=False) for case in cases}) == len(cases)
+    assert backtest(engine(), active, candidate, cases).match_rate == pytest.approx(1.0)
+
+
+def test_a_candidate_the_router_never_picks_scores_zero(active, candidate, cases):
+    report = backtest(FakeEngine("unknown"), active, candidate, cases)
+    assert report.match_rate == pytest.approx(0.0)
+    assert not report.publishable
+
+
+def test_a_candidate_below_the_threshold_is_not_a_hit(active, candidate, cases):
+    report = backtest(engine(), active, candidate, cases)
+    shy = backtest(FakeEngine(routes=TRICK_ROUTES, confidence=0.4), active, candidate, cases)
+    assert report.publishable
+    assert shy.match_rate == pytest.approx(0.0)
+
+
+def test_a_candidate_that_steals_an_active_command_is_refused(active, candidate, cases):
+    """The regression check, and the whole reason it exists.
+
+    `show_trick` covers its own cluster perfectly *and* drags "покорми" away from
+    `feed` — stage 2 measured that appending an option does exactly this. A
+    match rate cannot see it; a proposal published on match rate alone would
+    have broken feeding.
+    """
+    thief = engine(**{"покорми": "show_trick"})
+    report = backtest(thief, active, candidate, cases)
+    assert report.match_rate == pytest.approx(1.0)
+    assert report.regression is not None
+    assert "покорми" in report.regression
+    assert "feed" in report.regression
+    assert not report.publishable
+
+
+def test_a_control_phrase_falling_under_its_threshold_is_a_regression(active, candidate):
+    shy = FakeEngine(routes=TRICK_ROUTES, confidence=0.5)
+    assert "miss" in check_regressions(shy, [*active, candidate], active)
+
+
+def test_the_control_set_is_the_first_example_of_every_active_skill(active, candidate):
+    """So it grows with the library instead of being a hard-coded four."""
+    seen = []
+
+    class Recording(FakeEngine):
+        def ask(self, state, questions):
+            seen.append(state)
+            return super().ask(state, questions)
+
+    check_regressions(Recording(routes=TRICK_ROUTES), [*active, candidate], active)
+    for skill in active:
+        assert any(skill.examples[0] in state for state in seen)
+
+
+def test_a_skill_without_examples_is_not_a_control(candidate):
+    bare = Skill(
+        id="bare",
+        name="Bare",
+        description="без примеров",
+        rules=[{"when": {}, "actions": [{"action": "wave"}]}],
+    )
+    assert check_regressions(FakeEngine("unknown"), [bare, candidate], [bare]) is None
+
+
+def test_the_candidate_is_tried_last_in_the_option_list(active, candidate):
+    """Option order changes the answer, so the trial order must be the live one."""
+    probe = engine()
+    backtest(probe, active, candidate, [])
+    assert list(probe.calls[0]["skill"]["criteria"]) == [
+        "greet",
+        "feed",
+        "play",
+        "sleep",
+        "show_trick",
+        "unknown",
+    ]
+
+
+def test_the_minimum_match_rate_is_configurable(monkeypatch):
+    assert min_match_rate() == 0.8
+    monkeypatch.setenv("MINER_MIN_MATCH", "0.5")
+    assert min_match_rate() == 0.5
+
+
+def test_an_over_long_description_never_reaches_the_backtest():
+    """Measured, not stylistic: a long option label costs every skill accuracy."""
+    long = "навык, который показывает пользователю очень красивый и длинный фокус"
+    assert len(long) > MAX_DESCRIPTION_LEN
+    with pytest.raises(ValueError):
+        SkillDraft.model_validate_json(draft_json(description=long))
+
+
+def test_a_draft_naming_an_action_outside_the_library_does_not_build():
+    draft = SkillDraft.model_validate_json(
+        draft_json(rules=[{"when_state": "", "when_band": "", "actions": [{"action": "fly"}]}])
+    )
+    with pytest.raises(ValueError):
+        draft.to_skill()
+
+
+def test_a_draft_whose_last_rule_is_conditional_does_not_build():
+    draft = SkillDraft.model_validate_json(
+        draft_json(
+            rules=[
+                {
+                    "when_state": "energy",
+                    "when_band": "low",
+                    "actions": [{"action": "say", "text": "Устал"}],
+                }
+            ]
+        )
+    )
+    with pytest.raises(ValueError):
+        draft.to_skill()
+
+
+@pytest.mark.parametrize("bad_id", ["Показать Фокус", "show trick", "1trick", ""])
+def test_an_id_that_is_not_a_latin_label_is_refused(bad_id):
+    with pytest.raises(ValueError):
+        SkillDraft.model_validate_json(draft_json(id=bad_id))
+
+
+def test_a_when_naming_something_that_is_not_a_state_scale_is_refused():
+    with pytest.raises(ValueError):
+        SkillDraft.model_validate_json(
+            draft_json(
+                rules=[
+                    {
+                        "when_state": "weather",
+                        "when_band": "low",
+                        "actions": [{"action": "wave"}],
+                    },
+                    {"when_state": "", "when_band": "", "actions": [{"action": "wave"}]},
+                ]
+            )
+        )
+
+
+def test_a_built_skill_is_marked_as_mined(candidate):
+    assert (candidate.origin, candidate.status) == ("mined", "active")
+    assert candidate.questions == {}

@@ -14,6 +14,11 @@ Laya answers *typed questions*, it does not generate text. A question is one of:
 All of them are evaluated in a single forward pass, which is why :meth:`ask` —
 the batch method — is the one the router actually calls: ten questions in one
 ``predict`` cost far less than ten single-question calls.
+
+:meth:`DecisionEngine.embed` is the one thing here that is not a question. Stage
+4's miner needs sentence vectors to group the teacher's misses, and the model
+that can produce them is already resident — so the vectors cost no extra API and
+no extra money, and the miner still never says ``import laya``.
 """
 
 from __future__ import annotations
@@ -50,6 +55,10 @@ class NoulResult:
 Answer = ChoiceResult | ScoreResult | NoulResult
 
 
+class EmbeddingsUnavailable(RuntimeError):
+    """This engine cannot produce sentence vectors — the caller needs a plan B."""
+
+
 class DecisionEngine(Protocol):
     """A small model that answers typed questions about a piece of text."""
 
@@ -64,6 +73,8 @@ class DecisionEngine(Protocol):
     def noul(self, state: str, name: str, instructions: str) -> NoulResult: ...
 
     def ask(self, state: str, questions: dict[str, dict[str, Any]]) -> dict[str, Answer]: ...
+
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
 class SingleQuestionMixin:
@@ -127,6 +138,7 @@ class LayaEngine(SingleQuestionMixin):
         # One shared model, one forward pass at a time. Never taken together
         # with `db.lock` — see the ordering note in `backend/api.py`.
         self._lock = threading.Lock()
+        self._embed_fn: Any | None = None
 
     def ask(self, state: str, questions: dict[str, dict[str, Any]]) -> dict[str, Answer]:
         if not questions:
@@ -134,6 +146,31 @@ class LayaEngine(SingleQuestionMixin):
         with self._lock:
             raw = self._agent.predict(state, questions)
         return {name: _to_answer(answer) for name, answer in raw["answers"].items()}
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Sentence vectors from the checkpoint that is already in memory.
+
+        ``laya.embed_fn_from_agent`` is the documented way to reuse the loaded
+        encoder (it is what ``laya.predict_shortlist`` is built on — see the
+        shortlist TODO in :mod:`backend.brain.router`). It could not be verified
+        against an installed ``laya`` here: this stage was built without weights,
+        exactly like stage 3 was built without an API key. If the helper turns
+        out to be missing or renamed, this raises and the miner falls back to
+        grouping the commands with one Gemini call — which is why no paid
+        embedding API is wired in as a second fallback.
+        """
+        if not texts:
+            return []
+        import laya
+
+        with self._lock:
+            if self._embed_fn is None:
+                embed_fn_from_agent = getattr(laya, "embed_fn_from_agent", None)
+                if embed_fn_from_agent is None:
+                    raise EmbeddingsUnavailable("laya has no embed_fn_from_agent")
+                self._embed_fn = embed_fn_from_agent(self._agent)
+            vectors = self._embed_fn(list(texts))
+        return [[float(value) for value in vector] for vector in vectors]
 
 
 _engine: DecisionEngine | None = None

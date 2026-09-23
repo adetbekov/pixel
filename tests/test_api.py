@@ -164,10 +164,12 @@ async def test_feedback_rejects_other_values(client):
 
 
 @pytest.mark.anyio
-async def test_stage_later_endpoints_are_empty_but_present(client):
+async def test_the_proposal_endpoints_answer_on_an_empty_database(client):
+    """Nothing mined yet: an empty list, an honest zero, and 404 for an id that
+    was never proposed — the stage-1 stubs became real in stage 4."""
     assert (await client.get("/api/proposals")).json() == []
-    assert (await client.post("/api/proposals/abc/accept")).json() == {"ok": True}
-    assert (await client.post("/api/proposals/abc/reject")).json() == {"ok": True}
+    assert (await client.post("/api/proposals/abc/accept")).status_code == 404
+    assert (await client.post("/api/proposals/abc/reject")).status_code == 404
     assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
 
 

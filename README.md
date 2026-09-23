@@ -60,6 +60,42 @@ Without `GEMINI_API_KEY` the app still starts: the teacher is off, a miss answer
 stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` overrides the model
 (default `gemini-3.1-flash-lite`).
 
+## Learning — the skill miner
+
+Gemini answering a command is not learning; it costs money every single time. Learning is the moment
+a *pattern* in those answers becomes a skill and the command stops reaching Gemini at all. That is
+`backend/miner/`, and it runs on every `MINER_BATCH`-th unmined case (default 5) or on
+`POST /api/mine`:
+
+1. **Cluster.** Sentence vectors come from the Laya checkpoint already in memory
+   (`DecisionEngine.embed`) — local, free, and still no `import laya` outside `engine.py`.
+   Single-link agglomerative clustering on cosine >= `MINER_SIM` (0.75), which is connected
+   components of the similarity graph, in numpy. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
+   pool and ripen. Without embeddings the commands are grouped by one Gemini call instead — a
+   degraded path, not the default one.
+2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `gemini-3.8-flash`) per cluster. Offline,
+   nobody waiting, and what comes back is a schema that will route thousands of later commands — so
+   this is the one place that buys a bigger model than the teacher. A mined skill carries no
+   `questions` and branches only on the robot's own state; it is assembled into a real `Skill`, and
+   that is where `validate_plan` refuses anything outside the action library.
+3. **Backtest.** Every case of the cluster is re-routed against `active + candidate`, and a match
+   means the router picked the candidate *and* did what the teacher did (action names only — the
+   teacher never phrases a reply the same way twice). `match_rate` must reach `MINER_MIN_MATCH`
+   (0.8).
+4. **Regression check.** A match rate cannot see the damage a new option does to the old ones: stage
+   2 measured all 24 orderings of the four starter skills spreading the hit rate over 7/10…9/10, and
+   alphabetical order pushing "покорми" under its threshold outright. So one control phrase per
+   active skill (`examples[0]`, so the set grows with the library) is routed through the same trial
+   registry, and one phrase leaving its own skill kills the proposal.
+5. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
+   `POST /api/proposals/{id}/accept` adds the skill, and it takes effect in the same process, since
+   `/api/chat` reads the library on every request. `reject` puts the cases back in the pool and
+   remembers the case set, so the same cluster is not offered again.
+
+A mined `description` is a hard 60 characters and a candidate over it is rejected, not trimmed: the
+description *is* the router's option label, and stage 2 measured long ones dropping routing from 6/6
+to 2/6 — for every skill, not just the new one.
+
 ```
 pip install -e ".[dev]"
 uvicorn backend.main:app --reload     # first run downloads the weights (~650 MB) into HF_HOME

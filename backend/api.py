@@ -19,7 +19,8 @@ from . import db
 from .actions import Action, validate_plan
 from .brain.engine import get_engine
 from .brain.router import RouterHit, route
-from .brain.skill import load_skills
+from .brain.skill import load_skills, parse_skill
+from .miner import mine_once, mining_due
 from .state import apply_actions, iso, read_state, utcnow
 from .teacher import get_teacher, log_case
 
@@ -316,6 +317,13 @@ def post_chat(payload: ChatIn) -> dict:
             actions=reply["actions"],
             error=result.error,
         )
+        due = mining_due(conn)
+
+    # Every MINER_BATCH-th miss, the miner runs before this response returns.
+    # It is seconds on a pool this size, and the user who just taught Pixel
+    # something is the one most likely to be looking at the skills panel.
+    if due:
+        mine_once()
     return reply
 
 
@@ -366,23 +374,92 @@ def get_skills() -> list[dict]:
 
 @router.get("/proposals", response_model=list[Proposal])
 def get_proposals() -> list[dict]:
-    """Empty until stage 4 mines the first proposal."""
-    return []
+    """Skills the miner wants to add — pending ones only.
+
+    The card's example phrases live in `skill.examples`; there is no second
+    `examples` field, and the frozen `Proposal` shape says so.
+    """
+    conn = db.get_conn()
+    with db.lock:
+        rows = conn.execute(
+            "SELECT id, skill_json, match_rate, sample_ids, status, created_at"
+            " FROM skill_proposals WHERE status = 'pending' ORDER BY created_at, rowid"
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "skill": json.loads(row["skill_json"]),
+            "match_rate": row["match_rate"],
+            "sample_ids": json.loads(row["sample_ids"]),
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
 
 
 @router.post("/proposals/{proposal_id}/accept", response_model=Ok)
 def accept_proposal(proposal_id: str) -> dict:
+    """The one and only way a mined skill enters the library.
+
+    Nothing has to be reloaded and nothing has to be restarted: `/api/chat`
+    reads the library with `load_skills` on every request, so the next command
+    is already routed against the new skill. It lands at the end of the option
+    list — which is exactly the order the backtest tried it in.
+    """
+    conn = db.get_conn()
+    with db.lock:
+        row = conn.execute(
+            "SELECT skill_json FROM skill_proposals WHERE id = ? AND status = 'pending'",
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown or already decided proposal")
+
+        skill = parse_skill(json.loads(row["skill_json"]))
+        if skill is None:
+            raise HTTPException(status_code=422, detail="the proposed skill no longer validates")
+        if conn.execute("SELECT 1 FROM skills WHERE id = ?", (skill.id,)).fetchone():
+            raise HTTPException(status_code=409, detail=f"skill {skill.id} already exists")
+
+        skill = skill.model_copy(update={"status": "active", "origin": "mined"})
+        conn.execute(
+            "INSERT INTO skills (id, json, status, origin, created_at) VALUES (?, ?, ?, ?, ?)",
+            (skill.id, skill.model_dump_json(), skill.status, skill.origin, iso(utcnow())),
+        )
+        conn.execute("UPDATE skill_proposals SET status = 'accepted' WHERE id = ?", (proposal_id,))
+        conn.commit()
     return {"ok": True}
 
 
 @router.post("/proposals/{proposal_id}/reject", response_model=Ok)
 def reject_proposal(proposal_id: str) -> dict:
+    """Turn the proposal down and put its cases back in the pool.
+
+    The rejected row is kept, because its `sample_ids` are what stop the miner
+    proposing the very same cluster again on the next run.
+    """
+    conn = db.get_conn()
+    with db.lock:
+        cursor = conn.execute(
+            "UPDATE skill_proposals SET status = 'rejected' WHERE id = ? AND status = 'pending'",
+            (proposal_id,),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="unknown or already decided proposal")
+        conn.execute(
+            "UPDATE teacher_log SET mined = 0, cluster_id = NULL WHERE cluster_id = ?",
+            (proposal_id,),
+        )
+        conn.commit()
     return {"ok": True}
 
 
 @router.post("/mine", response_model=MineOut)
 def post_mine() -> dict:
-    return {"started": True, "proposals": 0}
+    """Mine now. An empty pool, or no API key, is `0` proposals — not an error."""
+    result = mine_once()
+    return {"started": result.started, "proposals": result.proposals}
 
 
 @router.get("/metrics", response_model=Metrics)
