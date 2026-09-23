@@ -37,14 +37,23 @@ log = logging.getLogger(__name__)
 #: Careful if a thinking budget is ever added here: `models/gemini-2.5-flash-lite`
 #: rejects `thinking_budget=1` with `400 INVALID_ARGUMENT` and wants >= 512
 #: (measured in split the bill, `src/services/gemini_thinking_budget.py`). The
-#: teacher passes no budget today — don't add one without that floor.
+#: teacher passes no budget today, and measured live that costs nothing:
+#: `thoughts_token_count` came back 0-2 on real teacher prompts.
 #:
 #: Confirmed live on 2026-09-24 against `client.models.list()`: this exact id,
-#: `models/` prefix included, is in the listing and is the form the call accepts.
-#: Overridable via `GEMINI_TEACHER_MODEL` either way.
+#: `models/` prefix included, is in the listing — 61 models, and the only
+#: 2.5-flash-lite entry among them. The call also accepts the bare
+#: `gemini-2.5-flash-lite`, so the prefix here is the catalog's own spelling
+#: rather than a requirement. Overridable via `GEMINI_TEACHER_MODEL` either way.
 DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
 
 #: Per-call ceiling, as JEB-1500 specifies.
+#:
+#: Confirmed live on 2026-09-24 that `_call` converts this correctly:
+#: `http_options.timeout` is in MILLISECONDS. A bare `timeout=1`, `3` or `5`
+#: aborts the request client-side, while `timeout=2000`/`3000` completes in
+#: ~1.4 s. The 3 and the 5 are what settle it: as seconds both would have been
+#: ample for a ~1.4 s call, and both aborted anyway.
 TIMEOUT_S = 8.0
 
 #: Ceiling across *all* attempts. Without it a retried timeout costs the user
@@ -66,7 +75,8 @@ MIN_CALL_BUDGET_S = 1.0
 #: ``models/gemini-2.5-flash-lite``: anything that rounds below 10 s is rejected
 #: outright — ``400 INVALID_ARGUMENT: Manually set deadline 8s is too short.
 #: Minimum allowed deadline is 10s`` — so our 8 s budget cannot be the header.
-#: 9400 ms passes, 9000 ms does not.
+#: 9400 ms passes, 9000 ms does not. Re-confirmed 2026-09-24: drop the header
+#: and an 8000 ms call still fails with exactly that 400.
 #:
 #: The SDK only fills the header in when it is absent, so :meth:`_call` sets it
 #: explicitly: the server gets its legal minimum, httpx still aborts at *our*
