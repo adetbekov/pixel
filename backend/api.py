@@ -25,6 +25,11 @@ router = APIRouter(prefix="/api")
 
 LOW_ENERGY_FOR_PLAY = 20.0
 
+# A chat call costs a forward pass behind the engine's single lock, so an unbounded
+# body is one caller stalling every other chat. Laya's context is 1024 tokens and a
+# real command is a handful of words; stage 3 trims to the same length before Gemini.
+MAX_CHAT_TEXT = 500
+
 BUTTON_PLANS: dict[str, list[dict[str, Any]]] = {
     "feed": [
         {"action": "eat", "args": {}},
@@ -81,7 +86,7 @@ class Reply(BaseModel):
 
 
 class ChatIn(BaseModel):
-    text: str
+    text: str = Field(min_length=1, max_length=MAX_CHAT_TEXT)
 
 
 class ActionIn(BaseModel):
