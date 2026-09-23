@@ -38,3 +38,36 @@ jobs:
       # those paths are mocked in tests.
       - name: Tests
         run: pytest -q
+
+  # `frontend/` ships as bare ES modules with no build step, so nothing but this job
+  # ever parses it. ESLint is a CI-only devDependency; production stays dependency-free.
+  frontend:
+    name: frontend lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install lint toolchain
+        run: npm ci
+
+      - name: Lint JS
+        run: npx eslint frontend
+
+      # Fixtures are fetched verbatim by mock.js — a broken one fails only at runtime.
+      - name: Validate mock fixtures
+        run: |
+          shopt -s nullglob
+          files=(frontend/mocks/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No fixtures found under frontend/mocks/ — expected at least one." >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            jq empty "$f"
+            echo "ok: $f"
+          done
