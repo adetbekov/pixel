@@ -83,6 +83,17 @@ jobs:
       - name: Lint JS
         run: npx eslint frontend
 
+      # JEB-1521: статус отключённого навыка и причина отключения читались на
+      # 1.70:1 и 2.18:1 — `opacity` на карточке гасила ровно тот текст, ради
+      # которого карточка и нужна. Считать это глазами нельзя: контраст здесь
+      # складывается из альфа-заливок и накопленной opacity предков, поэтому
+      # гейт открывает страницу в Chromium и меряет вычисленные стили.
+      - name: Install Chromium for the contrast gate
+        run: npx playwright install --with-deps chromium
+
+      - name: Contrast (WCAG AA)
+        run: npm run contrast
+
       # Fixtures are fetched verbatim by mock.js — a broken one fails only at runtime.
       - name: Validate mock fixtures
         run: |

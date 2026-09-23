@@ -234,6 +234,13 @@ docker compose -p pixel up -d --force-recreate     # or: redeploy the `pixel` st
 PRs target `dev`; `main` is the release branch. CI runs lint + tests, the frontend lint and an
 `image build` gate on every PR, and emits `check_suite`, which is the review hand-off gate.
 
+The `frontend lint` job also runs a **contrast gate**: it serves `frontend/` on a local port, opens
+`index.html?mock=1` in headless Chromium under both `prefers-color-scheme` values and measures every
+text node from the *computed* styles — alpha fills composited layer by layer, ancestor `opacity`
+multiplied down the branch — failing on anything below WCAG AA (4.5:1, or 3:1 for large text). It
+needs no backend: `frontend/mocks/` already contains a disabled skill and a rated interaction, so the
+states that regressed in JEB-1521 are on screen. Run it locally with `npm run contrast`.
+
 `image build` covers both halves of the deployment — `Dockerfile` **and** `docker-compose.yml`.
 
 It starts with the compose file, because that check costs under a second and needs no image:

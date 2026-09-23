@@ -3,11 +3,13 @@
   "private": true,
   "description": "CI-only toolchain for the static frontend gate. Production frontend ships as bare ES modules with no dependencies.",
   "scripts": {
-    "lint": "eslint frontend"
+    "lint": "eslint frontend",
+    "contrast": "node .github/scripts/contrast_gate.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "eslint": "^10.11.0",
-    "globals": "^17.12.0"
+    "globals": "^17.12.0",
+    "playwright": "^1.63.0"
   }
 }
