@@ -2,8 +2,17 @@ name: CI
 
 # `check_suite = success` is the hand-off gate for the Multica PR pipeline, so this
 # workflow must run on every PR into dev and main.
+#
+# The `push` trigger is a backstop, not a gate: `pull_request` runs against a
+# `base + head` merge commit computed when the run started, so a PR merged after its
+# base moved on — or two PRs green on different bases that conflict semantically —
+# leaves the branch tip itself untested. Without this, "is the tip of `dev` green?"
+# has no answer in the repository at all (step 1 of `jeb-release` needs one).
+# Deliberately NOT added to `required_status_checks`: it runs after the merge.
 on:
   pull_request:
+    branches: [dev, main]
+  push:
     branches: [dev, main]
 
 # Every job only reads the checkout — nothing pushes, comments on the PR or writes
@@ -13,8 +22,13 @@ on:
 permissions:
   contents: read
 
+# On `pull_request` the PR number groups the run, so a new push to the branch
+# supersedes the in-flight one. On `push` `github.event.pull_request` is empty, so
+# every push run would otherwise collapse into the single group `ci-` and cancel its
+# predecessor — the SHA fallback gives each merged commit its own group, because a
+# push run is the only record of whether that commit is green.
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
