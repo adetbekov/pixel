@@ -262,6 +262,17 @@ async function pollState() {
   }
 }
 
+/* Кнопочная интеракция хранится под именем действия (`feed`), а в чат живьём
+   попадает подпись кнопки («Покормить»). Восстановленный разговор должен
+   совпадать с тем, что пользователь видел, поэтому имя переводится обратно по
+   самим кнопкам — второго списка подписей не заводим. */
+function userText(item) {
+  const text = item.user_text ?? '';
+  if (item.engine !== 'button') return text;
+  const button = quickButtons.find((candidate) => candidate.dataset.action === text);
+  return button ? button.textContent : text;
+}
+
 /* Чат восстанавливается из базы: иначе оценка сохранена на сервере, но после
    перезагрузки её не видно — и это читается как «моё 👎 не сохранилось». */
 async function restoreHistory() {
@@ -276,7 +287,7 @@ async function restoreHistory() {
     return;
   }
   for (const item of history) {
-    addMessage('user', item.user_text ?? '');
+    addMessage('user', userText(item));
     addReply(item, item.feedback ?? null);
   }
   addMessage('system', 'Pixel проснулся. Выше — прошлый разговор.');

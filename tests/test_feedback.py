@@ -12,9 +12,13 @@ import httpx
 import pytest
 
 from backend import db, feedback
+from backend.brain.engine import set_engine
 from backend.brain.router import RouterMiss, route
 from backend.brain.skill import load_skills
 from backend.main import app
+
+from .fakes import FakeEngine
+from .trick_cluster import TRICK_EMBEDDINGS, TRICK_ROUTES, draft_json, fill_pool
 
 
 @pytest.fixture()
@@ -27,6 +31,15 @@ async def client(conn):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
+
+
+@pytest.fixture()
+def miner_engine():
+    """The engine the miner and the app share, scripted for the trick cluster."""
+    fake = FakeEngine(routes=TRICK_ROUTES, embeddings=TRICK_EMBEDDINGS)
+    set_engine(fake)
+    yield fake
+    set_engine(None)
 
 
 def rate(conn, skill_id: str, votes: list[int]) -> list[int]:
@@ -233,6 +246,87 @@ def test_a_seed_skill_gets_no_exemption(seeded):
     assert status_of(seeded, "feed") == "disabled"
     # Nothing to return to the pool — a seed skill was never a proposal.
     assert seeded.execute("SELECT COUNT(*) AS n FROM teacher_log").fetchone()["n"] == 0
+
+
+# ─── The retry: a disabled skill can actually be mined again ────────────────
+
+
+@pytest.mark.anyio
+async def test_a_disabled_skill_can_be_mined_and_accepted_again(
+    client, seeded, miner_engine, generator
+):
+    """The whole point of returning the cases: a *proposal* appears, not just rows.
+
+    Two locks had to come off together, and this is the test that would have
+    caught either one left on: the rejected signature (lifted in
+    `backend/feedback.py`) and the skill id (`_taken_ids` in
+    `backend/miner/run.py`). With the id still held, the retry dies in a
+    `log.warning` on every run; with the id freed but `accept_proposal` still
+    doing a bare INSERT, accepting the retry is a 500 on the primary key.
+    """
+    generator(draft_json())
+    fill_pool(seeded)
+
+    assert (await client.post("/api/mine")).json()["proposals"] == 1
+    first = (await client.get("/api/proposals")).json()[0]
+    assert first["skill"]["id"] == "show_trick"
+    assert (await client.post(f"/api/proposals/{first['id']}/accept")).status_code == 200
+    assert status_of(seeded, "show_trick") == "active"
+
+    # The user turns out to hate it: 4 dislikes in 10 ratings.
+    rate(seeded, "show_trick", [1] * 6 + [-1] * 4)
+    assert status_of(seeded, "show_trick") == "disabled"
+    assert seeded.execute(
+        "SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0"
+    ).fetchone()["n"] == 5
+
+    # The miner proposes the same cluster again, under the same obvious id.
+    assert (await client.post("/api/mine")).json()["proposals"] == 1
+    retry = (await client.get("/api/proposals")).json()[0]
+    assert retry["skill"]["id"] == "show_trick"
+    assert retry["id"] != first["id"]
+
+    assert (await client.post(f"/api/proposals/{retry['id']}/accept")).status_code == 200
+    row = seeded.execute(
+        "SELECT status, disabled_at, disabled_reason FROM skills WHERE id = 'show_trick'"
+    ).fetchone()
+    assert row["status"] == "active"
+    # The card must not still read "отключён из-за дизлайков" — it is a new skill.
+    assert row["disabled_at"] is None
+    assert row["disabled_reason"] is None
+
+    card = next(
+        item for item in (await client.get("/api/skills")).json() if item["id"] == "show_trick"
+    )
+    assert (card["status"], card["disabled_reason"]) == ("active", None)
+
+    # And it routes again, in the same process.
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+    assert (body["engine"], body["skill_id"]) == ("laya", "show_trick")
+
+
+@pytest.mark.anyio
+async def test_an_active_skill_still_blocks_its_id(client, seeded, miner_engine, generator):
+    """Only a *disabled* id is free. A live skill is still a 409 and still taken."""
+    from backend.miner.run import _taken_ids
+
+    generator(draft_json())
+    fill_pool(seeded)
+    assert (await client.post("/api/mine")).json()["proposals"] == 1
+    proposal = (await client.get("/api/proposals")).json()[0]
+    await client.post(f"/api/proposals/{proposal['id']}/accept")
+
+    assert "show_trick" in _taken_ids(seeded)
+    assert "greet" in _taken_ids(seeded)
+
+    # A second proposal for the same id cannot slip past the accept endpoint.
+    seeded.execute(
+        "INSERT INTO skill_proposals (id, skill_json, match_rate, sample_ids, status, created_at)"
+        " VALUES ('dup', ?, 0.9, '[]', 'pending', '2026-09-23T09:00:00Z')",
+        (json.dumps(proposal["skill"]),),
+    )
+    seeded.commit()
+    assert (await client.post("/api/proposals/dup/accept")).status_code == 409
 
 
 # ─── The endpoint and the panel ─────────────────────────────────────────────

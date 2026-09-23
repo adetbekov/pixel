@@ -1,5 +1,15 @@
 [
   {
+    "interaction_id": 60,
+    "user_text": "feed",
+    "reply": "Ням!",
+    "engine": "button",
+    "skill_id": null,
+    "confidence": null,
+    "latency_ms": 3,
+    "feedback": null
+  },
+  {
     "interaction_id": 61,
     "user_text": "привет",
     "reply": "Привет-привет!",

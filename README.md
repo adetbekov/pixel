@@ -173,9 +173,13 @@ router forever and every command it steals is answered wrong — fast, cheaply, 
   the skill is simply not among the router's options any more and the command goes to Gemini;
 * the skill is **not** deleted. It stays in `GET /api/skills` with `status="disabled"` and
   `disabled_reason="dislike_rate"`, because a skill that silently disappears reads as a bug;
-* its mined cases go back to `teacher_log` unmined, and any *rejected* proposal covering exactly
-  that case set is retired — returning the pool while leaving that block in place is a silent hole
-  and the miner would never propose again;
+* its mined cases go back to `teacher_log` unmined, and **every** lock on re-mining that cluster
+  comes off with them — the *rejected* proposal covering exactly that case set is retired, and the
+  skill's **id** stops counting as taken (`_taken_ids` in `backend/miner/run.py`). Both matter: the
+  generator is only ever shown the *active* library, so its next draft for the same phrases picks
+  the same obvious id, and one lock left on drops the retry into a `log.warning` on every run,
+  forever. Accepting the retry overwrites the disabled row and clears `disabled_at` /
+  `disabled_reason`; an id held by an **active** skill is still a 409;
 * seed skills get no exemption. A starter skill the user keeps disliking is exactly as wrong.
 
 A 👎 on a Gemini answer has no skill to disable; it stays in the metrics and stays raw material.

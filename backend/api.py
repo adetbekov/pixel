@@ -477,6 +477,12 @@ def accept_proposal(proposal_id: str) -> dict:
     reads the library with `load_skills` on every request, so the next command
     is already routed against the new skill. It lands at the end of the option
     list — which is exactly the order the backtest tried it in.
+
+    A **disabled** skill's id is free, so a retry of a skill stage 5 turned off
+    overwrites that row instead of colliding with its primary key. The miner is
+    the other half of that rule (`backend/miner/run.py`, `_taken_ids`): without
+    both, the retry is either refused before it is drafted or accepted into a
+    500.
     """
     conn = db.get_conn()
     with db.lock:
@@ -490,12 +496,20 @@ def accept_proposal(proposal_id: str) -> dict:
         skill = parse_skill(json.loads(row["skill_json"]))
         if skill is None:
             raise HTTPException(status_code=422, detail="the proposed skill no longer validates")
-        if conn.execute("SELECT 1 FROM skills WHERE id = ?", (skill.id,)).fetchone():
+        existing = conn.execute(
+            "SELECT status FROM skills WHERE id = ?", (skill.id,)
+        ).fetchone()
+        if existing is not None and existing["status"] != "disabled":
             raise HTTPException(status_code=409, detail=f"skill {skill.id} already exists")
 
         skill = skill.model_copy(update={"status": "active", "origin": "mined"})
+        # `disabled_at` / `disabled_reason` are written back as NULL rather than
+        # left behind: the row is a different skill now, and a fresh card
+        # carrying the old one's "отключён из-за дизлайков" is a lie.
         conn.execute(
-            "INSERT INTO skills (id, json, status, origin, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO skills"
+            " (id, json, status, origin, created_at, disabled_at, disabled_reason)"
+            " VALUES (?, ?, ?, ?, ?, NULL, NULL)",
             (skill.id, skill.model_dump_json(), skill.status, skill.origin, iso(utcnow())),
         )
         conn.execute("UPDATE skill_proposals SET status = 'accepted' WHERE id = ?", (proposal_id,))
