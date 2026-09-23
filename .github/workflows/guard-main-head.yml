@@ -6,27 +6,23 @@ name: Guard main PR head
 # fix PRs target `dev`; only the deliberate `dev → main` release PR is allowed
 # through. See jeb-git-pr / jeb-release.
 
-# `pull_request`, NOT `pull_request_target` — deliberate, and only for now
-# (JEB-1522). The four original studio repos use `pull_request_target` because
-# it resolves the workflow from the *base* branch, which the head cannot
-# rewrite. pixel's `main` does not carry this file yet: under
-# `pull_request_target` the guard would resolve from a `main` without it, never
-# report, and — once `main PRs must come from dev` is a required context —
-# permanently block the very release PR that would deliver the file, with
-# `enforce_admins: true` leaving no bypass.
+# `pull_request_target` only, on purpose (JEB-1368).
 #
-# Mandatory order (jeb-release, "Ordering trap"):
-#   1. this file lands on `dev` under `pull_request`
-#   2. it reports on a live PR into `main`, then the context is required
-#   3. a release carries the file to `main`
-#   4. only then may the trigger be switched to `pull_request_target`
+# GitHub reads `pull_request` from the PR head and `pull_request_target` from
+# the base branch. Under `pull_request` the head would control this guard: it
+# could rewrite the job to `exit 0`, keep the name, and make the required
+# context `main PRs must come from dev` report success on a PR that never came
+# from dev. Reading the base copy closes that — the head cannot touch it.
+#
+# Safe under `pull_request_target` only because this job checks nothing out and
+# runs no head-controlled code — never add a checkout step below.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, synchronize, edited]
     branches: [main]
 
-# Read-only default. The single job reads `github.head_ref` from the event
-# payload — it does not even check the repo out.
+# Read-only default (JEB-1049). The single job reads `github.head_ref` from the
+# event payload — it does not even check the repo out.
 permissions:
   contents: read
 
@@ -38,7 +34,7 @@ jobs:
       - name: Verify head is dev
         # `github.head_ref` is the bare branch name — a fork's branch named
         # `dev` yields the same value as this repo's release branch. Check the
-        # head repository too, so only <this repo>@dev passes.
+        # head repository too, so only <this repo>@dev passes (JEB-1154).
         # `head.repo.full_name` is null when the fork is gone: empty != this
         # repo, so the guard fails closed.
         env:
