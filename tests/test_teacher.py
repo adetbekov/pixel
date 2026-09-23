@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from backend.actions import ACTIONS, MAX_SAY_LEN
+from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
 from backend.main import app
 from backend.state import read_state
@@ -200,13 +201,19 @@ async def test_metrics_count_teacher_calls(client, seeded, missing, teacher):
     assert body["avg_latency_gemini_ms"] > 0
 
 
-@pytest.mark.anyio
-async def test_a_long_command_is_trimmed_before_it_is_sent(client, seeded, missing, teacher):
-    gemini = teacher(GOOD_PLAN)
-    await client.post("/api/chat", json={"text": "а" * 5000})
-    sent = gemini.calls[0]["input"]
-    assert "а" * MAX_TEXT_LEN in sent
-    assert "а" * (MAX_TEXT_LEN + 1) not in sent
+def test_the_prompt_trims_a_long_command(seeded):
+    """`/api/chat` already rejects anything longer (`MAX_CHAT_TEXT`), so this is
+    the second lock on the same door — the teacher must not be reachable with an
+    unbounded prompt if it ever gets a caller other than `post_chat`."""
+    prompt = build_input("а" * 5000, read_state(seeded), [])
+    assert "а" * MAX_TEXT_LEN in prompt
+    assert "а" * (MAX_TEXT_LEN + 1) not in prompt
+
+
+def test_the_two_text_limits_agree():
+    # The API cap and the prompt trim are declared separately — `backend.api`
+    # imports the teacher, so the teacher cannot import back. Pin them together.
+    assert MAX_TEXT_LEN == MAX_CHAT_TEXT
 
 
 @pytest.mark.anyio

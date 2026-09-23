@@ -12,7 +12,10 @@ from ..brain.skill import Skill
 from ..brain.verbalize import word
 from ..state import RobotState
 
-#: Enough to describe any command; past this it is noise or an attack.
+#: Mirrors ``backend.api.MAX_CHAT_TEXT``, declared here rather than imported
+#: because ``backend.api`` imports this package. `/api/chat` already rejects
+#: anything longer, so this only matters for a future caller that does not.
+#: ``tests/test_teacher.py`` pins the two together.
 MAX_TEXT_LEN = 500
 
 #: Keeps the skill list from crowding out the rest of the prompt.
