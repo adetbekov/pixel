@@ -1,0 +1,147 @@
+name: Live Gemini Contract
+
+# Asks the real model, once a night, whether it still answers in the shape our
+# parsers demand. The rationale, the exit codes and the probes themselves live in
+# .github/scripts/check_live_gemini_contract.py (JEB-1552).
+#
+# Why this cannot be a normal test: `tests/fakes.py::FakeGeminiClient` returns bare
+# JSON whatever it is asked, so the whole teacher/miner path is green on fixtures
+# while the live path is dead. That is not a hypothetical — JEB-1513 and JEB-1546
+# are the same defect, found twice, both times by a human on a live stand, because
+# no gate in the repository looks at a real response body.
+#
+# Why it is a separate workflow and not a job in ci.yml: it needs GEMINI_API_KEY,
+# which a fork PR cannot be given, and it spends real quota. A PR must stay green
+# without the key — so this never runs on `pull_request`, and `ci.yml` never needs
+# a secret. Cost is two `gemini-2.5-flash-lite` calls a day, on the order of $0.001.
+#
+# Note on the schedule, same as required-checks-audit.yml: GitHub starts `schedule:`
+# only from the default branch, which for pixel is `main`. Until this file reaches
+# `main` with a release, the nightly half does not exist and only `workflow_dispatch`
+# is live. "The workflow is in the repository" is not "the nightly runs".
+#
+# This job is deliberately NOT a required status check on any branch: it can go red
+# because Google changed something, and that must never be able to block a merge.
+
+on:
+  schedule:
+    # 03:17 UTC — off the hour, where every other repository's cron queues up.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: live-gemini-contract
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    name: Live model answers in the parsed shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Deliberately NOT `pip install -e ".[dev]"`: that pulls `laya`, which pulls
+      # ~1 GB of torch, and the probe imports neither — it touches the teacher and
+      # miner modules, pydantic and the SDK, nothing else. The google-genai
+      # requirement is read out of pyproject.toml rather than repeated here, so the
+      # nightly cannot drift onto a different SDK line than the app runs on.
+      - name: Install the SDK this repo pins
+        run: |
+          set -euo pipefail
+          pin=$(python - <<'PY'
+          import pathlib
+          import tomllib
+
+          deps = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["dependencies"]
+          print(next(d for d in deps if d.startswith("google-genai")))
+          PY
+          )
+          echo "installing: ${pin}"
+          pip install "${pin}" "pydantic>=2"
+
+      - name: Probe both call shapes against the live model
+        id: probe
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # The probe imports `backend.*` from the checkout; the project is not
+          # installed, on purpose (see the install step above).
+          PYTHONPATH: .
+        # Exit 1 (the contract broke) and exit 2 (the probe could not run at all)
+        # mean opposite things and must reach the alert step apart — so the code is
+        # published as a step output *before* the step fails. `set +e` brackets the
+        # one command allowed to fail: a `run:` step already executes under `-e`, so
+        # a nonzero exit would otherwise skip the `echo` below and collapse 1 and 2
+        # into "crashed before it could assert".
+        run: |
+          set -uo pipefail
+          set +e
+          python3 .github/scripts/check_live_gemini_contract.py
+          code=$?
+          set -e
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Open or update an alert issue
+        # A nightly run has no PR to go red on, so the finding needs somewhere to
+        # land. A manual `workflow_dispatch` skips this — whoever pressed the button
+        # is already looking at the log.
+        if: failure() && github.event_name == 'schedule'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Empty when the job died before the probe step ran (checkout, Python
+          # setup or the install).
+          PROBE_EXIT: ${{ steps.probe.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+
+          # A stable label, not a title search: `gh issue list --search` uses the
+          # code-search grammar, where a title beginning `ci:` reads as a qualifier
+          # and matches nothing — so every nightly would open a fresh issue while
+          # the contract stayed broken.
+          LABEL="live-gemini-contract"
+          gh label create "$LABEL" \
+            --color B60205 \
+            --description "Alerts from .github/workflows/live-gemini-contract.yml" \
+            2>/dev/null || true
+
+          case "${PROBE_EXIT}" in
+            1)
+              TITLE="ci: live Gemini contract broken — a call shape's answer no longer parses"
+              DETAIL="A real finding (exit 1): at least one of \`GeminiTeacher._call\` / \`GeminiSkillGenerator._call\` got an answer from the live model that its pydantic schema rejects. The failing step's log names the shape, quotes the first characters of the answer and says which failure mode it looks like.
+
+          If the answer came back in a \`\`\`json fence, that is the JEB-1546 / JEB-1513 defect: the call is not holding structured output on this model. Move it to \`models.generate_content\` + \`response_schema\`. Do **not** fix this by stripping fences in the parser — the strict parser is what makes the break visible."
+              ;;
+            2)
+              TITLE="ci: live Gemini contract COULD NOT BE CHECKED"
+              DETAIL="The probe did not run (exit 2): no \`GEMINI_API_KEY\` secret, or the SDK failed to install. This is **not** evidence that the contract broke, and not evidence that it holds — the live path is simply unverified until a run exits 0 or 1."
+              ;;
+            *)
+              TITLE="ci: live Gemini contract run failed before it could probe"
+              DETAIL="The job failed without producing a probe result (exit code: '${PROBE_EXIT:-none}') — checkout, Python setup or dependency install. The state of the live contract is unknown; this is neither a pass nor a finding."
+              ;;
+          esac
+
+          BODY="${DETAIL}
+
+          Run: ${RUN_URL}
+
+          <!-- live-gemini-contract -->"
+
+          EXISTING=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Still failing (${TITLE}). Run: ${RUN_URL}"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label "$LABEL"
+          fi
