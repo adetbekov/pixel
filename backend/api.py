@@ -10,10 +10,10 @@ from __future__ import annotations
 import json
 import time
 from datetime import timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from . import db
 from .actions import Action, validate_plan
@@ -89,7 +89,14 @@ class Reply(BaseModel):
 
 
 class ChatIn(BaseModel):
-    text: str = Field(min_length=1, max_length=MAX_CHAT_TEXT)
+    # `strip_whitespace` runs before `min_length`, so a body of nothing but
+    # spaces is a 422 from Pydantic rather than a forward pass behind the
+    # engine's lock. It also means the engine and the log see the same trimmed
+    # text, and `max_length` counts what is actually sent to the model.
+    text: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_CHAT_TEXT),
+    ]
 
 
 class ActionIn(BaseModel):

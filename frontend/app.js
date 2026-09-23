@@ -2,6 +2,7 @@
 
 import * as api from './api.js';
 import { playPlan, setFace, onBusyChange } from './robot.js';
+import { refreshSkills, refreshProposals, onLearningChange } from './skills.js';
 
 const STATE_POLL_MS = 15000;
 
@@ -12,8 +13,6 @@ const sendEl = document.getElementById('send');
 const quickEl = document.getElementById('quick');
 const statsEl = document.getElementById('stats');
 const metricsEl = document.getElementById('metrics');
-const skillsEl = document.getElementById('skills');
-const proposalsEl = document.getElementById('proposals');
 
 const quickButtons = [...quickEl.querySelectorAll('button')];
 
@@ -140,7 +139,11 @@ async function send(call) {
     addReply(reply);
     renderState(reply.state);
     await playPlan(reply.actions ?? []);
-    refreshLearning();
+    /* Новый кластер для майнера появляется только на ответе учителя, так что
+       предложения перезапрашиваются именно тогда; статистика — каждый раз. */
+    refreshSkills();
+    refreshMetrics();
+    if (reply.engine === 'gemini') refreshProposals();
   } catch (error) {
     console.error(error);
     addMessage('system', 'Не получилось связаться с Pixel. Попробуй ещё раз.');
@@ -166,83 +169,7 @@ formEl.addEventListener('submit', (event) => {
   send(() => api.chat(text));
 });
 
-/* ─── Навыки, предложения, метрики ──────────────────────────────────────── */
-
-function empty(text) {
-  const box = document.createElement('div');
-  box.className = 'empty';
-  box.textContent = text;
-  return box;
-}
-
-function card(title, description) {
-  const el = document.createElement('div');
-  el.className = 'card';
-  const heading = document.createElement('h3');
-  heading.textContent = title;
-  const body = document.createElement('p');
-  body.textContent = description;
-  el.append(heading, body);
-  return el;
-}
-
-function renderSkills(skills) {
-  skillsEl.replaceChildren();
-  if (!skills.length) {
-    skillsEl.append(empty('Навыков пока нет. Pixel учится на новых командах.'));
-    return;
-  }
-  for (const skill of skills) {
-    const uses = skill.uses ?? skill.usage_count ?? 0;
-    skillsEl.append(card(
-      skill.name ?? skill.title ?? skill.id ?? 'Навык',
-      `${skill.description ?? ''} · вызовов: ${uses}`.trim(),
-    ));
-  }
-}
-
-function renderProposals(proposals) {
-  proposalsEl.replaceChildren();
-  if (!proposals.length) {
-    proposalsEl.append(empty('Предложений нет. Они появятся, когда наберутся похожие команды.'));
-    return;
-  }
-  for (const proposal of proposals) {
-    const skill = proposal.skill ?? proposal.skill_json ?? {};
-    const rate = proposal.match_rate;
-    const description = Number.isFinite(rate)
-      ? `${skill.description ?? ''} · совпадение на истории: ${Math.round(rate * 100)}%`.trim()
-      : (skill.description ?? '');
-    const el = card(skill.name ?? proposal.name ?? proposal.id ?? 'Предложение', description);
-
-    const actions = document.createElement('div');
-    actions.className = 'card-actions';
-    const setDisabled = (flag) => actions.querySelectorAll('button').forEach((b) => { b.disabled = flag; });
-
-    for (const [label, call, primary] of [
-      ['Принять', api.acceptProposal, true],
-      ['Отклонить', api.rejectProposal, false],
-    ]) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = primary ? 'btn btn-primary' : 'btn';
-      button.textContent = label;
-      button.addEventListener('click', async () => {
-        setDisabled(true);
-        try {
-          await call(proposal.id);
-          refreshLearning();
-        } catch (error) {
-          console.error(error);
-          setDisabled(false);
-        }
-      });
-      actions.append(button);
-    }
-    el.append(actions);
-    proposalsEl.append(el);
-  }
-}
+/* ─── Метрики ───────────────────────────────────────────────────────────── */
 
 function metricCard(label, value, lead = false) {
   const el = document.createElement('div');
@@ -270,20 +197,16 @@ function renderMetrics(metrics) {
   );
 }
 
-function safe(promise, fallback) {
-  return promise.catch((error) => { console.error(error); return fallback; });
+async function refreshMetrics() {
+  try {
+    renderMetrics(await api.getMetrics() ?? {});
+  } catch (error) {
+    console.error(error);
+  }
 }
 
-async function refreshLearning() {
-  const [skills, proposals, metrics] = await Promise.all([
-    safe(api.getSkills(), []),
-    safe(api.getProposals(), []),
-    safe(api.getMetrics(), {}),
-  ]);
-  renderSkills(Array.isArray(skills) ? skills : []);
-  renderProposals(Array.isArray(proposals) ? proposals : []);
-  renderMetrics(metrics ?? {});
-}
+/* accept / reject / «поискать новые навыки» меняют и метрики тоже. */
+onLearningChange(refreshMetrics);
 
 /* ─── Старт ─────────────────────────────────────────────────────────────── */
 
@@ -297,7 +220,9 @@ async function pollState() {
 
 addMessage('system', 'Pixel проснулся. Напиши ему или нажми кнопку.');
 pollState();
-refreshLearning();
+refreshSkills();
+refreshProposals();
+refreshMetrics();
 setInterval(pollState, STATE_POLL_MS);
 
 /* Ручная проверка выражений и анимаций из консоли. */

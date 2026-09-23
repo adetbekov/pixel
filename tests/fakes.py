@@ -55,6 +55,9 @@ class FakeEngine(SingleQuestionMixin):
         self.routes = routes or {}
         self.embeddings = embeddings or {}
         self.calls: list[dict[str, Any]] = []
+        #: The verbalized prompt of every counted call, so a test can assert what
+        #: text actually reached the model, not just that it was asked something.
+        self.prompts: list[str] = []
         self.embedded: list[list[str]] = []
 
     def _pick_for(self, state: str) -> str:
@@ -70,6 +73,7 @@ class FakeEngine(SingleQuestionMixin):
             # so a call that never reaches the model is not counted as one.
             return {}
         self.calls.append(questions)
+        self.prompts.append(state)
         if ROUTER_QUESTION in questions:
             options = questions[ROUTER_QUESTION]["criteria"]
             picked = self._pick_for(state)

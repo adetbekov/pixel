@@ -104,16 +104,10 @@ def test_a_control_phrase_falling_under_its_threshold_is_a_regression(active, ca
 
 def test_the_control_set_is_the_first_example_of_every_active_skill(active, candidate):
     """So it grows with the library instead of being a hard-coded four."""
-    seen = []
-
-    class Recording(FakeEngine):
-        def ask(self, state, questions):
-            seen.append(state)
-            return super().ask(state, questions)
-
-    check_regressions(Recording(routes=TRICK_ROUTES), [*active, candidate], active)
+    probe = engine()
+    check_regressions(probe, [*active, candidate], active)
     for skill in active:
-        assert any(skill.examples[0] in state for state in seen)
+        assert any(skill.examples[0] in prompt for prompt in probe.prompts)
 
 
 def test_a_skill_without_examples_is_not_a_control(candidate):
