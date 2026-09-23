@@ -10,7 +10,9 @@
 # Basic or IP allow-list) — publishing it open is an open tap on a paid API.
 services:
   pixel:
-    image: ghcr.io/adetbekov/pixel:latest
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     container_name: pixel
     pull_policy: never
     restart: unless-stopped
