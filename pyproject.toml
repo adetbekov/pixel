@@ -31,6 +31,10 @@ dependencies = [
 dev = [
     "pytest",
     "httpx",
+    # `scripts/assert_required_checks.py` parses .github/workflows/*.yml. PyYAML
+    # arrives transitively via uvicorn[standard], but that script and its tests
+    # depend on it directly, so it is named here rather than inherited.
+    "pyyaml>=6.0",
     # Pinned to a minor: `ruff check .` runs with no rule selection, so it uses
     # ruff's *default* rule set — and that set widens between minors. 0.16 added
     # PIE, RET and PLR rules to it, which turned a locally green PR red in CI

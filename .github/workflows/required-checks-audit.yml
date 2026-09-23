@@ -1,0 +1,195 @@
+name: Required Checks Audit
+
+# Asserts that a protected branch's protection still REQUIRES every context the
+# path through it depends on — today `lint + tests` and `frontend lint` on both
+# `dev` and `main` — that those context strings still match the job names that
+# produce them, and that each of those jobs can actually be started by an event
+# on a PR into that branch. The authoritative lists, the rationale and the exit
+# codes all live in scripts/assert_required_checks.py (JEB-1523).
+#
+# Why a scheduled workflow and not only a PR check: the required-check list
+# lives on GitHub, not in the diff, so it can drift with no commit to hang a PR
+# job off. The `pull_request` trigger below is the second half — it catches the
+# drift that DOES arrive as a diff (a job rename that orphans a required
+# context, or a trigger change that makes one unreachable) in the PR that causes
+# it. The reachability half genuinely needs both: the defect lives in the
+# relation between the PR's copy of a workflow and the base branch's copy, so a
+# PR run reads the checkout and fetches the audited branch, and the scheduled
+# run compares that branch with itself.
+#
+# Both branches are audited in one job, and the job keeps going after the first
+# failure: a finding on `dev` says nothing about `main`, and a run that stopped
+# at `dev` would leave `main` unevaluated while looking like it had an answer.
+#
+# This job is deliberately NOT a required status check itself, on either branch.
+# It reads protection; it must never be able to block the paths it protects.
+#
+# Note on the schedule: GitHub runs `schedule:` only from the default branch,
+# which for pixel is `main`. So the daily half starts working after this file
+# reaches `main` with the next dev -> main release; until then only the
+# `pull_request` half is live. "The workflow is in the repository" is not the
+# same statement as "the daily backstop runs".
+
+on:
+  schedule:
+    # 07:00 UTC, matching the sibling studio repos so a morning read of the
+    # Actions tab shows the release-invariant monitors together.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    types: [opened, reopened, synchronize, edited]
+    # Only the files that can break an assertion. Everything else would be a
+    # full-repo re-run of a check that reads GitHub, not the diff.
+    paths:
+      - ".github/workflows/**"
+      - "scripts/assert_required_checks.py"
+      - "tests/test_assert_required_checks.py"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    name: Required checks match branch protection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyYAML
+        run: pip install "pyyaml>=6.0"
+
+      - name: Assert required checks on dev and main
+        id: assert
+        shell: bash
+        env:
+          # The built-in token suffices: the script reads
+          # GET /repos/{repo}/branches/{branch}, which needs only read access.
+          # GET .../branches/{branch}/protection would need admin, which a
+          # workflow token cannot be granted — there is no `administration:` key
+          # in a workflow's `permissions:` block.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Exit 1 (a real finding) and exit 2 (protection unreadable) mean
+        # opposite things and must reach the alert step apart, per branch — so
+        # each branch's code is published as its own step output *before* the
+        # step fails. The job's own code is 1 if either branch found something
+        # (a finding is the actionable answer and outranks an unreadable one)
+        # and 2 only when nothing could be read at all.
+        #
+        # `set -uo pipefail` does NOT clear `-e` — a `run:` step is already
+        # executing under `-e` (with `shell: bash` above,
+        # `bash --noprofile --norc -eo pipefail {0}`), so a nonzero exit from the
+        # python call would abort the script right there and skip the
+        # `echo "exit_code_..."` lines below, collapsing exit 1/2 into "crashed
+        # before it could assert". `set +e` / `set -e` bracket the one command
+        # allowed to fail on purpose.
+        run: |
+          set -uo pipefail
+          worst=0
+          for branch in dev main; do
+            echo "::group::${branch}"
+            set +e
+            python3 scripts/assert_required_checks.py \
+              --repo "$GITHUB_REPOSITORY" --branch "$branch"
+            code=$?
+            set -e
+            echo "::endgroup::"
+            echo "exit_code_${branch}=${code}" >> "$GITHUB_OUTPUT"
+            if [ "$code" -eq 1 ]; then
+              worst=1
+            elif [ "$code" -eq 2 ] && [ "$worst" -eq 0 ]; then
+              worst=2
+            fi
+          done
+          echo "exit_code=${worst}" >> "$GITHUB_OUTPUT"
+          exit "$worst"
+
+      - name: Open or update an alert issue
+        # Scheduled runs have no PR to go red on, so the finding needs a place to
+        # land. PR runs skip this — the red check is the notification.
+        if: failure() && github.event_name == 'schedule'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Empty when the job died before the assert step reached that branch
+          # (setup failure, or a crash on the first branch of the loop).
+          ASSERT_EXIT_DEV: ${{ steps.assert.outputs.exit_code_dev }}
+          ASSERT_EXIT_MAIN: ${{ steps.assert.outputs.exit_code_main }}
+        run: |
+          set -euo pipefail
+
+          # A stable label, not a title search. `gh issue list --search` runs the
+          # free-text code-search grammar, where a title like
+          # "ci: required-checks audit failing on main" reads `ci:` as a
+          # qualifier and matches nothing — so every scheduled run while the gate
+          # was broken would open a fresh issue. The label is exact and survives
+          # a title reword.
+          #
+          # Dedupe is per branch: a `dev` finding folded into a `main`-titled
+          # issue (or dropped as a duplicate of one) is a finding nobody reads.
+          # The family label goes on too, so one query still lists all of them.
+          FAMILY_LABEL="required-checks-audit"
+          gh label create "$FAMILY_LABEL" \
+            --color B60205 \
+            --description "Alerts from .github/workflows/required-checks-audit.yml" \
+            2>/dev/null || true
+
+          for AUDIT_BRANCH in dev main; do
+            case "$AUDIT_BRANCH" in
+              dev) ASSERT_EXIT="${ASSERT_EXIT_DEV}" ;;
+              main) ASSERT_EXIT="${ASSERT_EXIT_MAIN}" ;;
+            esac
+
+            # 0 is the branch that passed — nothing to report for it.
+            if [ "${ASSERT_EXIT}" = "0" ]; then
+              continue
+            fi
+
+            LABEL="${FAMILY_LABEL}-${AUDIT_BRANCH}"
+            gh label create "$LABEL" \
+              --color B60205 \
+              --description "Alerts from .github/workflows/required-checks-audit.yml" \
+              2>/dev/null || true
+
+            case "${ASSERT_EXIT}" in
+              2)
+                TITLE="ci: required-checks audit CANNOT DETERMINE protection on ${AUDIT_BRANCH}"
+                DETAIL="The audit could not **read** ${AUDIT_BRANCH}'s branch protection (exit 2). This is **not** evidence that a gate is missing — an unreadable protection read is never reported as an absent gate. Check whether the run's token can still GET \`repos/${GITHUB_REPOSITORY}/branches/${AUDIT_BRANCH}\`, then re-run the workflow.
+
+          Nothing needs restoring until a run exits 1."
+                ;;
+              1)
+                TITLE="ci: required-checks audit failing on ${AUDIT_BRANCH}"
+                DETAIL="A real finding (exit 1): ${AUDIT_BRANCH}'s branch protection no longer requires one of its gates, or a required context no longer matches its job name. The failing step's log names the exact context.
+
+          Restore the context with:
+          \`gh api --method PATCH repos/${GITHUB_REPOSITORY}/branches/${AUDIT_BRANCH}/protection/required_status_checks --input <full checks payload>\`
+
+          Do not close this by removing the assertion."
+                ;;
+              *)
+                TITLE="ci: required-checks audit run failed before it could assert (${AUDIT_BRANCH})"
+                DETAIL="The audit job failed without producing an assertion result for ${AUDIT_BRANCH} (exit code: '${ASSERT_EXIT:-none}') — checkout, Python setup or dependency install. The state of ${AUDIT_BRANCH}'s protection is unknown; this is neither a pass nor a finding."
+                ;;
+            esac
+
+            BODY="${DETAIL}
+
+          Run: ${RUN_URL}
+
+          <!-- required-checks-audit -->"
+
+            EXISTING=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" --body "Still failing (${TITLE}). Run: ${RUN_URL}"
+            else
+              gh issue create --title "$TITLE" --body "$BODY" --label "$FAMILY_LABEL" --label "$LABEL"
+            fi
+          done
