@@ -1,0 +1,53 @@
+name: Guard main PR head
+
+# Branch protection on `main` can enforce reviews/status checks but cannot
+# restrict which branch a PR's head is. This closes that gap at PR-open time:
+# any PR targeting `main` must come from `dev` (the release branch). Feature/
+# fix PRs target `dev`; only the deliberate `dev → main` release PR is allowed
+# through. See jeb-git-pr / jeb-release.
+
+# `pull_request`, NOT `pull_request_target` — deliberate, and only for now
+# (JEB-1522). The four original studio repos use `pull_request_target` because
+# it resolves the workflow from the *base* branch, which the head cannot
+# rewrite. pixel's `main` does not carry this file yet: under
+# `pull_request_target` the guard would resolve from a `main` without it, never
+# report, and — once `main PRs must come from dev` is a required context —
+# permanently block the very release PR that would deliver the file, with
+# `enforce_admins: true` leaving no bypass.
+#
+# Mandatory order (jeb-release, "Ordering trap"):
+#   1. this file lands on `dev` under `pull_request`
+#   2. it reports on a live PR into `main`, then the context is required
+#   3. a release carries the file to `main`
+#   4. only then may the trigger be switched to `pull_request_target`
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+    branches: [main]
+
+# Read-only default. The single job reads `github.head_ref` from the event
+# payload — it does not even check the repo out.
+permissions:
+  contents: read
+
+jobs:
+  guard-main-head:
+    name: main PRs must come from dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify head is dev
+        # `github.head_ref` is the bare branch name — a fork's branch named
+        # `dev` yields the same value as this repo's release branch. Check the
+        # head repository too, so only <this repo>@dev passes.
+        # `head.repo.full_name` is null when the fork is gone: empty != this
+        # repo, so the guard fails closed.
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          if [ "$HEAD_REF" != "dev" ] || [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::error::PRs into main must come from ${THIS_REPO}@dev (the release branch). Got ${HEAD_REPO:-<unknown>}@${HEAD_REF}. Feature PRs target dev; see jeb-git-pr / jeb-release."
+            exit 1
+          fi
+          echo "OK: PR into main has head=${THIS_REPO}@dev"
