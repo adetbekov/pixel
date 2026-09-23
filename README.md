@@ -58,7 +58,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | Key | Default | What it does |
 | --- | --- | --- |
 | `GEMINI_API_KEY` | — | Empty = teacher and miner are off. A router miss answers with a polite stub. |
-| `GEMINI_TEACHER_MODEL` | `gemini-3.1-flash-lite` | Model that answers router misses. |
+| `GEMINI_TEACHER_MODEL` | `models/gemini-2.5-flash-lite` | Model that answers router misses. |
 | `GEMINI_MINER_MODEL` | `models/gemini-2.5-flash-lite` | Model that drafts new skills, offline. |
 | `PIXEL_DB_PATH` | `./pixel.db` | SQLite file. |
 | `LAYA_MODEL` | `multilingual` | Laya subfolder. The English root checkpoint answers Cyrillic confidently and wrongly. |
@@ -116,7 +116,7 @@ so fallbacks are logged too. `raw_response` is never returned over the API.
 
 Without `GEMINI_API_KEY` the app still starts: the teacher is off, a miss answers with a polite
 stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` overrides the model
-(default `gemini-3.1-flash-lite`).
+(default `models/gemini-2.5-flash-lite`).
 
 ## Learning — the skill miner
 
@@ -199,6 +199,33 @@ slowly once there is history behind it, so the windowed one is where the learnin
 The panel refreshes on load, after every reply, after a vote, and after accept/reject — on events,
 never on a timer. `GET /api/history` redraws the last interactions with their votes after a page
 reload; without it the 👎 survives in the database but vanishes from the screen.
+
+## Deploy
+
+Live at **https://pixel.yeldos.dev** — one container on the NAS (Portainer stack `pixel`), TLS and
+access control at Nginx Proxy Manager. The app has **no auth and no rate limit**, and both
+`/api/chat` and `/api/mine` spend `GEMINI_API_KEY`, so the proxy host carries an Access List (HTTP
+Basic or IP allow-list). That list is the only thing standing between a loop script and the key's
+quota — do not publish the host without it.
+
+`Dockerfile` + `docker-compose.yml` are the whole deployment. Redeploy after a merge is two steps:
+
+```
+docker build -t pixel:latest .                    # on the NAS, from a fresh checkout of dev
+docker compose -p pixel up -d --force-recreate     # or: redeploy the `pixel` stack in Portainer
+```
+
+- **Volume `pixel_pixel_data` → `/data`** — mandatory. It holds the SQLite DB (`PIXEL_DB_PATH`, WAL
+  mode) *and* the ~650 MB Laya checkpoint (`HF_HOME`). Lose it and the robot forgets every mined
+  skill and re-downloads the weights on the next start.
+- **Memory** — 3 GB limit; 2 GB is the floor (mmBERT-base, 322M, resident in the process).
+- **Network** — `npm_network` (external, owned by the Nginx Proxy Manager stack). No published
+  port; port 8000 is reachable only from the proxy.
+- **Env** — see `.env.example`; values live in the Portainer stack env, never in the repo. A missing
+  `GEMINI_API_KEY` is supported: Pixel starts and runs on Laya alone.
+- **Cold start** is slow by design (~70 s: weights download), warm start 8-10 s. The healthcheck
+  allows a 180 s `start_period` — shorten it and the orchestrator kills the download and restarts
+  into the same download.
 
 ## Pipeline
 

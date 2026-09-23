@@ -1,8 +1,11 @@
 """Scripted stand-ins for both models, so CI needs neither weights nor network.
 
 ``FakeEngine`` replaces Laya. ``FakeGeminiClient`` replaces the ``google.genai``
-client inside :class:`backend.teacher.client.GeminiTeacher`, which takes its
+client inside :class:`backend.teacher.client.GeminiTeacher` and
+:class:`backend.miner.generate.GeminiSkillGenerator`, both of which take their
 client as an argument precisely so the retry and fallback paths are testable.
+One instance carries both call surfaces — ``models`` for the teacher,
+``interactions`` for the miner — off a single script.
 """
 
 import hashlib
@@ -91,30 +94,57 @@ class FakeInteraction:
     output_text: str
 
 
-class FakeInteractions:
-    """``client.interactions`` — one scripted answer per call.
+@dataclass
+class FakeResponse:
+    text: str
+
+
+class FakeScript:
+    """One scripted answer per call, shared by both call surfaces.
 
     A scripted entry is either the raw text the model would return, or an
     exception instance to raise instead (a timeout, a 500). The last entry is
-    reused if the teacher asks more times than the script has answers.
+    reused if the caller asks more times than the script has answers.
     """
 
     def __init__(self, script: list[Any]) -> None:
         self.script = script
         self.calls: list[dict[str, Any]] = []
 
-    def create(self, **kwargs: Any) -> FakeInteraction:
+    def answer(self, kwargs: dict[str, Any]) -> str:
         self.calls.append(kwargs)
         answer = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
         if isinstance(answer, BaseException):
             raise answer
-        return FakeInteraction(output_text=answer)
+        return answer
+
+
+class FakeInteractions:
+    """``client.interactions`` — the miner's call surface."""
+
+    def __init__(self, script: FakeScript) -> None:
+        self._script = script
+
+    def create(self, **kwargs: Any) -> FakeInteraction:
+        return FakeInteraction(output_text=self._script.answer(kwargs))
+
+
+class FakeModels:
+    """``client.models`` — the teacher's, which the cheap tier forced it onto."""
+
+    def __init__(self, script: FakeScript) -> None:
+        self._script = script
+
+    def generate_content(self, **kwargs: Any) -> FakeResponse:
+        return FakeResponse(text=self._script.answer(kwargs))
 
 
 class FakeGeminiClient:
     def __init__(self, *script: Any) -> None:
-        self.interactions = FakeInteractions(list(script))
+        self._script = FakeScript(list(script))
+        self.interactions = FakeInteractions(self._script)
+        self.models = FakeModels(self._script)
 
     @property
     def calls(self) -> list[dict[str, Any]]:
-        return self.interactions.calls
+        return self._script.calls
