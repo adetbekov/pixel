@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [dev, main]
 
+# Both jobs only read the checkout — nothing pushes, comments on the PR or writes
+# packages. Third-party install scripts (`pip install -e`, `npm ci`) run in the same
+# environment as GITHUB_TOKEN, so it gets the narrowest scope that still works.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -25,8 +31,11 @@ jobs:
       # `laya` depends on torch. The default PyPI wheel is the CUDA build (~1 GB);
       # CI only ever needs CPU, so pre-seed the CPU wheel and let the editable
       # install below see the requirement as already satisfied.
+      #
+      # Same exact pin as the Dockerfile — CI is only evidence about the image if
+      # both install the same torch. Bump the two lines together.
       - name: Install CPU torch
-        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
 
       - name: Install project
         run: pip install -e ".[dev]"
@@ -38,3 +47,36 @@ jobs:
       # those paths are mocked in tests.
       - name: Tests
         run: pytest -q
+
+  # `frontend/` ships as bare ES modules with no build step, so nothing but this job
+  # ever parses it. ESLint is a CI-only devDependency; production stays dependency-free.
+  frontend:
+    name: frontend lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install lint toolchain
+        run: npm ci
+
+      - name: Lint JS
+        run: npx eslint frontend
+
+      # Fixtures are fetched verbatim by mock.js — a broken one fails only at runtime.
+      - name: Validate mock fixtures
+        run: |
+          shopt -s nullglob
+          files=(frontend/mocks/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No fixtures found under frontend/mocks/ — expected at least one." >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            jq empty "$f"
+            echo "ok: $f"
+          done

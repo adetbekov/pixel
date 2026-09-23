@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel - робот-питомец</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">Pixel</span>
+  <p class="brand-note">Робот-питомец, который учится новым навыкам</p>
+</header>
+
+<main class="layout">
+
+  <!-- ─── Левая колонка: робот, состояние, быстрые действия ─────────────── -->
+  <section class="pane pane-robot" aria-label="Робот">
+    <div class="robot-stage" id="robot-stage">
+      <div class="speech" id="speech" hidden></div>
+
+      <svg id="pixel" class="face-curious" viewBox="0 0 200 230" role="img"
+           aria-labelledby="pixel-title">
+        <title id="pixel-title">Робот Pixel</title>
+
+        <g id="pixel-root">
+          <!-- тень -->
+          <ellipse id="pixel-shadow" cx="100" cy="214" rx="52" ry="8"/>
+
+          <!-- антенна -->
+          <g id="pixel-antenna">
+            <line x1="100" y1="32" x2="100" y2="14" class="antenna-rod"/>
+            <circle class="antenna-bulb" cx="100" cy="10" r="6"/>
+          </g>
+
+          <!-- корпус -->
+          <g id="pixel-body">
+            <rect class="shell" x="52" y="118" width="96" height="74" rx="24"/>
+            <rect class="panel" x="76" y="140" width="48" height="26" rx="9"/>
+            <circle class="led" cx="88" cy="153" r="3.5"/>
+            <circle class="led led-dim" cx="100" cy="153" r="3.5"/>
+            <circle class="led led-dim" cx="112" cy="153" r="3.5"/>
+            <rect class="foot" x="66" y="190" width="26" height="14" rx="7"/>
+            <rect class="foot" x="108" y="190" width="26" height="14" rx="7"/>
+          </g>
+
+          <!-- руки -->
+          <g id="pixel-arm-l"><rect class="limb" x="38" y="126" width="16" height="48" rx="8"/></g>
+          <g id="pixel-arm-r"><rect class="limb" x="146" y="126" width="16" height="48" rx="8"/></g>
+
+          <!-- голова -->
+          <g id="pixel-head">
+            <rect class="shell" x="46" y="32" width="108" height="82" rx="26"/>
+            <rect class="visor" x="56" y="44" width="88" height="58" rx="20"/>
+
+            <g id="pixel-eye-l" transform="translate(78,70)">
+              <path class="f f-happy"   d="M-11 4 Q0 -9 11 4"/>
+              <path class="f f-sad"     d="M-11 -4 Q0 9 11 -4"/>
+              <path class="f f-sleepy"  d="M-11 0 H11"/>
+              <path class="f f-angry"   d="M-12 -6 L10 3"/>
+              <circle class="f f-curious solid" r="7"/>
+            </g>
+
+            <g id="pixel-eye-r" transform="translate(122,70)">
+              <path class="f f-happy"   d="M-11 4 Q0 -9 11 4"/>
+              <path class="f f-sad"     d="M-11 -4 Q0 9 11 -4"/>
+              <path class="f f-sleepy"  d="M-11 0 H11"/>
+              <path class="f f-angry"   d="M12 -6 L-10 3"/>
+              <circle class="f f-curious solid" r="9.5"/>
+            </g>
+
+            <g id="pixel-mouth" transform="translate(100,94)">
+              <path class="f f-happy"   d="M-19 -2 Q0 13 19 -2"/>
+              <path class="f f-sad"     d="M-17 6 Q0 -8 17 6"/>
+              <path class="f f-sleepy"  d="M-7 0 H7"/>
+              <path class="f f-angry"   d="M-14 0 H14"/>
+              <ellipse class="f f-curious" rx="6.5" ry="8.5"/>
+            </g>
+          </g>
+
+          <!-- сонные «Z» -->
+          <g id="pixel-zzz" aria-hidden="true">
+            <text class="z z1" x="150" y="46">Z</text>
+            <text class="z z2" x="164" y="30">Z</text>
+            <text class="z z3" x="176" y="16">Z</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+
+    <div class="stats" id="stats">
+      <div class="stat">
+        <div class="stat-head"><span>Настроение</span><b data-val="mood">0</b></div>
+        <div class="bar"><i data-bar="mood" style="width:0%"></i></div>
+      </div>
+      <div class="stat">
+        <div class="stat-head"><span>Энергия</span><b data-val="energy">0</b></div>
+        <div class="bar"><i data-bar="energy" style="width:0%"></i></div>
+      </div>
+      <div class="stat">
+        <div class="stat-head"><span>Сытость</span><b data-val="fullness">0</b></div>
+        <div class="bar"><i data-bar="fullness" style="width:0%"></i></div>
+      </div>
+    </div>
+
+    <div class="quick" id="quick">
+      <button type="button" class="btn" data-action="feed">Покормить</button>
+      <button type="button" class="btn" data-action="pet">Погладить</button>
+      <button type="button" class="btn" data-action="play">Поиграть</button>
+    </div>
+  </section>
+
+  <!-- ─── Правая колонка: чат ───────────────────────────────────────────── -->
+  <section class="pane pane-chat" aria-label="Чат с роботом">
+    <div class="chat" id="chat" role="log" aria-live="polite"></div>
+    <form class="composer" id="composer">
+      <label class="visually-hidden" for="input">Сообщение роботу</label>
+      <input id="input" name="text" type="text" autocomplete="off"
+             placeholder="Скажи что-нибудь Pixel..." maxlength="200">
+      <button type="submit" class="btn btn-primary" id="send">Отправить</button>
+    </form>
+  </section>
+
+  <!-- ─── Навыки, предложения, метрики ──────────────────────────────────── -->
+  <section class="pane pane-skills" aria-label="Навыки и обучение">
+    <div class="metrics" id="metrics"></div>
+
+    <div class="cols">
+      <div class="col">
+        <div class="col-head"><h2>Навыки</h2></div>
+        <div id="skills" class="list"></div>
+      </div>
+      <div class="col">
+        <div class="col-head">
+          <h2>Предложенные навыки</h2>
+          <button type="button" class="btn btn-mine" id="mine">Поискать новые навыки</button>
+        </div>
+        <div id="proposals" class="list"></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

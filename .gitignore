@@ -13,6 +13,9 @@ dist/
 .coverage
 htmlcov/
 
+# Node (CI-only frontend lint toolchain)
+node_modules/
+
 # Environments
 .venv/
 venv/
@@ -29,3 +32,5 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+*.db-wal
+*.db-shm

@@ -1,0 +1,42 @@
+[
+  {
+    "interaction_id": 60,
+    "user_text": "feed",
+    "reply": "Ням!",
+    "engine": "button",
+    "skill_id": null,
+    "confidence": null,
+    "latency_ms": 3,
+    "feedback": null
+  },
+  {
+    "interaction_id": 61,
+    "user_text": "привет",
+    "reply": "Привет-привет!",
+    "engine": "laya",
+    "skill_id": "greet",
+    "confidence": 0.91,
+    "latency_ms": 38,
+    "feedback": 1
+  },
+  {
+    "interaction_id": 62,
+    "user_text": "изобрази робота-пылесоса",
+    "reply": "Вжжж! Убираюсь.",
+    "engine": "gemini",
+    "skill_id": null,
+    "confidence": 0.24,
+    "latency_ms": 2140,
+    "feedback": -1
+  },
+  {
+    "interaction_id": 63,
+    "user_text": "покрутись",
+    "reply": "Кручусь!",
+    "engine": "laya",
+    "skill_id": "spin",
+    "confidence": 0.84,
+    "latency_ms": 41,
+    "feedback": null
+  }
+]

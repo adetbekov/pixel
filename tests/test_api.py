@@ -1,0 +1,235 @@
+"""Contract tests — every one of the nine frozen endpoints, driven in-process."""
+
+import httpx
+import pytest
+
+from backend.api import MAX_CHAT_TEXT
+from backend.brain.engine import ScoreResult
+from backend.main import app
+from backend.state import read_state, utcnow, write_state
+
+STATE_KEYS = {"mood", "energy", "fullness", "face"}
+REPLY_KEYS = {
+    "interaction_id",
+    "reply",
+    "actions",
+    "engine",
+    "skill_id",
+    "confidence",
+    "latency_ms",
+    "state",
+}
+
+
+@pytest.fixture()
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture()
+async def client(conn):
+    # The `conn` fixture already pointed the module-level connection at a tmp
+    # database, so the app's lifespan is deliberately not run here.
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        yield async_client
+
+
+def assert_reply(body: dict, engine: str) -> None:
+    assert set(body) == REPLY_KEYS
+    assert body["engine"] == engine
+    assert isinstance(body["interaction_id"], int)
+    assert isinstance(body["latency_ms"], int)
+    assert set(body["state"]) == STATE_KEYS
+    for action in body["actions"]:
+        assert set(action) == {"action", "args"}
+
+
+@pytest.mark.anyio
+async def test_get_state(client):
+    response = await client.get("/api/state")
+    assert response.status_code == 200
+    assert set(response.json()) == STATE_KEYS
+
+
+@pytest.mark.anyio
+async def test_feed_raises_fullness(client):
+    before = (await client.get("/api/state")).json()["fullness"]
+    response = await client.post("/api/action", json={"name": "feed"})
+    assert response.status_code == 200
+    body = response.json()
+    assert_reply(body, "button")
+    assert body["actions"]
+    assert body["state"]["fullness"] > before
+    assert body["state"]["face"] == "happy"
+
+
+@pytest.mark.anyio
+async def test_play_refuses_when_energy_is_low(client, conn):
+    state = read_state(conn)
+    state.energy = 10
+    write_state(conn, state, utcnow())
+
+    body = (await client.post("/api/action", json={"name": "play"})).json()
+    assert [a["action"] for a in body["actions"]] == ["set_face", "say"]
+    assert body["state"]["face"] == "sleepy"
+    assert body["reply"] == "Я устал, давай позже"
+
+
+@pytest.mark.anyio
+async def test_unknown_button_is_rejected(client):
+    assert (await client.post("/api/action", json={"name": "launch_rocket"})).status_code == 422
+
+
+@pytest.mark.anyio
+async def test_chat_runs_a_skill(client, seeded, engine):
+    engine.pick, engine.confidence = "greet", 0.93
+    body = (await client.post("/api/chat", json={"text": "привет"})).json()
+    assert_reply(body, "laya")
+    assert body["skill_id"] == "greet"
+    assert body["confidence"] == pytest.approx(0.93)
+    assert body["reply"] == "Привет! Я Пиксель."
+    assert body["state"]["face"] == "happy"
+    assert body["latency_ms"] >= 0
+
+
+@pytest.mark.anyio
+async def test_chat_miss_answers_politely_without_running_a_skill(client, seeded, engine):
+    engine.pick, engine.confidence = "unknown", 0.41
+    body = (await client.post("/api/chat", json={"text": "расскажи про квантовую физику"})).json()
+    assert_reply(body, "laya")
+    assert body["skill_id"] is None
+    assert body["reply"] == "Я пока не понял"
+
+
+@pytest.mark.anyio
+async def test_chat_respects_the_robot_state(client, seeded, engine, conn):
+    state = read_state(conn)
+    state.energy = 10
+    write_state(conn, state, utcnow())
+
+    engine.pick, engine.confidence = "play", 0.97
+    engine.answers = {"intensity": ScoreResult(2.0, 0.9, {"2": 1.0})}
+    body = (await client.post("/api/chat", json={"text": "поиграем"})).json()
+    assert body["skill_id"] == "play"
+    assert body["state"]["face"] == "sleepy"
+    assert body["reply"] == "Я устал, давай позже"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "text",
+    ["", "а" * (MAX_CHAT_TEXT + 1), "          ", " \t\r\n "],
+    ids=["empty", "over-the-limit", "spaces", "tabs-and-newlines"],
+)
+async def test_chat_rejects_empty_and_oversized_text(client, seeded, engine, text):
+    # The point of the cap: a rejected body must never reach the engine, whose
+    # single lock every other chat request is queued behind. Whitespace-only text
+    # costs the same forward pass as a real command and is worth exactly nothing.
+    assert (await client.post("/api/chat", json={"text": text})).status_code == 422
+    assert engine.calls == []
+
+
+@pytest.mark.anyio
+async def test_chat_accepts_text_at_the_limit(client, seeded, engine):
+    # Padded past the cap: `max_length` counts what is left after trimming, which
+    # is what the model is actually given.
+    padded = "  " + "а" * MAX_CHAT_TEXT + "  "
+    response = await client.post("/api/chat", json={"text": padded})
+    assert response.status_code == 200
+    assert engine.calls
+
+
+@pytest.mark.anyio
+async def test_chat_trims_surrounding_whitespace(client, seeded, engine, conn):
+    engine.pick, engine.confidence = "greet", 0.93
+    response = await client.post("/api/chat", json={"text": "  привет  "})
+
+    assert response.status_code == 200
+    assert engine.prompts == ['Команда пользователя: "привет"']
+    stored = conn.execute("SELECT user_text FROM interactions ORDER BY id DESC LIMIT 1")
+    assert stored.fetchone()["user_text"] == "привет"
+
+
+@pytest.mark.anyio
+async def test_chat_without_an_engine_is_503(client, seeded):
+    assert (await client.post("/api/chat", json={"text": "привет"})).status_code == 503
+
+
+@pytest.mark.anyio
+async def test_feedback(client):
+    interaction_id = (await client.post("/api/action", json={"name": "pet"})).json()[
+        "interaction_id"
+    ]
+    response = await client.post(
+        "/api/feedback", json={"interaction_id": interaction_id, "value": 1}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.anyio
+async def test_feedback_unknown_interaction_is_404(client):
+    response = await client.post("/api/feedback", json={"interaction_id": 999, "value": -1})
+    assert response.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_feedback_rejects_other_values(client):
+    response = await client.post("/api/feedback", json={"interaction_id": 1, "value": 0})
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_the_proposal_endpoints_answer_on_an_empty_database(client):
+    """Nothing mined yet: an empty list, an honest zero, and 404 for an id that
+    was never proposed — the stage-1 stubs became real in stage 4."""
+    assert (await client.get("/api/proposals")).json() == []
+    assert (await client.post("/api/proposals/abc/accept")).status_code == 404
+    assert (await client.post("/api/proposals/abc/reject")).status_code == 404
+    assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+
+
+@pytest.mark.anyio
+async def test_skills_are_empty_before_seeding(client):
+    assert (await client.get("/api/skills")).json() == []
+
+
+@pytest.mark.anyio
+async def test_skill_cards_count_uses_and_feedback(client, seeded, engine):
+    engine.pick, engine.confidence = "greet", 0.93
+    interaction_id = (await client.post("/api/chat", json={"text": "привет"})).json()[
+        "interaction_id"
+    ]
+    await client.post("/api/feedback", json={"interaction_id": interaction_id, "value": -1})
+
+    cards = {card["id"]: card for card in (await client.get("/api/skills")).json()}
+    assert set(cards) == {"greet", "feed", "play", "sleep"}
+    assert cards["greet"]["uses"] == 1
+    assert cards["greet"]["dislikes"] == 1
+    assert cards["greet"]["likes"] == 0
+    assert cards["play"]["uses"] == 0
+    assert cards["play"]["origin"] == "seed"
+
+
+@pytest.mark.anyio
+async def test_metrics(client):
+    await client.post("/api/action", json={"name": "feed"})
+    body = (await client.get("/api/metrics")).json()
+    assert set(body) == {
+        "laya_share",
+        "laya_share_24h",
+        "avg_latency_laya_ms",
+        "avg_latency_gemini_ms",
+        "skills_active",
+        "skills_disabled",
+        "total_commands",
+        "gemini_calls_24h",
+        "teacher_calls_24h",
+    }
+    # A button click is not a command: it has neither a router nor a teacher, so
+    # counting it would inflate the headline share with clicks (see
+    # `backend/metrics.py`, and `tests/test_metrics.py` for the rest).
+    assert body["total_commands"] == 0
+    # No Laya and no Gemini yet — the share must not divide by zero.
+    assert body["laya_share"] == 0.0

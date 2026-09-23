@@ -13,8 +13,17 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "pydantic>=2",
-    "laya",
-    "google-genai",
+    # Pinned to a minor: laya is the router's whole brain and its 0.3.x line still
+    # moves — the stand and CI were both built on 0.3.11, which the confidence
+    # thresholds in `backend/brain/router.py` are calibrated against. An unpinned
+    # install lets a 0.4 land on a rebuild of an already-green commit and silently
+    # reshape those scores. Bump this line deliberately, re-checking the thresholds.
+    "laya>=0.3.10,<0.4",
+    # Pinned: the teacher path is shaped by this SDK's surface — `interactions.create`,
+    # `response_format`, `interaction.output_text` — and two call styles already coexist
+    # inside 2.x. `tests/test_teacher.py::test_the_sdk_still_has_the_surface_we_call`
+    # asserts that surface, so a break fails CI instead of production.
+    "google-genai>=2.25,<3",
     "numpy",
 ]
 
@@ -22,11 +31,19 @@ dependencies = [
 dev = [
     "pytest",
     "httpx",
-    "ruff",
+    # Pinned to a minor: `ruff check .` runs with no rule selection, so it uses
+    # ruff's *default* rule set — and that set widens between minors. 0.16 added
+    # PIE, RET and PLR rules to it, which turned a locally green PR red in CI
+    # the moment the unpinned install picked up 0.16.8. Bump this line
+    # deliberately, fixing the new findings in the same commit.
+    "ruff>=0.16,<0.17",
 ]
 
 [tool.setuptools.packages.find]
 include = ["backend*"]
+
+[tool.setuptools.package-data]
+"backend.brain" = ["seed_skills/*.json"]
 
 [tool.ruff]
 line-length = 100

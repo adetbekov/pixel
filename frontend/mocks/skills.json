@@ -1,0 +1,53 @@
+[
+  {
+    "id": "greet",
+    "name": "Приветствие",
+    "description": "приветствие",
+    "status": "active",
+    "origin": "seed",
+    "uses": 12,
+    "likes": 5,
+    "dislikes": 0
+  },
+  {
+    "id": "play",
+    "name": "Игра",
+    "description": "игра с роботом",
+    "status": "active",
+    "origin": "seed",
+    "uses": 31,
+    "likes": 9,
+    "dislikes": 2
+  },
+  {
+    "id": "feed",
+    "name": "Кормление",
+    "description": "дать роботу еду",
+    "status": "active",
+    "origin": "seed",
+    "uses": 8,
+    "likes": 3,
+    "dislikes": 1
+  },
+  {
+    "id": "sleep",
+    "name": "Сон",
+    "description": "уложить робота спать",
+    "status": "active",
+    "origin": "seed",
+    "uses": 4,
+    "likes": 1,
+    "dislikes": 0
+  },
+  {
+    "id": "echo",
+    "name": "Повторюшка",
+    "description": "повторить фразу за пользователем",
+    "status": "disabled",
+    "origin": "mined",
+    "uses": 3,
+    "likes": 0,
+    "dislikes": 3,
+    "disabled_reason": "dislike_rate"
+  }
+]

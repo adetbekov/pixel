@@ -1,0 +1,42 @@
+{
+  "id": "play",
+  "name": "Игра",
+  "description": "игра с роботом",
+  "examples": ["поиграй", "давай играть", "поиграем?", "развлеки меня", "потанцуем"],
+  "questions": {
+    "intensity": {
+      "type": "score",
+      "instructions": "Насколько бурной игры просит пользователь",
+      "criteria": ["спокойно", "обычно", "бурно"]
+    }
+  },
+  "rules": [
+    {
+      "when": {"energy": "low"},
+      "actions": [
+        {"action": "set_face", "args": {"face": "sleepy"}},
+        {"action": "say", "args": {"text": "Я устал, давай позже"}}
+      ]
+    },
+    {
+      "when": {"intensity": ">=1.5"},
+      "actions": [
+        {"action": "jump"},
+        {"action": "spin"},
+        {"action": "dance"},
+        {"action": "set_face", "args": {"face": "happy"}},
+        {"action": "say", "args": {"text": "Ура, играем!"}}
+      ]
+    },
+    {
+      "when": {},
+      "actions": [
+        {"action": "jump"},
+        {"action": "set_face", "args": {"face": "happy"}},
+        {"action": "say", "args": {"text": "Давай! Прыг-скок."}}
+      ]
+    }
+  ],
+  "status": "active",
+  "origin": "seed"
+}
