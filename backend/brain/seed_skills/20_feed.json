@@ -1,0 +1,38 @@
+{
+  "id": "feed",
+  "name": "Кормление",
+  "description": "дать роботу еду",
+  "examples": ["покорми", "дай поесть", "хочешь кушать?", "вот тебе еда", "поешь"],
+  "questions": {
+    "wants_food": {
+      "type": "noul",
+      "instructions": "Пользователь предлагает роботу еду или просит его поесть"
+    }
+  },
+  "rules": [
+    {
+      "when": {"fullness": "high"},
+      "actions": [
+        {"action": "set_face", "args": {"face": "angry"}},
+        {"action": "say", "args": {"text": "Я сыт, больше не влезет!"}}
+      ]
+    },
+    {
+      "when": {"wants_food": "yes"},
+      "actions": [
+        {"action": "eat"},
+        {"action": "set_face", "args": {"face": "happy"}},
+        {"action": "say", "args": {"text": "Ням! Очень вкусно."}}
+      ]
+    },
+    {
+      "when": {},
+      "actions": [
+        {"action": "eat"},
+        {"action": "say", "args": {"text": "Ладно, немного поем."}}
+      ]
+    }
+  ],
+  "status": "active",
+  "origin": "seed"
+}

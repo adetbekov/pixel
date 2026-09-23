@@ -28,6 +28,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["backend*"]
 
+[tool.setuptools.package-data]
+"backend.brain" = ["seed_skills/*.json"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

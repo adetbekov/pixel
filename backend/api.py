@@ -16,6 +16,9 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .actions import Action, validate_plan
+from .brain.engine import get_engine
+from .brain.router import RouterHit, route
+from .brain.skill import load_skills
 from .state import apply_actions, iso, read_state, utcnow
 
 router = APIRouter(prefix="/api")
@@ -47,7 +50,11 @@ TIRED_PLAN: list[dict[str, Any]] = [
     {"action": "say", "args": {"text": "Я устал, давай позже"}},
 ]
 
-CHAT_STUB_REPLY = "Пока я умею только кнопки — скоро научусь понимать слова!"
+# What a router miss answers with until stage 3 hands it to Gemini instead.
+MISS_PLAN: list[dict[str, Any]] = [
+    {"action": "set_face", "args": {"face": "curious"}},
+    {"action": "say", "args": {"text": "Я пока не понял"}},
+]
 
 
 class StateOut(BaseModel):
@@ -232,17 +239,33 @@ def post_action(payload: ActionIn) -> dict:
 
 @router.post("/chat", response_model=Reply)
 def post_chat(payload: ChatIn) -> dict:
-    """Stage-1 stub: no router and no teacher yet, so every message gets the same
-    polite canned answer. Stages 2 and 3 replace the body, not the shape."""
+    """The fast path: Laya picks a skill, the skill's rules pick the plan.
+
+    Stage 3 will send a miss to Gemini; today it answers with :data:`MISS_PLAN`.
+    """
     started = time.perf_counter()
+    try:
+        engine = get_engine()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    conn = db.get_conn()
+    # `db.lock` is a plain Lock and `execute_plan` takes it itself, so this read
+    # has to be finished and released before the router runs — exactly the order
+    # `post_action` uses. The engine's own lock is never nested with this one.
+    with db.lock:
+        state = read_state(conn)
+        skills = load_skills(conn, only_active=True)
+
+    outcome = route(engine, skills, payload.text, state)
+    hit = isinstance(outcome, RouterHit)
     return execute_plan(
         user_text=payload.text,
-        raw_plan=[
-            {"action": "set_face", "args": {"face": "curious"}},
-            {"action": "say", "args": {"text": CHAT_STUB_REPLY}},
-        ],
-        engine="button",
+        raw_plan=outcome.raw_plan if hit else MISS_PLAN,
+        engine="laya",
         started=started,
+        skill_id=outcome.skill_id if hit else None,
+        confidence=outcome.confidence,
     )
 
 
@@ -262,8 +285,33 @@ def post_feedback(payload: FeedbackIn) -> dict:
 
 @router.get("/skills", response_model=list[SkillCard])
 def get_skills() -> list[dict]:
-    """Empty until stage 4 mines the first skill."""
-    return []
+    """Every skill in the library, with its usage counted from `interactions`."""
+    conn = db.get_conn()
+    with db.lock:
+        skills = load_skills(conn)
+        stats = conn.execute(
+            # `IS` rather than `=` so an un-rated interaction (feedback NULL)
+            # counts as 0 instead of turning the whole SUM into NULL.
+            "SELECT skill_id,"
+            " COUNT(*) AS uses,"
+            " SUM(feedback IS 1) AS likes,"
+            " SUM(feedback IS -1) AS dislikes"
+            " FROM interactions WHERE skill_id IS NOT NULL GROUP BY skill_id"
+        ).fetchall()
+
+    unused = {"uses": 0, "likes": 0, "dislikes": 0}
+    counts = {row["skill_id"]: {key: row[key] for key in unused} for row in stats}
+    return [
+        {
+            "id": skill.id,
+            "name": skill.name,
+            "description": skill.description,
+            "status": skill.status,
+            "origin": skill.origin,
+            **counts.get(skill.id, unused),
+        }
+        for skill in skills
+    ]
 
 
 @router.get("/proposals", response_model=list[Proposal])

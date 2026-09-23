@@ -1,0 +1,27 @@
+{
+  "id": "greet",
+  "name": "Приветствие",
+  "description": "приветствие",
+  "examples": ["привет", "здравствуй", "хай", "доброе утро", "приветик"],
+  "questions": {},
+  "rules": [
+    {
+      "when": {"mood": "low"},
+      "actions": [
+        {"action": "set_face", "args": {"face": "sad"}},
+        {"action": "wave"},
+        {"action": "say", "args": {"text": "Привет... Мне сегодня грустновато."}}
+      ]
+    },
+    {
+      "when": {},
+      "actions": [
+        {"action": "wave"},
+        {"action": "set_face", "args": {"face": "happy"}},
+        {"action": "say", "args": {"text": "Привет! Я Пиксель."}}
+      ]
+    }
+  ],
+  "status": "active",
+  "origin": "seed"
+}

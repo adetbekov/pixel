@@ -1,0 +1,26 @@
+{
+  "id": "sleep",
+  "name": "Сон",
+  "description": "уложить робота спать",
+  "examples": ["пора спать", "иди спать", "отдохни", "спокойной ночи", "ложись"],
+  "questions": {},
+  "rules": [
+    {
+      "when": {"energy": "high"},
+      "actions": [
+        {"action": "set_face", "args": {"face": "curious"}},
+        {"action": "say", "args": {"text": "Я совсем не хочу спать!"}}
+      ]
+    },
+    {
+      "when": {},
+      "actions": [
+        {"action": "set_face", "args": {"face": "sleepy"}},
+        {"action": "sleep"},
+        {"action": "say", "args": {"text": "Сплю..."}}
+      ]
+    }
+  ],
+  "status": "active",
+  "origin": "seed"
+}
