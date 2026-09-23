@@ -164,7 +164,10 @@ class Metrics(BaseModel):
     skills_active: int
     total_commands: int
     #: Teacher calls in the last 24h — Gemini is the only thing here that costs
-    #: money, so the spend is visible without opening the console.
+    #: money, so the spend is visible without opening the console. Measured live
+    #: on 2026-09-24 (JEB-1508) against `models/gemini-2.5-flash-lite`: ~480 in +
+    #: ~101 out tokens per call, **$0.0004 a call**, i.e. ~$0.40 per 1000. Read
+    #: this number as cents, and re-measure it if the prompt or model changes.
     teacher_calls_24h: int = 0
     #: The same headline share over the last 24h: the lifetime number moves
     #: slowly once there is history behind it, this one shows today's trend.
