@@ -1,14 +1,19 @@
 /* Тонкая обёртка над HTTP-контрактом бэкенда (см. JEB-1497). */
 
+import { MOCK, mockRequest } from './mock.js';
+
 const BASE = '/api';
 
 async function request(path, options = {}) {
+  const method = options.method ?? 'GET';
+  if (MOCK) return mockRequest(method, path);
+
   const response = await fetch(`${BASE}${path}`, {
     headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
     ...options,
   });
   if (!response.ok) {
-    throw new Error(`${options.method ?? 'GET'} ${path} -> ${response.status}`);
+    throw new Error(`${method} ${path} -> ${response.status}`);
   }
   return response.json();
 }
