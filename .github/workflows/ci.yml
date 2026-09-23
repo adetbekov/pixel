@@ -104,6 +104,10 @@ jobs:
   image:
     name: image build
     runs-on: ubuntu-latest
+    # One tag for the whole job: the build, both verifiers and the smoke run have to
+    # be talking about the same image, and three copies of a literal cannot promise it.
+    env:
+      IMAGE: pixel:ci
     steps:
       - uses: actions/checkout@v4
 
@@ -116,6 +120,20 @@ jobs:
       - name: Install verifier deps
         run: pip install packaging
 
+      # JEB-1527: both compose steps run before the build — they need no image, take
+      # under a second, and a typo in the stack should not cost a full image build to
+      # find. `config` parses the YAML, checks it against the compose schema and
+      # resolves every `${VAR:-default}`; all of Pixel's have defaults, so nothing is
+      # stubbed here and a variable that stops having one fails this step by design.
+      - name: docker-compose.yml is valid
+        run: docker compose -f docker-compose.yml config -q
+
+      # And that it starts *this* repo's image. A valid stack pulling someone else's
+      # tag, or building from another context, passes `config` and then breaks the NAS
+      # redeploy — where `pull_policy: never` turns a wrong tag into a silent no-op.
+      - name: docker-compose.yml runs the image this job builds
+        run: python .github/scripts/verify_compose.py "$IMAGE"
+
       - uses: docker/setup-buildx-action@v3
 
       # The torch CPU wheel is ~200 MB and its layer changes only when
@@ -127,7 +145,7 @@ jobs:
           context: .
           push: false
           load: true
-          tags: pixel:ci
+          tags: ${{ env.IMAGE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -135,7 +153,7 @@ jobs:
       # Dockerfile installed it unpinned, and nothing in CI could tell. This reads the
       # pin from requirements-torch.txt and asks the built image what it actually has.
       - name: Image carries the pinned CPU torch and an in-range laya
-        run: python .github/scripts/verify_image_deps.py pixel:ci
+        run: python .github/scripts/verify_image_deps.py "$IMAGE"
 
       # PIXEL_SKIP_MODEL=1 starts in ~2 s and downloads no weights. `/` and `/app.js`
       # are the load-bearing part: `pip install -e .` is what keeps them served, and a
@@ -143,7 +161,7 @@ jobs:
       # 200 and not one error in the log.
       - name: Smoke-run the image
         run: |
-          docker run -d --name pixel-ci -e PIXEL_SKIP_MODEL=1 -p 127.0.0.1:8000:8000 pixel:ci
+          docker run -d --name pixel-ci -e PIXEL_SKIP_MODEL=1 -p 127.0.0.1:8000:8000 "$IMAGE"
           trap 'docker logs pixel-ci; docker rm -f pixel-ci >/dev/null 2>&1 || true' EXIT
 
           for _ in $(seq 1 60); do
