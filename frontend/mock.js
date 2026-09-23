@@ -28,10 +28,10 @@ async function fixture(name) {
 
 async function load() {
   if (!store) {
-    const [skills, proposals, metrics, state] = await Promise.all(
-      ['skills', 'proposals', 'metrics', 'state'].map(fixture),
+    const [skills, proposals, metrics, state, history] = await Promise.all(
+      ['skills', 'proposals', 'metrics', 'state', 'history'].map(fixture),
     );
-    store = { skills, proposals, metrics, state };
+    store = { skills, proposals, metrics, state, history };
   }
   return store;
 }
@@ -78,6 +78,7 @@ export async function mockRequest(method, path) {
 
   if (method === 'GET') {
     if (path === '/state') return data.state;
+    if (path === '/history') return data.history;
     if (path === '/skills') return data.skills;
     if (path === '/proposals') return data.proposals;
     if (path === '/metrics') return data.metrics;

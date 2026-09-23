@@ -47,6 +47,7 @@
     "origin": "mined",
     "uses": 3,
     "likes": 0,
-    "dislikes": 3
+    "dislikes": 3,
+    "disabled_reason": "dislike_rate"
   }
 ]

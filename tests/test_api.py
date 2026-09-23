@@ -218,12 +218,18 @@ async def test_metrics(client):
     body = (await client.get("/api/metrics")).json()
     assert set(body) == {
         "laya_share",
+        "laya_share_24h",
         "avg_latency_laya_ms",
         "avg_latency_gemini_ms",
         "skills_active",
+        "skills_disabled",
         "total_commands",
+        "gemini_calls_24h",
         "teacher_calls_24h",
     }
-    assert body["total_commands"] == 1
+    # A button click is not a command: it has neither a router nor a teacher, so
+    # counting it would inflate the headline share with clicks (see
+    # `backend/metrics.py`, and `tests/test_metrics.py` for the rest).
+    assert body["total_commands"] == 0
     # No Laya and no Gemini yet — the share must not divide by zero.
     assert body["laya_share"] == 0.0

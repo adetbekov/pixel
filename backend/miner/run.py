@@ -166,8 +166,17 @@ def _propose(
 
 
 def _taken_ids(conn: sqlite3.Connection) -> set[str]:
-    """Skill ids the candidate may not reuse — library plus pending proposals."""
-    ids = {row["id"] for row in conn.execute("SELECT id FROM skills")}
+    """Skill ids the candidate may not reuse — library plus pending proposals.
+
+    A **disabled** skill does not hold its id. Stage 5 turns a badly-rated skill
+    off and hands its cases back to the pool exactly so the miner can try again,
+    and the generator is only ever shown the *active* library — so the next draft
+    for the same cluster of phrases picks the same obvious id. Counting that id
+    as taken would drop every retry into a log line: quietly, every run, forever.
+    `accept_proposal` overwrites the disabled row when the retry is accepted.
+    """
+    # `IS NOT`, not `!=`: a row with a NULL status must read as taken, not free.
+    ids = {row["id"] for row in conn.execute("SELECT id FROM skills WHERE status IS NOT 'disabled'")}
     for row in conn.execute("SELECT skill_json FROM skill_proposals WHERE status = 'pending'"):
         try:
             ids.add(json.loads(row["skill_json"])["id"])
