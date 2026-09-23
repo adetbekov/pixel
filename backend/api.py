@@ -420,11 +420,18 @@ def get_skills() -> list[dict]:
         stats = conn.execute(
             # `IS` rather than `=` so an un-rated interaction (feedback NULL)
             # counts as 0 instead of turning the whole SUM into NULL.
-            "SELECT skill_id,"
+            #
+            # `i.ts >= s.created_at` is the same incarnation boundary
+            # `backend/feedback.py` judges a skill over: a skill re-mined and
+            # accepted under an id it once held must not open its card on the
+            # previous life's "👎 4 · использован 10 раз". The join also replaces
+            # the old `skill_id IS NOT NULL` — a Gemini answer joins to no skill.
+            "SELECT i.skill_id AS skill_id,"
             " COUNT(*) AS uses,"
-            " SUM(feedback IS 1) AS likes,"
-            " SUM(feedback IS -1) AS dislikes"
-            " FROM interactions WHERE skill_id IS NOT NULL GROUP BY skill_id"
+            " SUM(i.feedback IS 1) AS likes,"
+            " SUM(i.feedback IS -1) AS dislikes"
+            " FROM interactions i JOIN skills s ON s.id = i.skill_id"
+            " WHERE i.ts >= s.created_at GROUP BY i.skill_id"
         ).fetchall()
 
     unused = {"uses": 0, "likes": 0, "dislikes": 0}
@@ -496,6 +503,8 @@ def accept_proposal(proposal_id: str) -> dict:
         skill = parse_skill(json.loads(row["skill_json"]))
         if skill is None:
             raise HTTPException(status_code=422, detail="the proposed skill no longer validates")
+        # Only a row that says `disabled` may be overwritten — a NULL status is
+        # not a free id, it is a row nobody can vouch for.
         existing = conn.execute(
             "SELECT status FROM skills WHERE id = ?", (skill.id,)
         ).fetchone()

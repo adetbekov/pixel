@@ -38,6 +38,14 @@ DEFAULT_MIN_RATED = 5
 #: Written to ``skills.disabled_reason``. The only automatic reason there is.
 DISLIKE_REASON = "dislike_rate"
 
+#: Ratings of a skill's **current** incarnation — see :func:`review_skill`.
+#: ``/api/skills`` counts its cards over the same boundary.
+SKILL_RATINGS = (
+    "SELECT COUNT(*) AS rated, SUM(i.feedback IS -1) AS dislikes"
+    " FROM interactions i JOIN skills s ON s.id = i.skill_id"
+    " WHERE i.skill_id = ? AND i.feedback IS NOT NULL AND i.ts >= s.created_at"
+)
+
 
 def dislike_limit() -> float:
     return float(os.environ.get("SKILL_DISLIKE_LIMIT", DEFAULT_DISLIKE_LIMIT))
@@ -83,8 +91,18 @@ def review_skill(conn: sqlite3.Connection, skill_id: str) -> bool:
     Returns ``True`` when this call turned the skill off.
     """
     row = conn.execute(
-        "SELECT COUNT(*) AS rated, SUM(feedback IS -1) AS dislikes"
-        " FROM interactions WHERE skill_id = ? AND feedback IS NOT NULL",
+        # Only this skill's *current* life counts. A disabled skill can be mined
+        # again and accepted under the same id (`accept_proposal`), and the old
+        # incarnation's interactions still carry that id — `skills` and
+        # `interactions` have no foreign key between them. Without the boundary a
+        # freshly re-approved skill inherits the 4/10 that killed it and dies on
+        # its very first new rating, a 👍 included.
+        #
+        # `created_at` is rewritten on every accept, so it *is* the boundary, and
+        # both it and `ts` come from `iso()` — comparing the strings orders the
+        # instants, the same trick `metrics.py` uses. A seed skill's boundary is
+        # when the library was seeded, so nothing is lost there.
+        SKILL_RATINGS,
         (skill_id,),
     ).fetchone()
     rated = int(row["rated"] or 0)

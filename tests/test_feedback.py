@@ -16,6 +16,7 @@ from backend.brain.engine import set_engine
 from backend.brain.router import RouterMiss, route
 from backend.brain.skill import load_skills
 from backend.main import app
+from backend.state import iso, utcnow
 
 from .fakes import FakeEngine
 from .trick_cluster import TRICK_EMBEDDINGS, TRICK_ROUTES, draft_json, fill_pool
@@ -48,14 +49,19 @@ def rate(conn, skill_id: str, votes: list[int]) -> list[int]:
     The votes are applied through `feedback.record`, i.e. the same path
     `/api/feedback` takes, so the auto-disable rule is what is under test rather
     than a hand-written UPDATE.
+
+    `ts` is *now*, exactly as `_log_interaction` writes it, because the health
+    query only counts a skill's current incarnation (`i.ts >= s.created_at`) —
+    a hand-picked constant would sit before the skill was created and count as
+    somebody else's life.
     """
     ids = []
     for value in votes:
         cursor = conn.execute(
             "INSERT INTO interactions (ts, user_text, engine, skill_id, confidence,"
             " latency_ms, actions_json, reply_text, feedback)"
-            " VALUES ('2026-09-23T10:00:00Z', 'танцуй', 'laya', ?, 0.9, 12, '[]', 'ок', NULL)",
-            (skill_id,),
+            " VALUES (?, 'танцуй', 'laya', ?, 0.9, 12, '[]', 'ок', NULL)",
+            (iso(utcnow()), skill_id),
         )
         ids.append(int(cursor.lastrowid))
     conn.commit()
@@ -143,7 +149,8 @@ def test_a_gemini_dislike_disables_nothing(seeded):
     cursor = seeded.execute(
         "INSERT INTO interactions (ts, user_text, engine, skill_id, confidence, latency_ms,"
         " actions_json, reply_text, feedback)"
-        " VALUES ('2026-09-23T10:00:00Z', 'спой', 'gemini', NULL, 0.2, 900, '[]', 'ок', NULL)"
+        " VALUES (?, 'спой', 'gemini', NULL, 0.2, 900, '[]', 'ок', NULL)",
+        (iso(utcnow()),),
     )
     seeded.commit()
     assert feedback.record(seeded, interaction_id=int(cursor.lastrowid), value=-1) is True
@@ -295,14 +302,65 @@ async def test_a_disabled_skill_can_be_mined_and_accepted_again(
     assert row["disabled_at"] is None
     assert row["disabled_reason"] is None
 
+    # The card opens on a clean slate: the previous life's 10 uses and 4 dislikes
+    # belong to a skill that no longer exists, even though it had this id.
     card = next(
         item for item in (await client.get("/api/skills")).json() if item["id"] == "show_trick"
     )
     assert (card["status"], card["disabled_reason"]) == ("active", None)
+    assert (card["uses"], card["likes"], card["dislikes"]) == (0, 0, 0)
 
     # And it routes again, in the same process.
     body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
     assert (body["engine"], body["skill_id"]) == ("laya", "show_trick")
+
+    # The gate that matters: the first rating of the new life must not be judged
+    # against the old one. Counting all 11 ratings gives 4/11 = 36% > 30% at
+    # `rated >= 5`, so an inherited history kills the retry on its first 👍.
+    assert (
+        await client.post(
+            "/api/feedback", json={"interaction_id": body["interaction_id"], "value": 1}
+        )
+    ).status_code == 200
+    assert status_of(seeded, "show_trick") == "active"
+
+    card = next(
+        item for item in (await client.get("/api/skills")).json() if item["id"] == "show_trick"
+    )
+    assert (card["uses"], card["likes"], card["dislikes"]) == (1, 1, 0)
+
+    # A 👎 of the new life is judged on the new life alone — one rating is under
+    # `SKILL_MIN_RATED`, so it does not disable anything either.
+    second = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+    await client.post("/api/feedback", json={"interaction_id": second["interaction_id"], "value": -1})
+    assert status_of(seeded, "show_trick") == "active"
+
+
+def test_ratings_from_before_this_incarnation_are_not_counted(seeded):
+    """The boundary on its own: `created_at` moving forward resets the verdict.
+
+    `skills` and `interactions` have no foreign key, so the old rows keep the id
+    of the skill that is gone. Only `created_at` separates the two lives.
+    """
+    rate(seeded, "greet", [1] * 6 + [-1] * 4)
+    assert status_of(seeded, "greet") == "disabled"
+
+    # Re-accepting rewrites `created_at` — which is exactly what `accept_proposal`
+    # does through INSERT OR REPLACE.
+    seeded.execute(
+        "UPDATE skills SET status = 'active', created_at = ?, disabled_at = NULL,"
+        " disabled_reason = NULL WHERE id = 'greet'",
+        (iso(utcnow()),),
+    )
+    seeded.commit()
+
+    assert feedback.review_skill(seeded, "greet") is False
+    rate(seeded, "greet", [1])
+    assert status_of(seeded, "greet") == "active"
+
+    # And the new life is judged normally once it has ratings of its own.
+    rate(seeded, "greet", [1] * 5 + [-1] * 4)
+    assert status_of(seeded, "greet") == "disabled"
 
 
 @pytest.mark.anyio

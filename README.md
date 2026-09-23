@@ -180,6 +180,11 @@ router forever and every command it steals is answered wrong — fast, cheaply, 
   the same obvious id, and one lock left on drops the retry into a `log.warning` on every run,
   forever. Accepting the retry overwrites the disabled row and clears `disabled_at` /
   `disabled_reason`; an id held by an **active** skill is still a 409;
+* a re-accepted skill is judged on its **current life only**. `skills` and `interactions` have no
+  foreign key, so the dead incarnation's rows keep the id; `skills.created_at` — rewritten on every
+  accept — is the boundary (`i.ts >= s.created_at`), used by both the health query and the card
+  counts. Without it a freshly re-approved skill inherits the 4/10 that killed it and dies on its
+  first new rating, a 👍 included, with a card already reading "👎 4";
 * seed skills get no exemption. A starter skill the user keeps disliking is exactly as wrong.
 
 A 👎 on a Gemini answer has no skill to disable; it stays in the metrics and stays raw material.
