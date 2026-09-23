@@ -14,7 +14,11 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic>=2",
     "laya",
-    "google-genai",
+    # Pinned: the teacher path is shaped by this SDK's surface — `interactions.create`,
+    # `response_format`, `interaction.output_text` — and two call styles already coexist
+    # inside 2.x. `tests/test_teacher.py::test_the_sdk_still_has_the_surface_we_call`
+    # asserts that surface, so a break fails CI instead of production.
+    "google-genai>=2.25,<3",
     "numpy",
 ]
 

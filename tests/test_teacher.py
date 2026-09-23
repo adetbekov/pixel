@@ -6,7 +6,9 @@ the caller gets a plan made of library actions and the case lands in
 ``teacher_log``.
 """
 
+import inspect
 import json
+import typing
 
 import httpx
 import pytest
@@ -16,8 +18,12 @@ from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
 from backend.main import app
 from backend.state import read_state
-from backend.teacher import FALLBACK_PLAN
-from backend.teacher.client import FALLBACK_REPLY, TIMEOUT_S
+from backend.teacher import FALLBACK_PLAN, GeminiTeacher
+from backend.teacher.client import (
+    FALLBACK_REPLY,
+    TIMEOUT_S,
+    TOTAL_DEADLINE_S,
+)
 from backend.teacher.prompt import MAX_TEXT_LEN, build_input
 from backend.teacher.schema import TeacherPlan
 
@@ -38,6 +44,27 @@ HACKED_PLAN = json.dumps(
     {"reply": "Сейчас!", "actions": [{"action": "hack_nasa"}, {"action": "jump"}]},
     ensure_ascii=False,
 )
+
+BLANK_REPLY_PLAN = json.dumps({"reply": "   ", "actions": [{"action": "jump"}]})
+
+
+class TimingOutClient:
+    """A client whose every call burns its whole budget and then times out.
+
+    Drives `GeminiTeacher`'s injected clock, so the deadline arithmetic is
+    exercised at full speed instead of in real seconds.
+    """
+
+    def __init__(self, overshoot: float = 0.0) -> None:
+        self.now = 0.0
+        self.budgets: list[float] = []
+        self.interactions = self
+        self._overshoot = overshoot
+
+    def create(self, **kwargs) -> None:
+        self.budgets.append(kwargs["timeout"])
+        self.now += kwargs["timeout"] + self._overshoot
+        raise httpx.TimeoutException("deadline exceeded")
 
 
 @pytest.fixture()
@@ -244,3 +271,88 @@ def test_the_prompt_shows_the_skill_boundary(seeded):
 def test_an_over_long_reply_is_trimmed_not_rejected():
     plan = TeacherPlan.model_validate({"reply": "я" * 400, "actions": []})
     assert plan.reply == "я" * MAX_SAY_LEN
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("blank", ["", "   "], ids=["empty", "whitespace"])
+async def test_a_blank_reply_never_reaches_the_user(client, seeded, missing, teacher, blank):
+    """A blank `reply` with no `say` step would render as an empty bubble.
+
+    `""` is stopped by `min_length` in the schema and `"   "` only by the strip
+    check in `_parse` — both must end up retried, then on the fallback.
+    """
+    gemini = teacher(json.dumps({"reply": blank, "actions": [{"action": "jump"}]}))
+
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert len(gemini.calls) == 2, "a blank reply must be retried once"
+    assert body["reply"] == FALLBACK_REPLY
+    assert body["reply"].strip()
+
+
+@pytest.mark.anyio
+async def test_a_blank_reply_retry_that_succeeds_is_used(client, seeded, missing, teacher):
+    teacher(BLANK_REPLY_PLAN, GOOD_PLAN)
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+    assert body["reply"] == "Тада!"
+
+
+def test_the_retry_gets_only_the_time_that_is_left(seeded):
+    """Two timeouts must not cost the user 2 x TIMEOUT_S on top of the router miss.
+
+    Driven by an injected clock that a call advances by exactly the budget it
+    was handed — which is what a call that times out does — so the arithmetic is
+    asserted without a test that actually waits.
+    """
+    gemini = TimingOutClient()
+    teacher = GeminiTeacher(client=gemini, model="fake-model", clock=lambda: gemini.now)
+
+    result = teacher.explain("покажи фокус", read_state(seeded), [])
+
+    budgets = gemini.budgets
+    assert len(budgets) == 2, "a timeout still gets its one retry"
+    assert budgets[0] == TIMEOUT_S
+    assert budgets[1] == pytest.approx(TOTAL_DEADLINE_S - TIMEOUT_S)
+    assert sum(budgets) <= TOTAL_DEADLINE_S
+    assert result.raw_plan == FALLBACK_PLAN
+
+
+def test_no_retry_is_dialled_with_nothing_left_to_spend(seeded):
+    gemini = TimingOutClient(overshoot=TOTAL_DEADLINE_S)
+    teacher = GeminiTeacher(client=gemini, model="fake-model", clock=lambda: gemini.now)
+
+    result = teacher.explain("покажи фокус", read_state(seeded), [])
+
+    assert len(gemini.budgets) == 1, "a second call with < MIN_CALL_BUDGET_S left is not worth it"
+    assert "out of time" in result.error
+    assert result.raw_plan == FALLBACK_PLAN
+
+
+def test_the_sdk_still_has_the_surface_we_call():
+    """The one check CI could not make before: that the *real* SDK takes what
+    `GeminiTeacher._call` passes it.
+
+    `FakeGeminiClient` accepts any keyword, so every other test here proves only
+    that the code *sends* the argument. If `timeout` were not a real parameter
+    the live call would raise `TypeError`, `explain` would swallow it, and every
+    router miss would quietly degrade to `FALLBACK_PLAN` with CI still green.
+    Constructing the client needs no network and no real key.
+    """
+    from google import genai
+    from google.genai import interactions
+
+    client = genai.Client(api_key="not-a-real-key-and-never-sent")
+    parameters = inspect.signature(type(client.interactions).create).parameters
+
+    # `timeout` must be its OWN parameter. Were it merely absorbed by `**body`
+    # it would ride along to the API as a request field and time out nothing.
+    assert parameters["timeout"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+    # `**body` swallows anything, so the signature cannot vouch for these —
+    # the request TypedDict is what names them.
+    body_fields = typing.get_type_hints(interactions.CreateModelInteractionParamsNonStreaming)
+    assert {"model", "input", "system_instruction", "response_format"} <= set(body_fields)
+
+    assert "output_text" in interactions.Interaction.model_fields
+    assert {"mime_type", "schema_"} <= set(interactions.TextResponseFormat.model_fields)

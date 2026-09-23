@@ -42,9 +42,15 @@ it is what the user actually waited.
 Gemini writes no code. It returns a `{reply, actions}` plan, and that plan passes two independent
 checks: the response schema (`backend/teacher/schema.py`) for the shape, and `validate_plan`
 (`backend/actions.py`) for membership of the action library. The second is the one that matters —
-a schema cannot stop `{"action": "hack_nasa"}` in a string field. An invalid or empty plan is
-retried once with the reason, and a second failure answers with a fixed fallback plan; a timeout
-(8 s) or an API error does the same. The user never sees a traceback.
+a schema cannot stop `{"action": "hack_nasa"}` in a string field. A plan that is invalid, empty or
+carries a blank `reply` is retried once with the reason, and a second failure answers with a fixed
+fallback plan; a timeout or an API error does the same. The user never sees a traceback.
+
+Two clocks bound the wait: 8 s per call (`TIMEOUT_S`) and 12 s across both attempts
+(`TOTAL_DEADLINE_S`), the retry getting whatever is left. The SDK surface the teacher calls is
+pinned (`google-genai>=2.25,<3`) and asserted against the installed package by
+`test_the_sdk_still_has_the_surface_we_call` — a renamed argument would otherwise reach production
+as a fallback plan and a log line.
 
 Every teacher call writes a row to `teacher_log` — state, original command, router confidence, the
 raw model response and the validated plan. That table is the only input stage 4's skill miner has,

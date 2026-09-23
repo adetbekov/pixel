@@ -36,7 +36,10 @@ class TeacherAction(BaseModel):
 
 
 class TeacherPlan(BaseModel):
-    reply: str = Field(max_length=MAX_SAY_LEN)
+    #: ``min_length`` puts "not empty" in the schema the model is handed. It is
+    #: not the guard, though — it would still pass whitespace; the blank check
+    #: that actually protects the user lives in :func:`backend.teacher.client._parse`.
+    reply: str = Field(min_length=1, max_length=MAX_SAY_LEN)
     actions: list[TeacherAction] = Field(default_factory=list, max_length=MAX_PLAN_LEN)
 
     @field_validator("reply", mode="before")

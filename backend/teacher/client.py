@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -22,18 +24,31 @@ from .schema import TeacherPlan
 
 log = logging.getLogger(__name__)
 
-#: `gemini-3.5-flash-lite` (named in JEB-1500) is not a model id google-genai
-#: 2.25.0 knows; `gemini-3.1-flash-lite` is the current flash-lite tier. The
-#: online path wants the cheapest, fastest tier — the teacher writes an
-#: 8-primitive plan, not a chain of reasoning. Stage 4 mines offline and can
+#: The online path wants the cheapest, fastest tier — the teacher writes an
+#: 8-primitive plan, not a chain of reasoning; stage 4 mines offline and can
 #: afford a bigger model.
+#:
+#: JEB-1500 named `gemini-3.5-flash-lite`. Model ids resolve server-side, so the
+#: SDK is not the authority on what exists — but its convenience `Literal` lists
+#: `gemini-3.1-flash-lite` and no `-lite` sibling of `gemini-3.5-flash`, which is
+#: the only evidence available without a key. TODO: confirm against
+#: `client.models.list()` once `GEMINI_API_KEY` lands, then settle this default.
+#: Overridable via `GEMINI_TEACHER_MODEL` either way.
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
-#: The user is already waiting out a 217-240 ms router miss before this starts.
+#: Per-call ceiling, as JEB-1500 specifies.
 TIMEOUT_S = 8.0
+
+#: Ceiling across *all* attempts. Without it a retried timeout costs the user
+#: 2 x TIMEOUT_S on top of the router miss they already waited out; the retry is
+#: worth having, 16 s of dead air is not. Each call gets whatever is left.
+TOTAL_DEADLINE_S = 12.0
 
 #: One first try plus one retry — of either kind (network or bad plan).
 MAX_ATTEMPTS = 2
+
+#: Below this there is no point dialling the API at all.
+MIN_CALL_BUDGET_S = 1.0
 
 FALLBACK_REPLY = "Я не понял, научи меня по-другому"
 
@@ -77,9 +92,10 @@ def _with_reply(raw_plan: list[dict[str, Any]], reply: str) -> list[dict[str, An
 
     The model usually puts the line in a ``say`` step itself. When it does not,
     the reply would otherwise never reach the user, since ``execute_plan``
-    derives the visible text from the plan.
+    derives the visible text from the plan. ``reply`` is non-blank by the time
+    this runs — :func:`_parse` rejects a blank one rather than passing it on.
     """
-    if not reply.strip() or any(step["action"] == "say" for step in raw_plan):
+    if any(step["action"] == "say" for step in raw_plan):
         return raw_plan
     return [*raw_plan[: MAX_PLAN_LEN - 1], {"action": "say", "args": {"text": reply}}]
 
@@ -92,9 +108,16 @@ class GeminiTeacher:
     test run, exactly like ``laya`` in :mod:`backend.brain.engine`.
     """
 
-    def __init__(self, client: Any | None = None, model: str | None = None) -> None:
+    def __init__(
+        self,
+        client: Any | None = None,
+        model: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._client = client
         self._model = model or os.environ.get("GEMINI_TEACHER_MODEL", DEFAULT_MODEL)
+        # Injectable so the deadline arithmetic is testable without sleeping.
+        self._clock = clock
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -105,10 +128,19 @@ class GeminiTeacher:
             self._client = genai.Client()
         return self._client
 
-    def _call(self, prompt: str) -> str:
-        """One round trip. Verified against google-genai 2.25.0, where
-        ``client.interactions.create`` / ``interaction.output_text`` is the
-        canonical path (``client.models.generate_content`` also still exists)."""
+    def _call(self, prompt: str, timeout: float) -> str:
+        """One round trip.
+
+        Verified against google-genai 2.25.0: ``client.interactions.create`` /
+        ``interaction.output_text`` is the canonical path
+        (``client.models.generate_content`` also still exists), ``timeout`` is a
+        real keyword-only parameter, and ``model`` / ``input`` /
+        ``system_instruction`` / ``response_format`` are request-body fields.
+        ``tests/test_teacher.py::test_the_sdk_still_has_the_surface_we_call``
+        asserts all of that against the installed package — without it, a
+        renamed argument would land in ``**body``, 400 at the API, and reach the
+        user as a fallback plan with only a ``log.warning`` behind it.
+        """
         interaction = self._ensure_client().interactions.create(
             model=self._model,
             input=prompt,
@@ -118,19 +150,25 @@ class GeminiTeacher:
                 "mime_type": "application/json",
                 "schema": TeacherPlan.model_json_schema(),
             },
-            timeout=TIMEOUT_S,
+            timeout=timeout,
         )
         return interaction.output_text or ""
 
     def explain(self, text: str, state: RobotState, skills: list[Skill]) -> TeacherResult:
         prompt = build_input(text, state, skills)
+        deadline = self._clock() + TOTAL_DEADLINE_S
         last_raw = ""
         last_reason = "teacher did not produce a plan"
 
         for attempt in range(MAX_ATTEMPTS):
+            budget = min(TIMEOUT_S, deadline - self._clock())
+            if budget < MIN_CALL_BUDGET_S:
+                last_reason = f"out of time after {attempt} attempt(s): {last_reason}"
+                break
+
             hint = "" if attempt == 0 else retry_hint(last_reason)
             try:
-                last_raw = self._call(prompt + hint)
+                last_raw = self._call(prompt + hint, budget)
             except Exception as exc:  # noqa: BLE001 — a 500 must not reach the user
                 last_reason = f"{type(exc).__name__}: {exc}"
                 log.warning("teacher call failed (attempt %d): %s", attempt + 1, last_reason)
@@ -150,6 +188,12 @@ def _parse(raw: str) -> tuple[TeacherResult | None, str]:
         plan = TeacherPlan.model_validate_json(raw)
     except ValueError as exc:
         return None, f"response did not match the schema: {exc}"
+
+    # `max_length` bounds the reply but nothing stops the model returning "" or
+    # whitespace, and an empty `reply` with no `say` step reaches the user as an
+    # empty chat bubble. Retry it; a second blank one gets FALLBACK_REPLY.
+    if not plan.reply.strip():
+        return None, "plan came back with an empty reply"
 
     proposed = plan.to_raw_plan()
     try:
