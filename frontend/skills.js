@@ -25,6 +25,9 @@ const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
 
 const ORIGIN_WORDS = { seed: 'стартовый', mined: 'выучен сам' };
 
+/* `disabled_reason` из `SkillCard`; автоматическая причина пока ровно одна. */
+const DISABLED_REASONS = { dislike_rate: 'отключён из-за дизлайков' };
+
 /* Каждая шкала склоняется по-своему, поэтому фраза целиком, а не «шкала» + «слово». */
 const STATE_PHRASES = {
   mood: { low: 'настроение плохое', mid: 'настроение среднее', high: 'настроение хорошее' },
@@ -118,9 +121,16 @@ function skillCard(skill) {
     `использован ${uses} ${plural(uses, 'раз', 'раза', 'раз')}`,
     `👍 ${Number(skill.likes) || 0}`,
     `👎 ${Number(skill.dislikes) || 0}`,
-  ].join(' · ');
+  ];
+  /* Навык, который просто исчез из ответов, выглядит как поломка. Причина
+     отключения пишется прямо на карточке. */
+  if (disabled) stats.push(DISABLED_REASONS[skill.disabled_reason] ?? 'отключён');
 
-  card.append(head, el('p', 'card-note', skill.description ?? ''), el('p', 'card-stats', stats));
+  card.append(
+    head,
+    el('p', 'card-note', skill.description ?? ''),
+    el('p', 'card-stats', stats.join(' · ')),
+  );
   return card;
 }
 

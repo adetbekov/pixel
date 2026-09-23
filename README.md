@@ -14,6 +14,64 @@ Stack: Python, FastAPI, Laya (local), Gemini API, SQLite, HTML/JS frontend with 
 
 Tracking issue: JEB-1495.
 
+## The loop, in one line
+
+```
+command -> Laya (router) -> hit: a skill answers in ms
+                         -> miss: Gemini answers and the case is logged
+                                -> miner clusters the cases, drafts a skill, backtests it
+                                       -> user accepts -> the skill is in the library
+                                              -> the same command never reaches Gemini again
+```
+
+Two things close the loop back: 👎 on an answer, which switches a skill off once its dislike rate is
+high enough and returns its cases to the miner's pool, and `laya_share` — the share of commands
+handled without Gemini, which is the number the whole project is measured on.
+
+## Run it
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"            # CPU torch first if you are on a GPU-less box, see CI
+cp .env.example .env               # then fill GEMINI_API_KEY, or leave it empty
+uvicorn backend.main:app --reload  # http://127.0.0.1:8000
+```
+
+The first run downloads the Laya weights (~650 MB) into `HF_HOME`. Two shortcuts while developing:
+
+```bash
+PIXEL_SKIP_MODEL=1 uvicorn backend.main:app   # no weights: UI and buttons work, /api/chat is 503
+python3 -m pytest -q                          # never touches the model or the network
+```
+
+The frontend is served by the same app at `/`; `frontend/index.html?mock=1` runs it against the
+fixtures in `frontend/mocks/` with no backend at all.
+
+Nothing here needs a migration step: `backend/db.py` creates the schema and applies its column
+migrations on every connect, so an existing `pixel.db` from an earlier stage keeps working.
+
+## Environment
+
+All of it is optional except the Gemini key, and an empty key is a supported configuration — Pixel
+then runs on Laya alone. Defaults are in `.env.example`.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | — | Empty = teacher and miner are off. A router miss answers with a polite stub. |
+| `GEMINI_TEACHER_MODEL` | `gemini-3.1-flash-lite` | Model that answers router misses. |
+| `GEMINI_MINER_MODEL` | `models/gemini-2.5-flash-lite` | Model that drafts new skills, offline. |
+| `PIXEL_DB_PATH` | `./pixel.db` | SQLite file. |
+| `LAYA_MODEL` | `multilingual` | Laya subfolder. The English root checkpoint answers Cyrillic confidently and wrongly. |
+| `LAYA_DEVICE` | `cpu` | Where the local model runs. |
+| `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
+| `ROUTER_THRESHOLD` | `0.6` | Confidence a skill needs to win the router. Below it, the command is a miss. |
+| `MINER_BATCH` | `5` | Mine on every N-th unmined case. |
+| `MINER_SIM` | `0.75` | Cosine similarity that joins two commands into one cluster. |
+| `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
+| `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
+| `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
+| `SKILL_MIN_RATED` | `5` | Ratings required before that rule applies at all. |
+
 ## The fast path
 
 `POST /api/chat` costs at most two forward passes of one local model:
@@ -97,14 +155,41 @@ A mined `description` is a hard 60 characters and a candidate over it is rejecte
 description *is* the router's option label, and stage 2 measured long ones dropping routing from 6/6
 to 2/6 — for every skill, not just the new one.
 
-```
-pip install -e ".[dev]"
-uvicorn backend.main:app --reload     # first run downloads the weights (~650 MB) into HF_HOME
-PIXEL_SKIP_MODEL=1 uvicorn backend.main:app   # UI and buttons only; /api/chat answers 503
-```
-
 Tests never touch the model or the network — they run against `FakeEngine` and `FakeGeminiClient`
 (`tests/fakes.py`).
+
+## Unlearning — feedback and metrics
+
+The miner only ever adds. Without the other direction, a skill Gemini worded badly keeps winning the
+router forever and every command it steals is answered wrong — fast, cheaply, and wrong. So
+`POST /api/feedback` is not just a counter (`backend/feedback.py`):
+
+* a vote is stored on the interaction and **overwrites** an earlier vote on the same one, so the
+  skill's health is always recounted from the table, never accumulated;
+* once a skill has at least `SKILL_MIN_RATED` (5) ratings **and** more than `SKILL_DISLIKE_LIMIT`
+  (30%) of them are 👎, it is disabled. The floor is what stops a single 👎 on a new skill's first
+  use from killing it; 4 dislikes in 10 disables, 2 in 3 does not;
+* disabling takes effect on the very next command — `/api/chat` reads the library per request, so
+  the skill is simply not among the router's options any more and the command goes to Gemini;
+* the skill is **not** deleted. It stays in `GET /api/skills` with `status="disabled"` and
+  `disabled_reason="dislike_rate"`, because a skill that silently disappears reads as a bug;
+* its mined cases go back to `teacher_log` unmined, and any *rejected* proposal covering exactly
+  that case set is retired — returning the pool while leaving that block in place is a silent hole
+  and the miner would never propose again;
+* seed skills get no exemption. A starter skill the user keeps disliking is exactly as wrong.
+
+A 👎 on a Gemini answer has no skill to disable; it stays in the metrics and stays raw material.
+
+`GET /api/metrics` is all queries, no metrics table — a second copy of a count can only disagree
+with the rows it came from. `laya_share` = `laya / (laya + gemini)`; **button clicks are not
+commands** and never enter it, or the headline number would be inflated with clicks. Every ratio is
+guarded, so an empty database answers `0.0` and the panel says "пока нет данных" rather than `NaN%`.
+Alongside the lifetime share the panel shows the same share over 24h — the lifetime number moves
+slowly once there is history behind it, so the windowed one is where the learning is visible.
+
+The panel refreshes on load, after every reply, after a vote, and after accept/reject — on events,
+never on a timer. `GET /api/history` redraws the last interactions with their votes after a page
+reload; without it the 👎 survives in the database but vanishes from the screen.
 
 ## Pipeline
 

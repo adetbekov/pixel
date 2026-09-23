@@ -66,15 +66,19 @@ function engineBadge(engine) {
   return badge;
 }
 
-function voteButtons(interactionId) {
+function voteButtons(interactionId, current = null) {
   const box = document.createElement('div');
   box.className = 'vote';
 
+  /* Оценка меняет здоровье навыка на сервере, поэтому после неё перечитываем и
+     навыки, и метрики: плохой навык мог именно сейчас отключиться. */
   const send = async (button, value) => {
     [...box.children].forEach((b) => { b.disabled = true; });
     button.classList.add('picked');
     try {
       await api.feedback(interactionId, value);
+      refreshSkills();
+      refreshMetrics();
     } catch (error) {
       console.error(error);
       button.classList.remove('picked');
@@ -87,13 +91,16 @@ function voteButtons(interactionId) {
     button.type = 'button';
     button.textContent = label;
     button.title = title;
+    /* Оценка из базы: после перезагрузки страницы она видна, а не сброшена. */
+    if (current === value) button.classList.add('picked');
+    if (current !== null) button.disabled = true;
     button.addEventListener('click', () => send(button, value));
     box.append(button);
   }
   return box;
 }
 
-function addReply(reply) {
+function addReply(reply, vote = null) {
   const wrap = addMessage('bot', reply.reply ?? '');
 
   const meta = document.createElement('div');
@@ -111,7 +118,7 @@ function addReply(reply) {
     meta.append(confidence);
   }
   if (reply.interaction_id !== null && reply.interaction_id !== undefined) {
-    meta.append(voteButtons(reply.interaction_id));
+    meta.append(voteButtons(reply.interaction_id, vote));
   }
 
   wrap.append(meta);
@@ -186,15 +193,52 @@ function metricCard(label, value, lead = false) {
 /* null -> карточка покажет «нет данных» мелким шрифтом */
 const ms = (value) => (Number.isFinite(value) ? `${Math.round(value)} мс` : null);
 
+const percent = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
+
+/* Главная карточка: крупная доля, полоса прогресса и та же доля за сутки.
+   Пока команд не было, доля не «0%», а «пока нет данных» — ноль читался бы как
+   «Pixel ничему не научился», хотя его просто ещё ни о чём не просили. */
+function shareCard(metrics) {
+  const total = Number(metrics.total_commands) || 0;
+  const el = document.createElement('div');
+  el.className = 'metric metric-lead metric-share';
+
+  const caption = document.createElement('span');
+  caption.textContent = 'Доля команд без Gemini';
+  el.append(caption);
+
+  const strong = document.createElement('b');
+  strong.textContent = total ? percent(metrics.laya_share) : 'пока нет данных';
+  if (!total) strong.className = 'muted';
+  el.append(strong);
+
+  if (total) {
+    const bar = document.createElement('div');
+    bar.className = 'metric-bar';
+    const fill = document.createElement('i');
+    fill.style.width = percent(metrics.laya_share);
+    bar.append(fill);
+
+    const note = document.createElement('small');
+    note.textContent =
+      `за всё время · ${percent(metrics.laya_share_24h)} за 24 часа · команд: ${total}`;
+    el.append(bar, note);
+  }
+  return el;
+}
+
 function renderMetrics(metrics) {
-  const share = Number.isFinite(metrics.laya_share) ? `${Math.round(metrics.laya_share * 100)}%` : null;
-  metricsEl.replaceChildren(
-    metricCard('Доля команд без Gemini', share, true),
+  const disabled = Number(metrics.skills_disabled) || 0;
+  const cards = [
+    shareCard(metrics),
     metricCard('Laya, среднее время', ms(metrics.avg_latency_laya_ms)),
     metricCard('Gemini, среднее время', ms(metrics.avg_latency_gemini_ms)),
     metricCard('Активных навыков', String(metrics.skills_active ?? 0)),
-    metricCard('Всего команд', String(metrics.total_commands ?? 0)),
-  );
+  ];
+  /* Отключённые показываем, только когда они есть: пустая карточка «0» просто
+     занимала бы место в панели. */
+  if (disabled) cards.push(metricCard('Отключено навыков', String(disabled)));
+  metricsEl.replaceChildren(...cards);
 }
 
 async function refreshMetrics() {
@@ -218,7 +262,27 @@ async function pollState() {
   }
 }
 
-addMessage('system', 'Pixel проснулся. Напиши ему или нажми кнопку.');
+/* Чат восстанавливается из базы: иначе оценка сохранена на сервере, но после
+   перезагрузки её не видно — и это читается как «моё 👎 не сохранилось». */
+async function restoreHistory() {
+  let history = [];
+  try {
+    history = await api.getHistory();
+  } catch (error) {
+    console.error(error);
+  }
+  if (!Array.isArray(history) || history.length === 0) {
+    addMessage('system', 'Pixel проснулся. Напиши ему или нажми кнопку.');
+    return;
+  }
+  for (const item of history) {
+    addMessage('user', item.user_text ?? '');
+    addReply(item, item.feedback ?? null);
+  }
+  addMessage('system', 'Pixel проснулся. Выше — прошлый разговор.');
+}
+
+restoreHistory();
 pollState();
 refreshSkills();
 refreshProposals();
