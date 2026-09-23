@@ -10,7 +10,7 @@
 # Basic or IP allow-list) — publishing it open is an open tap on a paid API.
 services:
   pixel:
-    imagee: pixel:latest
+    image: ghcr.io/adetbekov/pixel:latest
     container_name: pixel
     pull_policy: never
     restart: unless-stopped
