@@ -52,7 +52,8 @@ DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
 #: Confirmed live on 2026-09-24 that `_call` converts this correctly:
 #: `http_options.timeout` is in MILLISECONDS. A bare `timeout=1`, `3` or `5`
 #: aborts the request client-side, while `timeout=2000`/`3000` completes in
-#: ~1.4 s — seconds would have made all five of those succeed.
+#: ~1.4 s. The 3 and the 5 are what settle it: as seconds both would have been
+#: ample for a ~1.4 s call, and both aborted anyway.
 TIMEOUT_S = 8.0
 
 #: Ceiling across *all* attempts. Without it a retried timeout costs the user
