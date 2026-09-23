@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from backend.brain.engine import ScoreResult
 from backend.main import app
 from backend.state import read_state, utcnow, write_state
 
@@ -80,11 +81,43 @@ async def test_unknown_button_is_rejected(client):
 
 
 @pytest.mark.anyio
-async def test_chat_stub(client):
-    body = (await client.post("/api/chat", json={"text": "станцуй"})).json()
-    assert_reply(body, "button")
+async def test_chat_runs_a_skill(client, seeded, engine):
+    engine.pick, engine.confidence = "greet", 0.93
+    body = (await client.post("/api/chat", json={"text": "привет"})).json()
+    assert_reply(body, "laya")
+    assert body["skill_id"] == "greet"
+    assert body["confidence"] == pytest.approx(0.93)
+    assert body["reply"] == "Привет! Я Пиксель."
+    assert body["state"]["face"] == "happy"
+    assert body["latency_ms"] >= 0
+
+
+@pytest.mark.anyio
+async def test_chat_miss_answers_politely_without_running_a_skill(client, seeded, engine):
+    engine.pick, engine.confidence = "unknown", 0.41
+    body = (await client.post("/api/chat", json={"text": "расскажи про квантовую физику"})).json()
+    assert_reply(body, "laya")
     assert body["skill_id"] is None
-    assert body["confidence"] is None
+    assert body["reply"] == "Я пока не понял"
+
+
+@pytest.mark.anyio
+async def test_chat_respects_the_robot_state(client, seeded, engine, conn):
+    state = read_state(conn)
+    state.energy = 10
+    write_state(conn, state, utcnow())
+
+    engine.pick, engine.confidence = "play", 0.97
+    engine.answers = {"intensity": ScoreResult(2.0, 0.9, {"2": 1.0})}
+    body = (await client.post("/api/chat", json={"text": "поиграем"})).json()
+    assert body["skill_id"] == "play"
+    assert body["state"]["face"] == "sleepy"
+    assert body["reply"] == "Я устал, давай позже"
+
+
+@pytest.mark.anyio
+async def test_chat_without_an_engine_is_503(client, seeded):
+    assert (await client.post("/api/chat", json={"text": "привет"})).status_code == 503
 
 
 @pytest.mark.anyio
@@ -113,11 +146,32 @@ async def test_feedback_rejects_other_values(client):
 
 @pytest.mark.anyio
 async def test_stage_later_endpoints_are_empty_but_present(client):
-    assert (await client.get("/api/skills")).json() == []
     assert (await client.get("/api/proposals")).json() == []
     assert (await client.post("/api/proposals/abc/accept")).json() == {"ok": True}
     assert (await client.post("/api/proposals/abc/reject")).json() == {"ok": True}
     assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+
+
+@pytest.mark.anyio
+async def test_skills_are_empty_before_seeding(client):
+    assert (await client.get("/api/skills")).json() == []
+
+
+@pytest.mark.anyio
+async def test_skill_cards_count_uses_and_feedback(client, seeded, engine):
+    engine.pick, engine.confidence = "greet", 0.93
+    interaction_id = (await client.post("/api/chat", json={"text": "привет"})).json()[
+        "interaction_id"
+    ]
+    await client.post("/api/feedback", json={"interaction_id": interaction_id, "value": -1})
+
+    cards = {card["id"]: card for card in (await client.get("/api/skills")).json()}
+    assert set(cards) == {"greet", "feed", "play", "sleep"}
+    assert cards["greet"]["uses"] == 1
+    assert cards["greet"]["dislikes"] == 1
+    assert cards["greet"]["likes"] == 0
+    assert cards["play"]["uses"] == 0
+    assert cards["play"]["origin"] == "seed"
 
 
 @pytest.mark.anyio
