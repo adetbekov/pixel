@@ -1,0 +1,8 @@
+{
+  "laya_share": 0.78,
+  "avg_latency_laya_ms": 142.0,
+  "avg_latency_gemini_ms": 2310.0,
+  "skills_active": 4,
+  "total_commands": 63,
+  "teacher_calls_24h": 11
+}

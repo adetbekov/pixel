@@ -1,0 +1,112 @@
+[
+  {
+    "id": "b7e4c1a0-2f3d-4c88-9a11-5d6e7f801234",
+    "skill": {
+      "id": "show_trick",
+      "name": "Фокус",
+      "description": "показать фокус",
+      "examples": [
+        "покажи фокус",
+        "сделай фокус",
+        "фокус покажи",
+        "удиви фокусом",
+        "а фокус умеешь?"
+      ],
+      "questions": {
+        "energy_wanted": {
+          "type": "score",
+          "instructions": "Насколько эффектного фокуса просит пользователь",
+          "criteria": ["простой", "обычный", "эффектный"]
+        }
+      },
+      "rules": [
+        {
+          "when": { "energy": "low" },
+          "actions": [
+            { "action": "set_face", "args": { "face": "sleepy" } },
+            { "action": "say", "args": { "text": "Я устал, фокус не выйдет" } }
+          ]
+        },
+        {
+          "when": { "energy_wanted": ">=1.5" },
+          "actions": [
+            { "action": "spin", "args": {} },
+            { "action": "jump", "args": {} },
+            { "action": "set_face", "args": { "face": "happy" } },
+            { "action": "say", "args": { "text": "Та-дам! Вот это фокус." } }
+          ]
+        },
+        {
+          "when": {},
+          "actions": [
+            { "action": "spin", "args": {} },
+            { "action": "set_face", "args": { "face": "curious" } },
+            { "action": "say", "args": { "text": "Смотри внимательно... та-дам!" } }
+          ]
+        }
+      ],
+      "threshold": 0.6,
+      "status": "active",
+      "origin": "mined"
+    },
+    "match_rate": 1.0,
+    "sample_ids": [41, 44, 47, 52, 58],
+    "status": "pending",
+    "created_at": "2026-09-23T15:04:11Z"
+  },
+  {
+    "id": "c3a9d5b2-8e01-4f77-b210-9c4d5e6f7890",
+    "skill": {
+      "id": "cheer_up",
+      "name": "Поддержка",
+      "description": "подбодрить пользователя",
+      "examples": [
+        "мне грустно",
+        "плохой день",
+        "поддержи меня",
+        "мне тоскливо",
+        "утешь меня",
+        "мне одиноко",
+        "как-то тяжело",
+        "скажи что-нибудь приятное",
+        "настроение на нуле",
+        "подбодри"
+      ],
+      "questions": {
+        "tone": {
+          "type": "choice",
+          "instructions": "Какая поддержка нужна пользователю",
+          "criteria": {
+            "тёплая": "человеку нужно сочувствие и спокойные слова",
+            "весёлая": "человека нужно рассмешить и растормошить"
+          }
+        }
+      },
+      "rules": [
+        {
+          "when": { "tone": "весёлая" },
+          "actions": [
+            { "action": "dance", "args": {} },
+            { "action": "set_face", "args": { "face": "happy" } },
+            { "action": "say", "args": { "text": "Держи танец! Уже легче?" } }
+          ]
+        },
+        {
+          "when": {},
+          "actions": [
+            { "action": "wave", "args": {} },
+            { "action": "set_face", "args": { "face": "happy" } },
+            { "action": "say", "args": { "text": "Я рядом. Всё наладится." } }
+          ]
+        }
+      ],
+      "threshold": 0.6,
+      "status": "active",
+      "origin": "mined"
+    },
+    "match_rate": 0.833,
+    "sample_ids": [12, 17, 19, 23, 29, 33],
+    "status": "pending",
+    "created_at": "2026-09-23T15:04:11Z"
+  }
+]

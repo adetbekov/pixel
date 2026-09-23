@@ -127,18 +127,23 @@
     <div class="metrics" id="metrics"></div>
 
     <div class="cols">
-      <div>
-        <h2>Навыки</h2>
+      <div class="col">
+        <div class="col-head"><h2>Навыки</h2></div>
         <div id="skills" class="list"></div>
       </div>
-      <div>
-        <h2>Предложенные навыки</h2>
+      <div class="col">
+        <div class="col-head">
+          <h2>Предложенные навыки</h2>
+          <button type="button" class="btn btn-mine" id="mine">Поискать новые навыки</button>
+        </div>
         <div id="proposals" class="list"></div>
       </div>
     </div>
   </section>
 
 </main>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
 <script type="module" src="app.js"></script>
 </body>
