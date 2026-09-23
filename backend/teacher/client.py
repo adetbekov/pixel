@@ -10,6 +10,7 @@ exception, and none of them show the user a traceback. The worst case is
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import Callable
@@ -38,9 +39,9 @@ log = logging.getLogger(__name__)
 #: (measured in split the bill, `src/services/gemini_thinking_budget.py`). The
 #: teacher passes no budget today — don't add one without that floor.
 #:
-#: TODO: once `GEMINI_API_KEY` lands (JEB-1508), confirm against
-#: `client.models.list()` that the model is visible and that this is the id form
-#: the live call accepts. Overridable via `GEMINI_TEACHER_MODEL` either way.
+#: Confirmed live on 2026-09-24 against `client.models.list()`: this exact id,
+#: `models/` prefix included, is in the listing and is the form the call accepts.
+#: Overridable via `GEMINI_TEACHER_MODEL` either way.
 DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
 
 #: Per-call ceiling, as JEB-1500 specifies.
@@ -163,8 +164,9 @@ class GeminiTeacher:
         :data:`FALLBACK_PLAN` behind a single ``log.warning`` while
         ``teacher_log`` filled with fallbacks and starved the miner. The same
         model on ``models.generate_content`` with ``response_schema`` returns
-        bare JSON. The miner made the same move for the same reason
-        (``backend/miner/generate.py``).
+        bare JSON. The miner still calls ``interactions.create`` on the same
+        model (``backend/miner/generate.py``) and is due the same move for the
+        same reason; it has not been made yet.
 
         The fences are a symptom of the wrong call shape, not a response format
         to support: ``_parse`` stays strict — it is what made this visible.
@@ -191,7 +193,18 @@ class GeminiTeacher:
                     # which has a 10 s floor. See `MIN_SERVER_DEADLINE_S`: this
                     # header keeps the request legal without lengthening the
                     # client-side wait above.
-                    "headers": {"X-Server-Timeout": str(MIN_SERVER_DEADLINE_S)},
+                    #
+                    # It is a floor, not a constant. With today's `TIMEOUT_S`
+                    # the budget never reaches 10 s, so the floor always wins —
+                    # but raise `TIMEOUT_S` above 10 and announcing a flat 10 s
+                    # would have the server cut the call short of a budget httpx
+                    # is still happily waiting out. `ceil` because the SDK
+                    # rounds the same way (`populate_server_timeout_header`),
+                    # and two roundings that differ are one more way for these
+                    # numbers to drift apart.
+                    "headers": {
+                        "X-Server-Timeout": str(max(MIN_SERVER_DEADLINE_S, math.ceil(timeout))),
+                    },
                 },
             },
         )

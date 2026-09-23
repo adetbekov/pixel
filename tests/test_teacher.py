@@ -345,6 +345,28 @@ def test_the_shortened_retry_still_sends_a_deadline_the_api_accepts(seeded):
     assert gemini.deadlines == [MIN_SERVER_DEADLINE_S, MIN_SERVER_DEADLINE_S]
 
 
+def test_a_budget_above_the_floor_is_announced_to_the_server():
+    """`MIN_SERVER_DEADLINE_S` is a floor, not the deadline we always announce.
+
+    Today's `TIMEOUT_S` keeps every budget under the floor, so this case is
+    unreachable through `explain` — until someone raises the ceiling. Announcing
+    a flat 10 s then has the server cut the call at 10 s while httpx waits out
+    the full budget: the extra seconds buy nothing and the user sees a bare
+    timeout. `_call` takes the budget as a parameter, so it is asked directly.
+    """
+    gemini = TimingOutClient()
+    teacher = GeminiTeacher(client=gemini, model="fake-model", clock=lambda: gemini.now)
+
+    budget = MIN_SERVER_DEADLINE_S + 5.5
+    with pytest.raises(httpx.TimeoutException):
+        teacher._call("покажи фокус", budget)
+
+    # Rounded UP, the way the SDK's own `populate_server_timeout_header` does it:
+    # a deadline announced shorter than the budget is the whole defect.
+    assert gemini.deadlines == [16]
+    assert gemini.deadlines[0] >= budget
+
+
 def test_no_retry_is_dialled_with_nothing_left_to_spend(seeded):
     gemini = TimingOutClient(overshoot=TOTAL_DEADLINE_S)
     teacher = GeminiTeacher(client=gemini, model="fake-model", clock=lambda: gemini.now)
