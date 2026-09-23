@@ -106,6 +106,33 @@ PIXEL_SKIP_MODEL=1 uvicorn backend.main:app   # UI and buttons only; /api/chat a
 Tests never touch the model or the network — they run against `FakeEngine` and `FakeGeminiClient`
 (`tests/fakes.py`).
 
+## Deploy
+
+Live at **https://pixel.yeldos.dev** — one container on the NAS (Portainer stack `pixel`), TLS and
+access control at Nginx Proxy Manager. The app has **no auth and no rate limit**, and both
+`/api/chat` and `/api/mine` spend `GEMINI_API_KEY`, so the proxy host carries an Access List (HTTP
+Basic or IP allow-list). That list is the only thing standing between a loop script and the key's
+quota — do not publish the host without it.
+
+`Dockerfile` + `docker-compose.yml` are the whole deployment. Redeploy after a merge is two steps:
+
+```
+docker build -t pixel:latest .                    # on the NAS, from a fresh checkout of dev
+docker compose -p pixel up -d --force-recreate     # or: redeploy the `pixel` stack in Portainer
+```
+
+- **Volume `pixel_pixel_data` → `/data`** — mandatory. It holds the SQLite DB (`PIXEL_DB_PATH`, WAL
+  mode) *and* the ~650 MB Laya checkpoint (`HF_HOME`). Lose it and the robot forgets every mined
+  skill and re-downloads the weights on the next start.
+- **Memory** — 3 GB limit; 2 GB is the floor (mmBERT-base, 322M, resident in the process).
+- **Network** — `npm_network` (external, owned by the Nginx Proxy Manager stack). No published
+  port; port 8000 is reachable only from the proxy.
+- **Env** — see `.env.example`; values live in the Portainer stack env, never in the repo. A missing
+  `GEMINI_API_KEY` is supported: Pixel starts and runs on Laya alone.
+- **Cold start** is slow by design (~70 s: weights download), warm start 8-10 s. The healthcheck
+  allows a 180 s `start_period` — shorten it and the orchestrator kills the download and restarts
+  into the same download.
+
 ## Pipeline
 
 PRs target `dev`; `main` is the release branch. CI runs lint + tests on every PR and
