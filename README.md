@@ -135,5 +135,14 @@ docker compose -p pixel up -d --force-recreate     # or: redeploy the `pixel` st
 
 ## Pipeline
 
-PRs target `dev`; `main` is the release branch. CI runs lint + tests on every PR and
-emits `check_suite`, which is the review hand-off gate.
+PRs target `dev`; `main` is the release branch. CI runs lint + tests, the frontend lint and an
+`image build` gate on every PR, and emits `check_suite`, which is the review hand-off gate.
+
+`image build` builds the same `Dockerfile` the NAS redeploy builds, so a broken image fails the PR
+instead of the stand. It then asks the built image what it actually installed: torch must equal the
+pin in `requirements-torch.txt` — the one file the image *and* the test job install from — it must
+not be a CUDA wheel, and `laya` must land inside the range in `pyproject.toml`. Then it smoke-runs
+the container with `PIXEL_SKIP_MODEL=1` and asserts 200 from `/api/state`, `/` and `/app.js`. The
+last one is the editable-install regression: a non-editable `pip install .` moves the package into
+site-packages, `/frontend` stops existing and the whole UI 404s while the API still answers.
+Nothing is pushed to a registry — the image is a gate, not a deploy.

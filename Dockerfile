@@ -13,12 +13,12 @@ WORKDIR /app
 # Pixel runs on CPU, so seed the CPU wheel first — in its own layer, so a code
 # change never rebuilds it — and let the install below see torch as satisfied.
 #
-# Pinned exactly, to the same version .github/workflows/ci.yml installs: the
-# documented redeploy is `docker build .` on the NAS, so an unpinned `torch`
-# rebuilds an already-green commit against whatever the CPU index serves that day
-# and the image stops being a function of the commit. `+cpu` is part of the pin so
-# a CUDA wheel can never satisfy it silently.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
+# The pin itself lives in requirements-torch.txt — the single file the `test` job
+# installs from as well, so the two can no longer drift the way JEB-1516 found them
+# drifted. This layer rebuilds only when that file changes. CI's `image build` job
+# asserts the built image really carries that version and is not a CUDA wheel.
+COPY requirements-torch.txt ./
+RUN pip install -r requirements-torch.txt
 
 # `readme = "README.md"` in pyproject.toml, so the build needs it.
 COPY pyproject.toml README.md ./
