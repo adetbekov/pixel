@@ -66,7 +66,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
 | `ROUTER_THRESHOLD` | `0.6` | Confidence a skill needs to win the router. Below it, the command is a miss. |
 | `MINER_BATCH` | `5` | Mine on every N-th unmined case. |
-| `MINER_SIM` | `0.75` | Cosine similarity that joins two commands into one cluster. |
+| `MINER_SIM` | `0.88` | Cosine similarity that joins two commands into one cluster. Narrow usable band — see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
@@ -127,8 +127,10 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
 
 1. **Cluster.** Sentence vectors come from the Laya checkpoint already in memory
    (`DecisionEngine.embed`) — local, free, and still no `import laya` outside `engine.py`.
-   Single-link agglomerative clustering on cosine >= `MINER_SIM` (0.75), which is connected
-   components of the similarity graph, in numpy. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
+   Single-link agglomerative clustering on cosine >= `MINER_SIM` (0.88), which is connected
+   components of the similarity graph, in numpy. The default is measured against the real
+   checkpoint: these vectors are anisotropic, so the band that separates "same request" from
+   "different request" sits high and is narrow. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
    pool and ripen. Without embeddings the commands are grouped by one Gemini call instead — a
    degraded path, not the default one.
 2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-2.5-flash-lite`,

@@ -40,11 +40,12 @@ TEACHER_PLANS = [
 #: Nothing extreme, so the candidate's fallback rule is the one that fires.
 MID_STATE = RobotState(mood=60.0, energy=60.0, fullness=60.0, face="curious")
 
-#: One direction plus a nudge per command: every pair sits at cos >= 0.92, well
-#: clear of MINER_SIM, and an unscripted command stays far away (`hash_vector`).
-#: Same width as `hash_vector`, so the two can appear in one batch.
+#: One direction plus a nudge per command: every pair sits at cos >= 0.97, well
+#: clear of MINER_SIM (0.88), and an unscripted command stays far away — below
+#: 0.19 through `hash_vector`. Same width as `hash_vector`, so the two can
+#: appear in one batch.
 TRICK_EMBEDDINGS = {
-    text: [1.0, 0.1 * index, *([0.0] * (EMBED_DIM - 2))]
+    text: [1.0, 0.05 * index, *([0.0] * (EMBED_DIM - 2))]
     for index, text in enumerate([*TRICK_COMMANDS, LATER_TRICK])
 }
 

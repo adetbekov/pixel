@@ -8,7 +8,14 @@ import pytest
 
 from backend.brain.engine import EmbeddingsUnavailable
 from backend.miner.case import load_pool, pool_size
-from backend.miner.cluster import components, cosine_matrix, group_texts, min_cluster_size
+from backend.miner.cluster import (
+    DEFAULT_SIM,
+    components,
+    cosine_matrix,
+    group_texts,
+    min_cluster_size,
+    sim_threshold,
+)
 from backend.state import RobotState
 
 from .fakes import FakeEngine, hash_vector
@@ -32,16 +39,36 @@ def test_an_unrelated_command_stays_on_its_own(trick_engine):
 
 
 def test_the_threshold_is_configurable(monkeypatch):
-    """These two sit at cos = 0.8: together by default, apart at 0.9."""
-    engine = FakeEngine(embeddings={"a": [1.0, 0.0], "b": [0.8, 0.6]})
+    """These two sit at cos = 0.9: together by default, apart at 0.95."""
+    engine = FakeEngine(embeddings={"a": [1.0, 0.0], "b": [0.9, np.sqrt(1 - 0.9**2)]})
     assert group_texts(engine, ["a", "b"]) == [[0, 1]]
-    monkeypatch.setenv("MINER_SIM", "0.9")
+    monkeypatch.setenv("MINER_SIM", "0.95")
     assert group_texts(engine, ["a", "b"]) == [[0], [1]]
 
 
+def test_the_default_sits_in_the_measured_band(monkeypatch):
+    """0.88, calibrated on real Laya vectors in JEB-1509.
+
+    Pinned because it is not a round number anybody would guess back: below
+    ~0.87 the clusters come out mixed, past ~0.91 none reach the minimum size.
+    """
+    monkeypatch.delenv("MINER_SIM", raising=False)
+    assert DEFAULT_SIM == 0.88
+    assert sim_threshold() == DEFAULT_SIM
+
+
 def test_single_link_chains_through_a_middle_point():
-    """A and C are far apart but both close to B — single-link joins all three."""
-    engine = FakeEngine(embeddings={"a": [1.0, 0.0], "b": [1.0, 0.6], "c": [1.0, 1.6]})
+    """A and C are far apart but both close to B — single-link joins all three.
+
+    Three unit vectors 25° apart: neighbours sit at cos 0.91, the ends at 0.64.
+    """
+    angles = {"a": 0.0, "b": 25.0, "c": 50.0}
+    engine = FakeEngine(
+        embeddings={
+            name: [np.cos(np.radians(angle)), np.sin(np.radians(angle))]
+            for name, angle in angles.items()
+        }
+    )
     assert group_texts(engine, ["a", "b", "c"]) == [[0, 1, 2]]
 
 
