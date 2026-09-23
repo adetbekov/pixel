@@ -1,0 +1,40 @@
+name: CI
+
+# `check_suite = success` is the hand-off gate for the Multica PR pipeline, so this
+# workflow must run on every PR into dev and main.
+on:
+  pull_request:
+    branches: [dev, main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # `laya` depends on torch. The default PyPI wheel is the CUDA build (~1 GB);
+      # CI only ever needs CPU, so pre-seed the CPU wheel and let the editable
+      # install below see the requirement as already satisfied.
+      - name: Install CPU torch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Install project
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      # No model weights are downloaded and no GEMINI_API_KEY is required here —
+      # those paths are mocked in tests.
+      - name: Tests
+        run: pytest -q
