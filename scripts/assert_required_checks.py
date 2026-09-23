@@ -139,28 +139,31 @@ _WORKFLOWS = _ROOT / ".github" / "workflows"
 # Keyed by branch, because `main` and `dev` need not gate the same set. The
 # audited branch selects the map; `--branch` names it.
 #
-# Both of pixel's CI jobs are declared `on: pull_request: branches: [dev, main]`,
-# so each reports for a PR into either branch and both lists carry them. `main`
-# is that pair plus the release-only gates, which `dev` must NOT require:
+# All three of pixel's CI jobs are declared `on: pull_request: branches: [dev,
+# main]`, so each reports for a PR into either branch and both lists carry them.
+# `main` is that trio plus the release-only gate, which `dev` must NOT require:
 #
 #   * `main PRs must come from dev` — guard-main-head.yml is
 #     `on: pull_request: branches: [main]` (JEB-1522), so no PR into `dev` can
 #     start it. Requiring it on `dev` would leave every such PR blocked on a
 #     context nothing reports.
 #
-# The image build (JEB-1518) joins `main` the same way, in the PR that adds it
-# to `main`'s protection — not before: asserting a context that is not yet
-# required is a finding, and asserting one no PR into that branch can produce
-# would wedge the branch.
+# `image build` (JEB-1518) was deliberately absent from both lists until the job
+# was on `dev` — asserting a context that is not yet required is a finding, and
+# requiring one no PR into that branch can produce would wedge the branch. It
+# landed with #17, reported on live PRs into both branches, and JEB-1524 made it
+# required on `dev` and `main`; this dict edit is that change's other half.
 REQUIRED_CONTEXTS = {
     "main": {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
+        "image build": "ci.yml",
         "main PRs must come from dev": "guard-main-head.yml",
     },
     "dev": {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
+        "image build": "ci.yml",
     },
 }
 
