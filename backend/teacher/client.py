@@ -164,9 +164,8 @@ class GeminiTeacher:
         :data:`FALLBACK_PLAN` behind a single ``log.warning`` while
         ``teacher_log`` filled with fallbacks and starved the miner. The same
         model on ``models.generate_content`` with ``response_schema`` returns
-        bare JSON. The miner still calls ``interactions.create`` on the same
-        model (``backend/miner/generate.py``) and is due the same move for the
-        same reason; it has not been made yet.
+        bare JSON. The miner made the same move for the same reason in JEB-1540
+        (``backend/miner/generate.py``), so the two halves call alike.
 
         The fences are a symptom of the wrong call shape, not a response format
         to support: ``_parse`` stays strict — it is what made this visible.
