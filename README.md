@@ -58,7 +58,7 @@ so fallbacks are logged too. `raw_response` is never returned over the API.
 
 Without `GEMINI_API_KEY` the app still starts: the teacher is off, a miss answers with a polite
 stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` overrides the model
-(default `gemini-3.1-flash-lite`).
+(default `models/gemini-2.5-flash-lite`).
 
 ## Learning — the skill miner
 
