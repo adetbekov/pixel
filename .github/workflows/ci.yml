@@ -2,18 +2,33 @@ name: CI
 
 # `check_suite = success` is the hand-off gate for the Multica PR pipeline, so this
 # workflow must run on every PR into dev and main.
+#
+# The `push` trigger is a backstop, not a gate: `pull_request` runs against a
+# `base + head` merge commit computed when the run started, so a PR merged after its
+# base moved on — or two PRs green on different bases that conflict semantically —
+# leaves the branch tip itself untested. Without this, "is the tip of `dev` green?"
+# has no answer in the repository at all (step 1 of `jeb-release` needs one).
+# Deliberately NOT added to `required_status_checks`: it runs after the merge.
 on:
   pull_request:
     branches: [dev, main]
+  push:
+    branches: [dev, main]
 
-# Both jobs only read the checkout — nothing pushes, comments on the PR or writes
-# packages. Third-party install scripts (`pip install -e`, `npm ci`) run in the same
+# Every job only reads the checkout — nothing pushes, comments on the PR or writes
+# packages, and `image build` deliberately never publishes the image it builds.
+# Third-party install scripts (`pip install -e`, `npm ci`) run in the same
 # environment as GITHUB_TOKEN, so it gets the narrowest scope that still works.
 permissions:
   contents: read
 
+# On `pull_request` the PR number groups the run, so a new push to the branch
+# supersedes the in-flight one. On `push` `github.event.pull_request` is empty, so
+# every push run would otherwise collapse into the single group `ci-` and cancel its
+# predecessor — the SHA fallback gives each merged commit its own group, because a
+# push run is the only record of whether that commit is green.
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -32,10 +47,11 @@ jobs:
       # CI only ever needs CPU, so pre-seed the CPU wheel and let the editable
       # install below see the requirement as already satisfied.
       #
-      # Same exact pin as the Dockerfile — CI is only evidence about the image if
-      # both install the same torch. Bump the two lines together.
+      # Same file the Dockerfile installs from — this job is only evidence about the
+      # image if both install the same torch, and one file cannot disagree with
+      # itself. The `image build` job below checks the image really got it.
       - name: Install CPU torch
-        run: pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
+        run: pip install -r requirements-torch.txt
 
       - name: Install project
         run: pip install -e ".[dev]"
@@ -79,4 +95,85 @@ jobs:
           for f in "${files[@]}"; do
             jq empty "$f"
             echo "ok: $f"
+          done
+
+  # `Dockerfile` + `docker-compose.yml` are the whole deployment, and the documented
+  # redeploy is `docker build .` on the NAS — without this job the first real build of
+  # a commit happens on production. The image is built, probed and thrown away: this is
+  # a gate, not a deploy, so nothing is pushed to a registry.
+  image:
+    name: image build
+    runs-on: ubuntu-latest
+    # One tag for the whole job: the build, both verifiers and the smoke run have to
+    # be talking about the same image, and three copies of a literal cannot promise it.
+    env:
+      IMAGE: pixel:ci
+    steps:
+      - uses: actions/checkout@v4
+
+      # tomllib needs 3.11+; `packaging` compares the image's laya against the range
+      # in pyproject.toml instead of a second copy of that range living in CI.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install verifier deps
+        run: pip install packaging
+
+      # JEB-1527: both compose steps run before the build — they need no image, take
+      # under a second, and a typo in the stack should not cost a full image build to
+      # find. `config` parses the YAML, checks it against the compose schema and
+      # resolves every `${VAR:-default}`; all of Pixel's have defaults, so nothing is
+      # stubbed here and a variable that stops having one fails this step by design.
+      - name: docker-compose.yml is valid
+        run: docker compose -f docker-compose.yml config -q
+
+      # And that it starts *this* repo's image. A valid stack pulling someone else's
+      # tag, or building from another context, passes `config` and then breaks the NAS
+      # redeploy — where `pull_policy: never` turns a wrong tag into a silent no-op.
+      - name: docker-compose.yml runs the image this job builds
+        run: python .github/scripts/verify_compose.py "$IMAGE"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The torch CPU wheel is ~200 MB and its layer changes only when
+      # requirements-torch.txt does, so a code-only PR restores it from cache and
+      # rebuilds just the `pip install -e .` layer and the COPYs after it.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # JEB-1516: ci.yml claimed the Dockerfile pinned the same torch while the
+      # Dockerfile installed it unpinned, and nothing in CI could tell. This reads the
+      # pin from requirements-torch.txt and asks the built image what it actually has.
+      - name: Image carries the pinned CPU torch and an in-range laya
+        run: python .github/scripts/verify_image_deps.py "$IMAGE"
+
+      # PIXEL_SKIP_MODEL=1 starts in ~2 s and downloads no weights. `/` and `/app.js`
+      # are the load-bearing part: `pip install -e .` is what keeps them served, and a
+      # non-editable install 404s the whole UI silently, with the API still answering
+      # 200 and not one error in the log.
+      - name: Smoke-run the image
+        run: |
+          docker run -d --name pixel-ci -e PIXEL_SKIP_MODEL=1 -p 127.0.0.1:8000:8000 "$IMAGE"
+          trap 'docker logs pixel-ci; docker rm -f pixel-ci >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8000/api/state; then break; fi
+            sleep 1
+          done
+
+          for path in /api/state / /app.js; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8000$path")
+            echo "GET $path -> $code"
+            if [ "$code" != 200 ]; then
+              echo "expected 200 from $path" >&2
+              exit 1
+            fi
           done
