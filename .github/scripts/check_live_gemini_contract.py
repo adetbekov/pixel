@@ -29,8 +29,9 @@ Exit codes, which the workflow's alert step branches on:
 
   0  both shapes answered in a parsable form
   1  a real finding — at least one shape's answer did not parse
-  2  the probe could not be run at all (no key, SDK missing, import error);
-     this is *not* evidence that the contract broke
+  2  the probe could not be run at all (no key, SDK missing, import error, or
+     the API refused every call on quota); this is *not* evidence that the
+     contract broke
 """
 
 from __future__ import annotations
@@ -71,6 +72,48 @@ SDK_ENTRY_POINTS = (
     ("interactions.create", "response_format"),
     ("models.generate_content", "response_schema"),
 )
+
+#: HTTP status the API uses for "you are out of quota". The project this key
+#: belongs to is on the free tier, where `models/gemini-2.5-flash-lite` allows
+#: 20 `generateContent` requests a DAY and the live stand spends from the same
+#: twenty (JEB-1553) — so an exhausted day is the expected steady state, not an
+#: anomaly. Retrying does not help: the window is daily, measured.
+QUOTA_HTTP_CODE = 429
+
+#: The `status` field that comes with it, checked alongside the code because the
+#: SDK fills whichever of the two the error envelope carried.
+QUOTA_STATUS = "RESOURCE_EXHAUSTED"
+
+
+class ProbeUnavailable(Exception):
+    """The API never answered, so there is nothing to judge — exit 2, not 1.
+
+    A quota refusal and a fenced answer are opposite outcomes: one means the
+    model's behaviour moved (a finding), the other means the model was never
+    asked. Collapsing them opens an issue titled "a call shape's answer no
+    longer parses" on a night when no answer existed at all.
+    """
+
+
+def quota_refusal(exc: BaseException) -> str | None:
+    """The reason line when `exc` is the API refusing on quota, else `None`.
+
+    `google.genai` is imported here rather than at module scope on purpose: a
+    missing SDK is itself an exit-2 condition that `main` reports in words, and
+    a top-level import would turn that into an ImportError traceback.
+    """
+    try:
+        from google.genai.errors import APIError
+    except ImportError:  # pragma: no cover - `main` has already refused this case
+        return None
+    if not isinstance(exc, APIError):
+        return None
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    if code != QUOTA_HTTP_CODE and status != QUOTA_STATUS:
+        return None
+    detail = getattr(exc, "message", None) or str(exc)
+    return f"the API refused the call on quota ({code} {status}): {detail}"
 
 
 def _code_of(func: Callable) -> str:
@@ -197,12 +240,21 @@ def diagnose(raw: str) -> str:
 
 
 def run(probe: Probe) -> str | None:
-    """`None` when the shape is healthy, otherwise the finding to print."""
+    """`None` when the shape is healthy, otherwise the finding to print.
+
+    Raises :class:`ProbeUnavailable` when the call never reached a model answer
+    for a reason that says nothing about the contract.
+    """
     failures = []
     for attempt in range(1, ATTEMPTS + 1):
         try:
             raw = probe.call()
-        except Exception as exc:  # noqa: BLE001 — every failure is reportable here
+        except Exception as exc:  # every failure is reportable here
+            refusal = quota_refusal(exc)
+            if refusal:
+                # No retry: the quota window is a day, so the second attempt
+                # would fail identically and spend nothing but wall clock.
+                raise ProbeUnavailable(f"{probe.name}: {refusal}") from exc
             failures.append(f"attempt {attempt}: the call itself raised {type(exc).__name__}: {exc}")
             continue
 
@@ -246,11 +298,15 @@ def main() -> int:
         return 2
 
     findings = []
+    unchecked = []
     for probe in PROBES:
         # Both shapes are always probed: a teacher finding says nothing about the
         # miner, and half an answer reads like a whole one in the alert issue.
         try:
             finding = run(probe)
+        except ProbeUnavailable as exc:
+            unchecked.append(str(exc))
+            continue
         except Exception:  # noqa: BLE001 — a crash in one probe must not hide the other
             traceback.print_exc()
             findings.append(f"{probe.name}: the probe itself crashed, see the traceback above")
@@ -258,14 +314,29 @@ def main() -> int:
         if finding:
             findings.append(finding)
 
-    if not findings:
-        print("Both call shapes hold their contract with the live model.")
-        return 0
+    if findings:
+        # A real finding outranks an unchecked shape: one shape proving the
+        # contract broke is worth alerting on even if the other never ran.
+        print("\nFINDINGS:", file=sys.stderr)
+        for finding in findings:
+            print(f"- {finding}", file=sys.stderr)
+        for reason in unchecked:
+            print(f"- (not checked) {reason}", file=sys.stderr)
+        return 1
 
-    print("\nFINDINGS:", file=sys.stderr)
-    for finding in findings:
-        print(f"- {finding}", file=sys.stderr)
-    return 1
+    if unchecked:
+        print("\nNOT CHECKED:", file=sys.stderr)
+        for reason in unchecked:
+            print(f"- {reason}", file=sys.stderr)
+        print(
+            "No answer came back from the model, so the live contract was not checked. "
+            "This is not a pass and not a finding.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print("Both call shapes hold their contract with the live model.")
+    return 0
 
 
 if __name__ == "__main__":
