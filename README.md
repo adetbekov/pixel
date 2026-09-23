@@ -246,6 +246,9 @@ instead of the stand. It asks the built image what it actually installed: torch 
 pin in `requirements-torch.txt` — the one file the image *and* the test job install from — it must
 not be a CUDA wheel, and `laya` must land inside the range in `pyproject.toml`. Then it smoke-runs
 the container with `PIXEL_SKIP_MODEL=1` and asserts 200 from `/api/state`, `/` and `/app.js`. The
-last one is the editable-install regression: a non-editable `pip install .` moves the package into
-site-packages, `/frontend` stops existing and the whole UI 404s while the API still answers.
-Nothing is pushed to a registry — the image is a gate, not a deploy.
+last two are the missing-frontend regression: an image that lost `frontend/` — a dropped `COPY`, a
+bad `.dockerignore` — 404s the whole UI while `/api/state` still answers 200. It is *not* an
+editable-install gate: JEB-1530 measured an image built with plain `pip install .` serving all
+three paths, because `WORKDIR /app` plus uvicorn's default `--app-dir ""` make `/app/backend`
+shadow the site-packages copy either way. Nothing is pushed to a registry — the image is a gate,
+not a deploy.
