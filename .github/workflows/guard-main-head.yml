@@ -6,23 +6,35 @@ name: Guard main PR head
 # fix PRs target `dev`; only the deliberate `dev → main` release PR is allowed
 # through. See jeb-git-pr / jeb-release.
 
-# `pull_request_target` only, on purpose (JEB-1368).
+# BOTH triggers on purpose — transitional dual-trigger phase (JEB-1525).
 #
-# GitHub reads `pull_request` from the PR head and `pull_request_target` from
-# the base branch. Under `pull_request` the head would control this guard: it
-# could rewrite the job to `exit 0`, keep the name, and make the required
-# context `main PRs must come from dev` report success on a PR that never came
-# from dev. Reading the base copy closes that — the head cannot touch it.
+# GitHub resolves `pull_request` from the PR's *merge ref* (head merged into
+# base) and `pull_request_target` from the *base* branch. `pull_request_target`
+# is the end state the four other studio repos use (JEB-1368), because a head
+# cannot rewrite the copy that decides its own gate.
+#
+# Swapping one key for the other in a single step deadlocks the release that
+# would deliver the swap: on the `dev → main` PR neither trigger fires —
+# `pull_request` is gone from the merge ref, and `pull_request_target` is not
+# on `main` yet. The required context `main PRs must come from dev` would then
+# never report, with `strict: true` and `enforce_admins: true` leaving no
+# bypass. So both keys ride together until a release carries this copy to
+# `main`; the transitional `pull_request` is dropped in its own PR afterwards
+# (JEB-1525 step 5). warmplace (#96 → #104) and split-the-bill (#673 → #682)
+# migrated exactly this way.
 #
 # Safe under `pull_request_target` only because this job checks nothing out and
 # runs no head-controlled code — never add a checkout step below.
 on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+    branches: [main]
   pull_request_target:
     types: [opened, reopened, synchronize, edited]
     branches: [main]
 
-# Read-only default (JEB-1049). The single job reads `github.head_ref` from the
-# event payload — it does not even check the repo out.
+# Read-only default. The single job reads `github.head_ref` from the event
+# payload — it does not even check the repo out.
 permissions:
   contents: read
 
@@ -34,7 +46,7 @@ jobs:
       - name: Verify head is dev
         # `github.head_ref` is the bare branch name — a fork's branch named
         # `dev` yields the same value as this repo's release branch. Check the
-        # head repository too, so only <this repo>@dev passes (JEB-1154).
+        # head repository too, so only <this repo>@dev passes.
         # `head.repo.full_name` is null when the fork is gone: empty != this
         # repo, so the guard fails closed.
         env:
