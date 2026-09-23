@@ -67,6 +67,19 @@ def _parse(row: sqlite3.Row) -> Case | None:
     if payload.get("error"):
         return None
 
+    # And the same holds for a call that *succeeded* and declined. `handled` is
+    # false when the teacher answered "я не умею заказывать еду" — a real plan, a
+    # real reply, and the worst possible thing to learn: a mined refusal answers
+    # instantly, from Laya, for ever, and the command never reaches the teacher
+    # again. Measured before this check existed (JEB-1547): four of five phrasings
+    # of "покажи фокус" came back as refusals and the drafted skill said "я не
+    # умею показывать фокусы" from Laya in 300 ms.
+    #
+    # `is False`, not falsy: a row written before this field existed has no
+    # `handled` at all, and a missing verdict must not read as a refusal.
+    if payload.get("handled") is False:
+        return None
+
     text = str(payload.get("user_text") or "").strip()
     if not text or not actions:
         return None
@@ -82,7 +95,16 @@ def load_pool(conn: sqlite3.Connection) -> list[Case]:
 
 
 def pool_size(conn: sqlite3.Connection) -> int:
-    """How many rows are unmined — the counter the automatic trigger watches."""
-    return int(
-        conn.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0").fetchone()["n"]
-    )
+    """How many cases the miner could actually use — what the trigger watches.
+
+    ``len(load_pool(conn))`` and not ``COUNT(*) WHERE mined = 0``, so that "pool
+    size" has exactly one definition. The rows :func:`_parse` drops are never
+    marked ``mined``, so a count of raw rows drifts: three unusable rows and the
+    every-``MINER_BATCH``-th trigger fires on two mineable cases — below
+    ``MINER_MIN_CLUSTER``, so the run finds nothing, and the offset never
+    recovers. With refusals now dropped too (above) that drift would only grow.
+
+    The cost is parsing tens of rows per teacher call instead of a ``COUNT``. The
+    mining run this decides reads and parses the same rows anyway.
+    """
+    return len(load_pool(conn))

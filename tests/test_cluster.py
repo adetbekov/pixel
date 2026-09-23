@@ -19,7 +19,7 @@ from backend.miner.cluster import (
 from backend.state import RobotState
 
 from .fakes import FakeEngine, hash_vector
-from .trick_cluster import TRICK_COMMANDS, TRICK_EMBEDDINGS, fill_pool
+from .trick_cluster import TEACHER_PLANS, TRICK_COMMANDS, TRICK_EMBEDDINGS, fill_pool
 
 FAR = [0.0, 0.0, 1.0]
 
@@ -133,8 +133,39 @@ def test_the_pool_reads_back_the_command_and_the_plan(conn):
 def test_a_failed_teacher_call_is_not_mining_material(conn):
     """Its plan is "I did not understand" — mining it would teach that."""
     fill_pool(conn, error="TimeoutError: boom")
-    assert pool_size(conn) == len(TRICK_COMMANDS)
     assert load_pool(conn) == []
+
+
+def test_a_declined_answer_is_not_mining_material(conn):
+    """The call worked; the teacher said it cannot do this.
+
+    A real plan and a real reply, and the worst thing in the pool: mined, it
+    becomes a skill that answers "я не умею" from Laya for ever and never lets
+    the command reach the teacher again (JEB-1547).
+    """
+    fill_pool(conn, handled=False)
+    assert load_pool(conn) == []
+
+
+def test_a_row_written_before_handled_existed_is_still_mineable(conn):
+    """A missing verdict is not a refusal — `pixel.db` predates the field."""
+    conn.execute(
+        "INSERT INTO teacher_log (state_json, actions_json, mined) VALUES (?, ?, 0)",
+        (json.dumps({"user_text": "покажи фокус", "state": {}}), json.dumps(TEACHER_PLANS[0])),
+    )
+    conn.commit()
+    assert [case.user_text for case in load_pool(conn)] == ["покажи фокус"]
+
+
+def test_the_pool_size_counts_only_what_the_miner_could_use(conn):
+    """Otherwise the every-MINER_BATCH-th trigger drifts and never recovers: the
+    rows `load_pool` drops are never marked `mined`, so they sit in the count for
+    ever and the trigger fires on a pool too small to cluster."""
+    fill_pool(conn, ["какая погода", "закажи пиццу"], handled=False)
+    assert pool_size(conn) == 0
+
+    fill_pool(conn, TRICK_COMMANDS)
+    assert pool_size(conn) == len(TRICK_COMMANDS) == len(load_pool(conn))
 
 
 def test_a_mined_row_is_out_of_the_pool(conn):

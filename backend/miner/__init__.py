@@ -7,7 +7,7 @@ Gemini at all.
 
 The pipeline, once per run:
 
-``teacher_log (mined=0)`` -> cluster -> generate -> backtest -> proposal
+``teacher_log (mined=0, handled)`` -> cluster -> generate -> backtest -> proposal
 
 and it stops there. **A mined skill is never activated by this package.** Only
 ``POST /api/proposals/{id}/accept`` puts one in the library — that is the

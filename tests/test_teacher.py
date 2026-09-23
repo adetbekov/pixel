@@ -31,6 +31,7 @@ from backend.teacher.schema import TeacherPlan
 GOOD_PLAN = json.dumps(
     {
         "reply": "Смотри, что я умею!",
+        "handled": True,
         "actions": [
             {"action": "set_face", "face": "happy"},
             {"action": "spin"},
@@ -42,11 +43,30 @@ GOOD_PLAN = json.dumps(
 )
 
 HACKED_PLAN = json.dumps(
-    {"reply": "Сейчас!", "actions": [{"action": "hack_nasa"}, {"action": "jump"}]},
+    {
+        "reply": "Сейчас!",
+        "handled": True,
+        "actions": [{"action": "hack_nasa"}, {"action": "jump"}],
+    },
     ensure_ascii=False,
 )
 
-BLANK_REPLY_PLAN = json.dumps({"reply": "   ", "actions": [{"action": "jump"}]})
+BLANK_REPLY_PLAN = json.dumps(
+    {"reply": "   ", "handled": True, "actions": [{"action": "jump"}]}
+)
+
+#: The teacher answered, and declined: a real plan, a real reply, `handled` false.
+DECLINED_PLAN = json.dumps(
+    {
+        "reply": "Я не умею заказывать еду, научи меня чему-нибудь другому",
+        "handled": False,
+        "actions": [
+            {"action": "set_face", "face": "curious"},
+            {"action": "say", "text": "Я не умею заказывать еду"},
+        ],
+    },
+    ensure_ascii=False,
+)
 
 
 class TimingOutClient:
@@ -196,7 +216,67 @@ async def test_every_call_leaves_a_complete_log_row(client, conn, seeded, missin
     assert state["router_confidence"] == pytest.approx(0.38)
     assert set(state["state"]) == {"mood", "energy", "fullness", "face"}
     assert state["error"] is None
+    assert state["handled"] is True
 
+    assert json.loads(row["actions_json"]) == body["actions"]
+
+
+@pytest.mark.anyio
+async def test_a_refusal_with_nothing_to_do_still_speaks(client, seeded, missing, teacher):
+    """The live model declines with `actions: []` — there is nothing in the
+    library to do, only something to say. Retrying that cost two round trips and
+    replaced a good refusal with FALLBACK_REPLY (JEB-1547)."""
+    gemini = teacher(
+        json.dumps(
+            {"reply": "Я не умею предсказывать погоду", "handled": False, "actions": []},
+            ensure_ascii=False,
+        )
+    )
+    body = (await client.post("/api/chat", json={"text": "какая погода"})).json()
+
+    assert len(gemini.calls) == 1, "a refusal is an answer, not something to retry"
+    assert body["reply"] == "Я не умею предсказывать погоду"
+    assert body["actions"] == [
+        {"action": "say", "args": {"text": "Я не умею предсказывать погоду"}}
+    ]
+
+
+@pytest.mark.anyio
+async def test_an_empty_plan_that_claims_to_have_acted_is_retried(
+    client, seeded, missing, teacher
+):
+    """`handled` true and nothing done is a contradiction, not a refusal."""
+    gemini = teacher(
+        json.dumps({"reply": "Смотри!", "handled": True, "actions": []}), GOOD_PLAN
+    )
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert len(gemini.calls) == 2
+    assert body["reply"] == "Тада!"
+
+
+@pytest.mark.anyio
+async def test_a_declined_answer_reaches_the_user_and_is_marked_for_the_miner(
+    client, conn, seeded, missing, teacher
+):
+    """The teacher answered, and said it cannot do this.
+
+    Nothing changes for the user — a plan, a reply, the `gemini` badge. What
+    changes is the row: `handled` false is what keeps the miner from turning a
+    refusal into a permanent Laya skill (JEB-1547, `backend/miner/case._parse`).
+    """
+    teacher(DECLINED_PLAN)
+    body = (await client.post("/api/chat", json={"text": "закажи пиццу"})).json()
+
+    assert body["engine"] == "gemini"
+    assert "не умею заказывать" in body["reply"]
+
+    row = teacher_rows(conn)[0]
+    state = json.loads(row["state_json"])
+    assert state["error"] is None, "the call succeeded — this is not a failure"
+    assert state["handled"] is False
+    # Still written, still kept: "the user keeps asking for food delivery" is
+    # worth reading even though no skill can come of it.
     assert json.loads(row["actions_json"]) == body["actions"]
 
 
@@ -264,7 +344,7 @@ async def test_the_request_asks_for_the_plan_schema(client, seeded, missing, tea
     # at 10 s and would 400 our 8 s outright.
     assert config["http_options"]["headers"]["X-Server-Timeout"] == "10"
     assert config["response_mime_type"] == "application/json"
-    assert set(config["response_schema"]["properties"]) == {"reply", "actions"}
+    assert set(config["response_schema"]["properties"]) == {"reply", "handled", "actions"}
     # The prompt is generated from the library, so it cannot drift from it.
     assert all(name in config["system_instruction"] for name in ACTIONS)
 
@@ -281,7 +361,7 @@ def test_the_prompt_shows_the_skill_boundary(seeded):
 
 
 def test_an_over_long_reply_is_trimmed_not_rejected():
-    plan = TeacherPlan.model_validate({"reply": "я" * 400, "actions": []})
+    plan = TeacherPlan.model_validate({"reply": "я" * 400, "handled": True, "actions": []})
     assert plan.reply == "я" * MAX_SAY_LEN
 
 
@@ -293,7 +373,9 @@ async def test_a_blank_reply_never_reaches_the_user(client, seeded, missing, tea
     `""` is stopped by `min_length` in the schema and `"   "` only by the strip
     check in `_parse` — both must end up retried, then on the fallback.
     """
-    gemini = teacher(json.dumps({"reply": blank, "actions": [{"action": "jump"}]}))
+    gemini = teacher(
+        json.dumps({"reply": blank, "handled": True, "actions": [{"action": "jump"}]})
+    )
 
     body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
 

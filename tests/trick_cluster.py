@@ -94,6 +94,7 @@ def fill_pool(
     commands: list[str] | None = None,
     state: RobotState = MID_STATE,
     error: str | None = None,
+    handled: bool = True,
 ) -> list[int]:
     """Put teacher cases in the pool through the real writer, not a hand-built row."""
     commands = TRICK_COMMANDS if commands is None else commands
@@ -107,6 +108,7 @@ def fill_pool(
             raw_response="{}",
             actions=TEACHER_PLANS[index % len(TEACHER_PLANS)],
             error=error,
+            handled=handled,
         )
         for index, command in enumerate(commands)
     ]

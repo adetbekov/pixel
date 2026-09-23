@@ -30,7 +30,11 @@ sys.modules[spec.name] = contract
 spec.loader.exec_module(contract)
 
 GOOD_PLAN = json.dumps(
-    {"reply": "Кручусь!", "actions": [{"action": "spin"}, {"action": "say", "text": "Кручусь!"}]},
+    {
+        "reply": "Кручусь!",
+        "handled": True,
+        "actions": [{"action": "spin"}, {"action": "say", "text": "Кручусь!"}],
+    },
     ensure_ascii=False,
 )
 

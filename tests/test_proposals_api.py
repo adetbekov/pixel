@@ -113,6 +113,7 @@ async def test_accepting_routes_the_command_to_the_new_skill_without_a_restart(
         json.dumps(
             {
                 "reply": "Тада!",
+                "handled": True,
                 "actions": [
                     {"action": "spin"},
                     {"action": "set_face", "face": "happy"},
@@ -437,7 +438,12 @@ async def test_mining_runs_itself_every_batch_th_case(
     """No button pressed: the fifth miss triggers the run that proposes."""
     monkeypatch.setenv("MINER_BATCH", "5")
     generator(draft_json())
-    teacher(json.dumps({"reply": "Тада!", "actions": [{"action": "spin"}]}, ensure_ascii=False))
+    teacher(
+        json.dumps(
+            {"reply": "Тада!", "handled": True, "actions": [{"action": "spin"}]},
+            ensure_ascii=False,
+        )
+    )
 
     fill_pool(seeded, TRICK_COMMANDS[:4])
     assert (await client.get("/api/proposals")).json() == []

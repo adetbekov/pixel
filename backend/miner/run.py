@@ -5,7 +5,7 @@ one run is seconds. That is a prototype decision, not an architectural one,
 which is why the whole run is :func:`mine_once` and nothing else: moving it to a
 background worker is a change of caller, not of this module.
 
-Two triggers, one body: every ``MINER_BATCH``-th new unmined case, and
+Two triggers, one body: every ``MINER_BATCH``-th new mineable case, and
 ``POST /api/mine``. A second concurrent run is refused rather than queued — it
 would re-read the same pool and race the first one to the same proposals.
 
@@ -51,11 +51,17 @@ def batch_size() -> int:
 
 
 def mining_due(conn: sqlite3.Connection) -> bool:
-    """True on every ``MINER_BATCH``-th unmined case.
+    """True on every ``MINER_BATCH``-th *mineable* case.
 
     Counted, not accumulated: a run that mines nothing leaves the pool where it
     was, so the next case brings the count to the following multiple and the
     trigger fires again instead of going quiet forever.
+
+    Mineable, not merely unmined — :func:`backend.miner.case.pool_size` counts
+    what :func:`load_pool` returns. A failed call and a declined answer are both
+    kept in ``teacher_log`` and never marked ``mined``, so counting raw rows would
+    offset this multiple permanently and fire the trigger on a pool too small to
+    cluster.
     """
     size = pool_size(conn)
     return size > 0 and size % batch_size() == 0
@@ -150,13 +156,21 @@ def _propose(
         return None
     if not report.publishable:
         log.info(
-            "miner: %r rejected — match_rate %.2f on %d cases",
+            "miner: %r rejected — match_rate %.2f (agreement %.2f) on %d cases",
             skill.id,
             report.match_rate,
+            report.agreement,
             report.total,
         )
         return None
 
+    log.info(
+        "miner: %r proposed — match_rate %.2f (agreement %.2f) on %d cases",
+        skill.id,
+        report.match_rate,
+        report.agreement,
+        report.total,
+    )
     return MinedProposal(
         id=str(uuid.uuid4()),
         skill=skill,

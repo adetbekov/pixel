@@ -352,6 +352,7 @@ def post_chat(payload: ChatIn) -> dict:
             raw_response=result.raw_response,
             actions=reply["actions"],
             error=result.error,
+            handled=result.handled,
         )
         due = mining_due(conn)
 
