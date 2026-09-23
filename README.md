@@ -73,9 +73,10 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    components of the similarity graph, in numpy. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
    pool and ripen. Without embeddings the commands are grouped by one Gemini call instead — a
    degraded path, not the default one.
-2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `gemini-3.8-flash`) per cluster. Offline,
-   nobody waiting, and what comes back is a schema that will route thousands of later commands — so
-   this is the one place that buys a bigger model than the teacher. A mined skill carries no
+2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-2.5-flash-lite`,
+   $0.30 / $2.50 per 1M) per cluster. Offline, nobody waiting, and what comes back is a schema that
+   will route thousands of later commands; raise the model through the env var if drafts start
+   failing validation, never loosen the validation. A mined skill carries no
    `questions` and branches only on the robot's own state; it is assembled into a real `Skill`, and
    that is where `validate_plan` refuses anything outside the action library.
 3. **Backtest.** Every case of the cluster is re-routed against `active + candidate`, and a match

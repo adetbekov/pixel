@@ -1,11 +1,14 @@
 """Asking Gemini for the skill a cluster is asking for.
 
-This is the offline half of the teacher/miner split. The teacher answers a user
-who is waiting, so it runs on the cheapest, fastest tier. Nobody waits on this
-call: it runs after the fact, once per cluster, and what it produces is a
-*schema* that will route thousands of later commands. Quality beats latency, so
-it uses a bigger model — ``gemini-3.8-flash`` ($0.75 / $3.75 per 1M, GA since
-2026-09-02), overridable with ``GEMINI_MINER_MODEL``.
+This is the offline half of the teacher/miner split. Nobody waits on this call:
+it runs after the fact, once per cluster, and what it produces is a *schema*
+that will route thousands of later commands.
+
+The model is ``models/gemini-2.5-flash-lite`` ($0.30 / $2.50 per 1M) — the same
+cheap tier the receipt parser runs on, so its bill is known. Overridable with
+``GEMINI_MINER_MODEL``: if a noticeable share of drafts dies on the ``Skill``
+validation below, raise the model through the env var rather than loosening the
+validation.
 
 Like the teacher, this never raises at the caller: a bad draft costs one retry
 and then the cluster is left in the pool for the next run.
@@ -33,7 +36,7 @@ from .schema import MAX_DESCRIPTION_LEN, MAX_RULES, Grouping, SkillDraft
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
 
 TIMEOUT_S = 30.0
 
