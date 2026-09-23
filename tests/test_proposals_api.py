@@ -454,6 +454,38 @@ async def test_mining_runs_itself_every_batch_th_case(
 
 
 @pytest.mark.anyio
+async def test_a_refusal_does_not_re_trigger_a_parked_pool(
+    client, seeded, miner_engine, generator, teacher, monkeypatch
+):
+    """The pool sits on a multiple of MINER_BATCH and a refusal arrives.
+
+    `mined = 1` is set only when a proposal is saved, so a cluster that fails its
+    backtest stays in the pool for good — and a refusal does not move the pool at
+    all. On a pool parked at exactly MINER_BATCH, a trigger that read the level
+    instead of the arrival would fire on *every* later "какая погода": one
+    synchronous `generator.propose` round trip per declined message, inside a
+    request the user is waiting on (JEB-1547 review).
+    """
+    monkeypatch.setenv("MINER_BATCH", "5")
+    fake = generator(draft_json())
+    teacher(
+        json.dumps(
+            {"reply": "Я не умею предсказывать погоду", "handled": False, "actions": []},
+            ensure_ascii=False,
+        )
+    )
+
+    fill_pool(seeded, TRICK_COMMANDS)
+    assert fake.calls == [], "nothing has run the miner yet"
+
+    for text in ("какая погода", "закажи пиццу", "который час"):
+        await client.post("/api/chat", json={"text": text})
+
+    assert fake.calls == [], "a refusal must not pay for a mining run"
+    assert (await client.get("/api/proposals")).json() == []
+
+
+@pytest.mark.anyio
 async def test_mine_on_an_empty_pool_is_200_not_500(client):
     assert (await client.post("/api/mine")).status_code == 200
     assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}

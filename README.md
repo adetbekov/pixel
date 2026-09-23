@@ -65,7 +65,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `LAYA_DEVICE` | `cpu` | Where the local model runs. |
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
 | `ROUTER_THRESHOLD` | `0.6` | Confidence a skill needs to win the router. Below it, the command is a miss. |
-| `MINER_BATCH` | `5` | Mine on every N-th unmined case. |
+| `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. |
 | `MINER_SIM` | `0.88` | Cosine similarity that joins two commands into one cluster. Narrow usable band — see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
@@ -139,7 +139,7 @@ stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` ov
 
 Gemini answering a command is not learning; it costs money every single time. Learning is the moment
 a *pattern* in those answers becomes a skill and the command stops reaching Gemini at all. That is
-`backend/miner/`, and it runs on every `MINER_BATCH`-th unmined case (default 5) or on
+`backend/miner/`, and it runs when the `MINER_BATCH`-th *mineable* case arrives (default 5) or on
 `POST /api/mine`:
 
 1. **Cluster.** Sentence vectors come from the Laya checkpoint already in memory

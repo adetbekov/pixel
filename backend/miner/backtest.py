@@ -59,7 +59,7 @@ import os
 from dataclasses import dataclass
 
 from ..brain.engine import DecisionEngine
-from ..brain.router import RouterHit, RouterOutcome, route
+from ..brain.router import RouterHit, route
 from ..brain.skill import Skill
 from ..state import RobotState
 from .case import Case
@@ -127,7 +127,9 @@ def backtest(
     agreed = 0
     for case in cases:
         outcome = route(engine, trial, case.user_text, case.state)
-        if not _routes_to(outcome, candidate):
+        # `route` already applies the skill's threshold, so a RouterHit *is* a
+        # confident pick — there is no second comparison to make here.
+        if not isinstance(outcome, RouterHit) or outcome.skill_id != candidate.id:
             continue
         matched += 1
         if _does_what_the_teacher_did(outcome, case):
@@ -145,12 +147,6 @@ def backtest(
         agreement=agreed / total if total else 0.0,
         regression=check_regressions(engine, trial, active),
     )
-
-
-def _routes_to(outcome: RouterOutcome, candidate: Skill) -> bool:
-    # `route` already applies the skill's threshold, so a RouterHit *is* a
-    # confident pick — there is no second comparison to make here.
-    return isinstance(outcome, RouterHit) and outcome.skill_id == candidate.id
 
 
 def _does_what_the_teacher_did(outcome: RouterHit, case: Case) -> bool:

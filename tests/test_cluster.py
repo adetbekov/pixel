@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from backend.brain.engine import EmbeddingsUnavailable
-from backend.miner.case import load_pool, pool_size
+from backend.miner.case import is_mineable, load_pool, pool_size
 from backend.miner.cluster import (
     DEFAULT_SIM,
     components,
@@ -16,6 +16,7 @@ from backend.miner.cluster import (
     min_cluster_size,
     sim_threshold,
 )
+from backend.miner.run import mining_due
 from backend.state import RobotState
 
 from .fakes import FakeEngine, hash_vector
@@ -166,6 +167,39 @@ def test_the_pool_size_counts_only_what_the_miner_could_use(conn):
 
     fill_pool(conn, TRICK_COMMANDS)
     assert pool_size(conn) == len(TRICK_COMMANDS) == len(load_pool(conn))
+
+
+def test_the_trigger_reads_the_arrival_not_the_pool_level(conn, monkeypatch):
+    """A pool parked on a multiple of MINER_BATCH must not fire on every message.
+
+    `mined = 1` is set only when a proposal is saved, so a cluster that fails its
+    backtest stays in the pool for good, and a refusal never enters it — the
+    level stays true while the pool stands still. Reading it instead of the
+    arrival puts one synchronous `generator.propose` round trip inside every
+    later declined `/api/chat` (JEB-1547 review).
+    """
+    monkeypatch.setenv("MINER_BATCH", "5")
+    ids = fill_pool(conn, TRICK_COMMANDS)
+    assert pool_size(conn) == 5
+
+    assert mining_due(conn, ids[-1]), "the fifth mineable case is what the trigger counts"
+
+    refusal = fill_pool(conn, ["какая погода"], handled=False)[0]
+    assert pool_size(conn) == 5, "a refusal does not move the pool"
+    assert not mining_due(conn, refusal)
+
+    broken = fill_pool(conn, ["закажи пиццу"], error="TimeoutError: boom")[0]
+    assert not mining_due(conn, broken)
+
+
+def test_a_mined_row_is_not_an_arrival(conn):
+    """`is_mineable` answers about the pool, so a row already taken out is not in it."""
+    ids = fill_pool(conn, TRICK_COMMANDS)
+    assert is_mineable(conn, ids[0])
+    conn.execute("UPDATE teacher_log SET mined = 1 WHERE id = ?", (ids[0],))
+    conn.commit()
+    assert not is_mineable(conn, ids[0])
+    assert not is_mineable(conn, 9999)
 
 
 def test_a_mined_row_is_out_of_the_pool(conn):

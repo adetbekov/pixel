@@ -94,6 +94,22 @@ def load_pool(conn: sqlite3.Connection) -> list[Case]:
     return [case for case in (_parse(row) for row in rows) if case is not None]
 
 
+def is_mineable(conn: sqlite3.Connection, case_id: int) -> bool:
+    """Did this one row land in the pool?
+
+    The mining trigger counts *arrivals*, not rows — see
+    :func:`backend.miner.run.mining_due` for why that distinction is what keeps
+    it from firing on every message. Which rows count is decided by
+    :func:`_parse`, asked about one row here rather than restated as a second
+    predicate that could disagree with it.
+    """
+    row = conn.execute(
+        "SELECT id, state_json, actions_json FROM teacher_log WHERE id = ? AND mined = 0",
+        (case_id,),
+    ).fetchone()
+    return row is not None and _parse(row) is not None
+
+
 def pool_size(conn: sqlite3.Connection) -> int:
     """How many cases the miner could actually use — what the trigger watches.
 

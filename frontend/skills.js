@@ -214,11 +214,16 @@ function examplesList(examples) {
   return list;
 }
 
+/* `match_rate` — доля команд группы, которые распознаватель отдаёт этому навыку
+   (`backend/miner/backtest.py`). Совпадение с планами учителя считается рядом,
+   называется `agreement` и в карточку не выводится: это разброс сырья, а не
+   качество навыка, и цифра про учителя на карточке «принять навык?» читалась бы
+   как оценка навыка. Подпись здесь и смысл числа там меняются вместе. */
 function matchBlock(rate) {
   const box = el('div', 'match');
   box.append(
     el('b', null, Number.isFinite(Number(rate)) ? percent(rate) : '—'),
-    el('span', null, 'навык повторил решения учителя на прошлых примерах'),
+    el('span', null, 'команд из этой группы распознаватель отдаёт навыку'),
   );
   return box;
 }
