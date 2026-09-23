@@ -57,6 +57,22 @@ MAX_ATTEMPTS = 2
 #: Below this there is no point dialling the API at all.
 MIN_CALL_BUDGET_S = 1.0
 
+#: The shortest deadline the API will *accept*, and it is longer than ours.
+#:
+#: ``http_options.timeout`` does two jobs in google-genai 2.25.0: it is the httpx
+#: client-side timeout, and ``ceil()``-ed to seconds it is also sent as the
+#: ``X-Server-Timeout`` header. Measured live on 2026-09-23 against
+#: ``models/gemini-2.5-flash-lite``: anything that rounds below 10 s is rejected
+#: outright — ``400 INVALID_ARGUMENT: Manually set deadline 8s is too short.
+#: Minimum allowed deadline is 10s`` — so our 8 s budget cannot be the header.
+#: 9400 ms passes, 9000 ms does not.
+#:
+#: The SDK only fills the header in when it is absent, so :meth:`_call` sets it
+#: explicitly: the server gets its legal minimum, httpx still aborts at *our*
+#: budget, and JEB-1500's per-call ceiling survives the move off
+#: ``interactions.create`` (which took plain seconds and never saw this floor).
+MIN_SERVER_DEADLINE_S = 10
+
 FALLBACK_REPLY = "Я не понял, научи меня по-другому"
 
 FALLBACK_PLAN: list[dict[str, Any]] = [
@@ -136,30 +152,50 @@ class GeminiTeacher:
         return self._client
 
     def _call(self, prompt: str, timeout: float) -> str:
-        """One round trip.
+        """One round trip, over ``models.generate_content``.
 
-        Verified against google-genai 2.25.0: ``client.interactions.create`` /
-        ``interaction.output_text`` is the canonical path
-        (``client.models.generate_content`` also still exists), ``timeout`` is a
-        real keyword-only parameter, and ``model`` / ``input`` /
-        ``system_instruction`` / ``response_format`` are request-body fields.
+        Not ``interactions.create``, which is what this used to call. Measured
+        against the live API on 2026-09-23 with google-genai 2.25.0:
+        ``interactions.create`` honours ``response_format`` on
+        ``gemini-3.8-flash`` but *not* on ``models/gemini-2.5-flash-lite`` —
+        that model answers inside a ```` ```json ```` fence, which :func:`_parse`
+        rejects on both attempts, so every router miss degraded to
+        :data:`FALLBACK_PLAN` behind a single ``log.warning`` while
+        ``teacher_log`` filled with fallbacks and starved the miner. The same
+        model on ``models.generate_content`` with ``response_schema`` returns
+        bare JSON. The miner made the same move for the same reason
+        (``backend/miner/generate.py``).
+
+        The fences are a symptom of the wrong call shape, not a response format
+        to support: ``_parse`` stays strict — it is what made this visible.
+
+        ``config`` is a plain dict rather than ``types.GenerateContentConfig``
+        so that ``google.genai`` stays off the import path of a key-less app,
+        exactly like the lazy client construction above.
         ``tests/test_teacher.py::test_the_sdk_still_has_the_surface_we_call``
-        asserts all of that against the installed package — without it, a
-        renamed argument would land in ``**body``, 400 at the API, and reach the
-        user as a fallback plan with only a ``log.warning`` behind it.
+        asserts the field names against the installed package instead — without
+        it a rename would ride along silently and 400 at the API.
         """
-        interaction = self._ensure_client().interactions.create(
+        response = self._ensure_client().models.generate_content(
             model=self._model,
-            input=prompt,
-            system_instruction=SYSTEM_PROMPT,
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": TeacherPlan.model_json_schema(),
+            contents=prompt,
+            config={
+                "system_instruction": SYSTEM_PROMPT,
+                "response_mime_type": "application/json",
+                "response_schema": TeacherPlan.model_json_schema(),
+                "http_options": {
+                    # On this path the timeout lives in `http_options`, and there
+                    # it is in MILLISECONDS — `TIMEOUT_S` seconds x 1000.
+                    "timeout": int(timeout * 1000),
+                    # ...but the same value also becomes the server deadline,
+                    # which has a 10 s floor. See `MIN_SERVER_DEADLINE_S`: this
+                    # header keeps the request legal without lengthening the
+                    # client-side wait above.
+                    "headers": {"X-Server-Timeout": str(MIN_SERVER_DEADLINE_S)},
+                },
             },
-            timeout=timeout,
         )
-        return interaction.output_text or ""
+        return response.text or ""
 
     def explain(self, text: str, state: RobotState, skills: list[Skill]) -> TeacherResult:
         prompt = build_input(text, state, skills)

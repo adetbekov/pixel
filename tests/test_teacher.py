@@ -8,7 +8,6 @@ the caller gets a plan made of library actions and the case lands in
 
 import inspect
 import json
-import typing
 
 import httpx
 import pytest
@@ -22,6 +21,7 @@ from backend.teacher import FALLBACK_PLAN, GeminiTeacher
 from backend.teacher.client import (
     DEFAULT_MODEL,
     FALLBACK_REPLY,
+    MIN_SERVER_DEADLINE_S,
     TIMEOUT_S,
     TOTAL_DEADLINE_S,
 )
@@ -53,18 +53,24 @@ class TimingOutClient:
     """A client whose every call burns its whole budget and then times out.
 
     Drives `GeminiTeacher`'s injected clock, so the deadline arithmetic is
-    exercised at full speed instead of in real seconds.
+    exercised at full speed instead of in real seconds. `budgets` is recorded in
+    SECONDS — the call carries milliseconds, which is exactly the conversion
+    worth pinning here.
     """
 
     def __init__(self, overshoot: float = 0.0) -> None:
         self.now = 0.0
         self.budgets: list[float] = []
-        self.interactions = self
+        self.deadlines: list[int] = []
+        self.models = self
         self._overshoot = overshoot
 
-    def create(self, **kwargs) -> None:
-        self.budgets.append(kwargs["timeout"])
-        self.now += kwargs["timeout"] + self._overshoot
+    def generate_content(self, **kwargs) -> None:
+        http_options = kwargs["config"]["http_options"]
+        self.deadlines.append(int(http_options["headers"]["X-Server-Timeout"]))
+        budget = http_options["timeout"] / 1000
+        self.budgets.append(budget)
+        self.now += budget + self._overshoot
         raise httpx.TimeoutException("deadline exceeded")
 
 
@@ -140,7 +146,7 @@ async def test_an_invented_action_is_retried_then_falls_back(
     assert body["engine"] == "gemini"
     # The retry has to tell the model what was wrong, or it repeats itself.
     assert "hack_nasa" not in json.dumps(body)
-    assert "недопустимое действие" in gemini.calls[1]["input"]
+    assert "недопустимое действие" in gemini.calls[1]["contents"]
 
 
 @pytest.mark.anyio
@@ -250,12 +256,17 @@ async def test_the_request_asks_for_the_plan_schema(client, seeded, missing, tea
     await client.post("/api/chat", json={"text": "покажи фокус"})
 
     call = gemini.calls[0]
+    config = call["config"]
     assert call["model"] == "fake-model"
-    assert call["timeout"] == TIMEOUT_S
-    assert call["response_format"]["mime_type"] == "application/json"
-    assert set(call["response_format"]["schema"]["properties"]) == {"reply", "actions"}
+    # Milliseconds on this path, so the first call asks for TIMEOUT_S x 1000.
+    assert config["http_options"]["timeout"] == int(TIMEOUT_S * 1000)
+    # ...and the server deadline is sent separately, because the API floors it
+    # at 10 s and would 400 our 8 s outright.
+    assert config["http_options"]["headers"]["X-Server-Timeout"] == "10"
+    assert config["response_mime_type"] == "application/json"
+    assert set(config["response_schema"]["properties"]) == {"reply", "actions"}
     # The prompt is generated from the library, so it cannot drift from it.
-    assert all(name in call["system_instruction"] for name in ACTIONS)
+    assert all(name in config["system_instruction"] for name in ACTIONS)
 
 
 def test_the_prompt_shows_the_skill_boundary(seeded):
@@ -318,6 +329,22 @@ def test_the_retry_gets_only_the_time_that_is_left(seeded):
     assert result.raw_plan == FALLBACK_PLAN
 
 
+def test_the_shortened_retry_still_sends_a_deadline_the_api_accepts(seeded):
+    """The retry's budget is 4 s, and the API rejects any deadline under 10 s.
+
+    Tying the two together would turn every retry into a `400 INVALID_ARGUMENT`
+    — a fallback for a reason that has nothing to do with the user's command.
+    The client-side budget shrinks; the deadline we announce does not.
+    """
+    gemini = TimingOutClient()
+    teacher = GeminiTeacher(client=gemini, model="fake-model", clock=lambda: gemini.now)
+
+    teacher.explain("покажи фокус", read_state(seeded), [])
+
+    assert gemini.budgets[1] < MIN_SERVER_DEADLINE_S, "the retry is the case that matters here"
+    assert gemini.deadlines == [MIN_SERVER_DEADLINE_S, MIN_SERVER_DEADLINE_S]
+
+
 def test_no_retry_is_dialled_with_nothing_left_to_spend(seeded):
     gemini = TimingOutClient(overshoot=TOTAL_DEADLINE_S)
     teacher = GeminiTeacher(client=gemini, model="fake-model", clock=lambda: gemini.now)
@@ -349,26 +376,57 @@ def test_the_sdk_still_has_the_surface_we_call():
     `GeminiTeacher._call` passes it.
 
     `FakeGeminiClient` accepts any keyword, so every other test here proves only
-    that the code *sends* the argument. If `timeout` were not a real parameter
-    the live call would raise `TypeError`, `explain` would swallow it, and every
-    router miss would quietly degrade to `FALLBACK_PLAN` with CI still green.
-    Constructing the client needs no network and no real key.
+    that the code *sends* the argument. `config` is a plain dict, so a renamed
+    field would not even raise — it would ride along to the API, the answer
+    would come back unschema'd, and every router miss would quietly degrade to
+    `FALLBACK_PLAN` with CI still green. That is precisely the defect JEB-1513
+    fixed. Constructing the client needs no network and no real key.
     """
     from google import genai
-    from google.genai import interactions
+    from google.genai import types
 
     client = genai.Client(api_key="not-a-real-key-and-never-sent")
-    parameters = inspect.signature(type(client.interactions).create).parameters
+    parameters = inspect.signature(type(client.models).generate_content).parameters
+    assert {"model", "contents", "config"} <= set(parameters)
 
-    # `timeout` must be its OWN parameter. Were it merely absorbed by `**body`
-    # it would ride along to the API as a request field and time out nothing.
-    assert parameters["timeout"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    config_fields = set(types.GenerateContentConfig.model_fields)
+    assert {
+        "system_instruction",
+        "response_mime_type",
+        "response_schema",
+        "http_options",
+    } <= config_fields
+    # The timeout lives here on this path, in milliseconds, and `headers` is how
+    # the server deadline is kept off it (`MIN_SERVER_DEADLINE_S`).
+    assert {"timeout", "headers"} <= set(types.HttpOptions.model_fields)
+    assert hasattr(types.GenerateContentResponse, "text")
 
-    # `**body` swallows anything, so the signature cannot vouch for these —
-    # the request TypedDict is what names them.
-    body_fields = typing.get_type_hints(interactions.CreateModelInteractionParamsNonStreaming)
-    assert {"model", "input", "system_instruction", "response_format"} <= set(body_fields)
+    # The whole `MIN_SERVER_DEADLINE_S` trick rests on the SDK filling
+    # `X-Server-Timeout` from the timeout only when we have not set it ourselves.
+    # If that ever flips, our 8 s budget goes back out as the server deadline and
+    # every teacher call 400s.
+    from google.genai._api_client import populate_server_timeout_header
 
-    assert "output_text" in interactions.Interaction.model_fields
-    assert {"mime_type", "schema_"} <= set(interactions.TextResponseFormat.model_fields)
+    headers = {"X-Server-Timeout": "10"}
+    populate_server_timeout_header(headers, 8.0)
+    assert headers["X-Server-Timeout"] == "10"
+
+
+@pytest.mark.anyio
+async def test_a_fenced_response_is_not_parsed(client, conn, seeded, missing, teacher):
+    """The fences stay a failure, deliberately.
+
+    ` ```json ` around an otherwise valid plan is what `interactions.create`
+    returned on `models/gemini-2.5-flash-lite`, and stripping it in `_parse`
+    would have hidden the wrong call shape rather than fixed it. So a fenced
+    answer must still be retried and still end on the fallback — that is the
+    signal the call path is wrong.
+    """
+    gemini = teacher(f"```json\n{GOOD_PLAN}\n```")
+
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert len(gemini.calls) == 2, "a fenced answer is retried like any other bad response"
+    assert body["reply"] == FALLBACK_REPLY
+    assert [a["action"] for a in body["actions"]] == [s["action"] for s in FALLBACK_PLAN]
+    assert "did not match the schema" in json.loads(teacher_rows(conn)[0]["state_json"])["error"]
