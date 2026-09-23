@@ -150,14 +150,18 @@ class LayaEngine(SingleQuestionMixin):
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Sentence vectors from the checkpoint that is already in memory.
 
-        ``laya.embed_fn_from_agent`` is the documented way to reuse the loaded
-        encoder (it is what ``laya.predict_shortlist`` is built on — see the
-        shortlist TODO in :mod:`backend.brain.router`). It could not be verified
-        against an installed ``laya`` here: this stage was built without weights,
-        exactly like stage 3 was built without an API key. If the helper turns
-        out to be missing or renamed, this raises and the miner falls back to
-        grouping the commands with one Gemini call — which is why no paid
-        embedding API is wired in as a second fallback.
+        Verified against laya 0.3.10 — the version CI installs:
+        ``embed_fn_from_agent(agent, max_length=512, batch_size=32)`` returns a
+        ``Sequence[str] -> np.ndarray`` callable that mean-pools ``agent.tok`` /
+        ``agent.model.encoder``, runs no decision head and downloads no weights.
+        ``tests/test_cluster.py::test_laya_still_has_the_embedding_helper_we_call``
+        pins that surface, because a rename would not break loudly: this would
+        raise, the miner would fall back to grouping with one Gemini call, and
+        the only trace would be a ``log.warning``. That fallback is also why no
+        paid embedding API is wired in as a second one.
+
+        The rows come back as numpy floats, hence the conversion — the protocol
+        promises plain lists so nothing downstream has to know about numpy.
         """
         if not texts:
             return []

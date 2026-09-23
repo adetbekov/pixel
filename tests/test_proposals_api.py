@@ -343,8 +343,8 @@ async def test_a_concurrent_run_is_refused_not_queued(client, seeded, miner_engi
             return []
 
         def propose(self, cases, skills):
+            # Re-entering from inside a run is what the Lock has to refuse.
             seen.append(mine_once())
-            return None
 
     generator(draft_json())
     set_generator(Reentrant())

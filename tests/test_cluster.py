@@ -1,5 +1,6 @@
 """Clustering and the pool it reads from — no weights, no network."""
 
+import inspect
 import json
 
 import numpy as np
@@ -140,3 +141,29 @@ def test_min_cluster_size_is_configurable(monkeypatch):
     assert min_cluster_size() == 3
     monkeypatch.setenv("MINER_MIN_CLUSTER", "2")
     assert min_cluster_size() == 2
+
+
+def test_laya_still_has_the_embedding_helper_we_call():
+    """The mirror of `test_the_sdk_still_has_the_surface_we_call`, for Laya.
+
+    `FakeEngine.embed` proves the miner *uses* vectors, never that the real
+    package can produce them. If `embed_fn_from_agent` were renamed,
+    `LayaEngine.embed` would raise, and the miner would quietly stop clustering
+    locally and start paying Gemini to group the commands instead — with CI
+    green and only a `log.warning` behind it.
+
+    Skipped where `laya` is not installed (it pulls torch, which the rest of the
+    suite deliberately keeps off the import path); CI installs both, so this is
+    the one place the assertion actually runs. Importing and inspecting the
+    helper downloads no weights — only calling it needs a loaded agent.
+    """
+    laya = pytest.importorskip("laya")
+
+    helper = getattr(laya, "embed_fn_from_agent", None)
+    assert helper is not None, "laya.embed_fn_from_agent is gone — see LayaEngine.embed"
+
+    # One positional `agent`, and the rest defaulted: `LayaEngine.embed` passes
+    # nothing else, so a newly required argument has to fail here, not live.
+    parameters = list(inspect.signature(helper).parameters.values())
+    assert parameters[0].name == "agent"
+    assert all(p.default is not inspect.Parameter.empty for p in parameters[1:])

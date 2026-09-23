@@ -41,8 +41,9 @@ def cases():
     ]
 
 
-def engine(**overrides):
-    return FakeEngine(routes={**TRICK_ROUTES, **overrides})
+def engine(steals: dict[str, str] | None = None) -> FakeEngine:
+    """The library routing as it stands, optionally with a command the candidate steals."""
+    return FakeEngine(routes={**TRICK_ROUTES, **(steals or {})})
 
 
 def test_a_candidate_that_covers_its_cluster_is_publishable(active, candidate, cases):
@@ -88,7 +89,7 @@ def test_a_candidate_that_steals_an_active_command_is_refused(active, candidate,
     match rate cannot see it; a proposal published on match rate alone would
     have broken feeding.
     """
-    thief = engine(**{"покорми": "show_trick"})
+    thief = engine({"покорми": "show_trick"})
     report = backtest(thief, active, candidate, cases)
     assert report.match_rate == pytest.approx(1.0)
     assert report.regression is not None

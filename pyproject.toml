@@ -26,7 +26,12 @@ dependencies = [
 dev = [
     "pytest",
     "httpx",
-    "ruff",
+    # Pinned to a minor: `ruff check .` runs with no rule selection, so it uses
+    # ruff's *default* rule set — and that set widens between minors. 0.16 added
+    # PIE, RET and PLR rules to it, which turned a locally green PR red in CI
+    # the moment the unpinned install picked up 0.16.8. Bump this line
+    # deliberately, fixing the new findings in the same commit.
+    "ruff>=0.16,<0.17",
 ]
 
 [tool.setuptools.packages.find]
