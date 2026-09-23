@@ -13,3 +13,8 @@ library. Over time Laya handles more and more on its own and Gemini is called le
 Stack: Python, FastAPI, Laya (local), Gemini API, SQLite, HTML/JS frontend with an SVG robot.
 
 Tracking issue: JEB-1495.
+
+## Pipeline
+
+PRs target `dev`; `main` is the release branch. CI runs lint + tests on every PR and
+emits `check_suite`, which is the review hand-off gate.
