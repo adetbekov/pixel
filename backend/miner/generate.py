@@ -163,18 +163,29 @@ class GeminiSkillGenerator:
         return self._client
 
     def _call(self, system: str, prompt: str, schema: dict[str, Any]) -> str:
-        interaction = self._ensure_client().interactions.create(
+        """One round trip, over ``models.generate_content`` and not the teacher's
+        ``interactions.create``.
+
+        Measured against the live API on 2026-09-23 with google-genai 2.25.0:
+        ``interactions.create`` honours ``response_format`` on
+        ``gemini-3.8-flash`` but not on ``models/gemini-2.5-flash-lite``, which
+        answers in a ```` ```json ```` fence and fails every parse below —
+        2/2 attempts, every cluster back into the pool. The same model on
+        ``models.generate_content`` with ``response_schema`` returns bare JSON.
+        So the cheap tier costs us this call shape; ``timeout`` moves into
+        ``http_options`` (milliseconds) with it.
+        """
+        response = self._ensure_client().models.generate_content(
             model=self._model,
-            input=prompt,
-            system_instruction=system,
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": schema,
+            contents=prompt,
+            config={
+                "system_instruction": system,
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+                "http_options": {"timeout": int(TIMEOUT_S * 1000)},
             },
-            timeout=TIMEOUT_S,
         )
-        return interaction.output_text or ""
+        return response.text or ""
 
     def propose(self, cases: list[Case], skills: list[Skill]) -> Skill | None:
         prompt = build_input(cases, skills)

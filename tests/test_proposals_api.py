@@ -6,6 +6,7 @@ pipeline: the real clustering, the real draft schema, the real backtest and the
 real endpoints.
 """
 
+import inspect
 import json
 
 import httpx
@@ -275,7 +276,7 @@ async def test_a_second_attempt_is_given_the_reason_the_first_failed(
     fake = generator(draft_json(description="ц" * 200), draft_json())
     fill_pool(seeded)
     assert (await client.post("/api/mine")).json()["proposals"] == 1
-    assert "Предыдущий ответ не прошёл проверку" in fake.calls[1]["input"]
+    assert "Предыдущий ответ не прошёл проверку" in fake.calls[1]["contents"]
 
 
 @pytest.mark.anyio
@@ -288,8 +289,8 @@ async def test_the_generator_is_asked_with_the_miner_model_and_the_skill_schema(
 
     call = fake.calls[0]
     assert call["model"] == "fake-model"
-    assert call["response_format"]["mime_type"] == "application/json"
-    assert set(call["response_format"]["schema"]["properties"]) == {
+    assert call["config"]["response_mime_type"] == "application/json"
+    assert set(call["config"]["response_schema"]["properties"]) == {
         "id",
         "name",
         "description",
@@ -299,8 +300,37 @@ async def test_the_generator_is_asked_with_the_miner_model_and_the_skill_schema(
     # The cluster and the teacher's plans both go in — the plans are what make
     # the generated rules resemble what the teacher actually did.
     for command in TRICK_COMMANDS:
-        assert command in call["input"]
-    assert "spin(), set_face(happy)" in call["input"]
+        assert command in call["contents"]
+    assert "spin(), set_face(happy)" in call["contents"]
+
+
+def test_the_sdk_still_has_the_generate_content_surface_we_call():
+    """`FakeGeminiClient` takes any keyword, so only the real SDK can say whether
+    `GeminiSkillGenerator._call` is calling anything that exists.
+
+    The miner is on `models.generate_content` and not the teacher's
+    `interactions.create` because `models/gemini-2.5-flash-lite` fences its JSON
+    on the latter. A renamed config field would ride along silently, the answer
+    would come back unschema'd, and every draft would die in `_parse` with only
+    a `log.warning` behind it. Needs no network and no real key.
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key="not-a-real-key-and-never-sent")
+    parameters = inspect.signature(type(client.models).generate_content).parameters
+    assert {"model", "contents", "config"} <= set(parameters)
+
+    config_fields = set(types.GenerateContentConfig.model_fields)
+    assert {
+        "system_instruction",
+        "response_mime_type",
+        "response_schema",
+        "http_options",
+    } <= config_fields
+    # The timeout lives here on this path, in milliseconds.
+    assert "timeout" in types.HttpOptions.model_fields
+    assert hasattr(types.GenerateContentResponse, "text")
 
 
 @pytest.mark.anyio
