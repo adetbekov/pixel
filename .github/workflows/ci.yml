@@ -25,8 +25,11 @@ jobs:
       # `laya` depends on torch. The default PyPI wheel is the CUDA build (~1 GB);
       # CI only ever needs CPU, so pre-seed the CPU wheel and let the editable
       # install below see the requirement as already satisfied.
+      #
+      # Same exact pin as the Dockerfile — CI is only evidence about the image if
+      # both install the same torch. Bump the two lines together.
       - name: Install CPU torch
-        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
 
       - name: Install project
         run: pip install -e ".[dev]"

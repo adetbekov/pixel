@@ -12,7 +12,13 @@ WORKDIR /app
 # `laya` depends on torch, and the default PyPI wheel is the CUDA build (~1 GB).
 # Pixel runs on CPU, so seed the CPU wheel first — in its own layer, so a code
 # change never rebuilds it — and let the install below see torch as satisfied.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch
+#
+# Pinned exactly, to the same version .github/workflows/ci.yml installs: the
+# documented redeploy is `docker build .` on the NAS, so an unpinned `torch`
+# rebuilds an already-green commit against whatever the CPU index serves that day
+# and the image stops being a function of the commit. `+cpu` is part of the pin so
+# a CUDA wheel can never satisfy it silently.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
 
 # `readme = "README.md"` in pyproject.toml, so the build needs it.
 COPY pyproject.toml README.md ./
