@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from backend.api import MAX_CHAT_TEXT
 from backend.brain.engine import ScoreResult
 from backend.main import app
 from backend.state import read_state, utcnow, write_state
@@ -113,6 +114,24 @@ async def test_chat_respects_the_robot_state(client, seeded, engine, conn):
     assert body["skill_id"] == "play"
     assert body["state"]["face"] == "sleepy"
     assert body["reply"] == "Я устал, давай позже"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "text", ["", "а" * (MAX_CHAT_TEXT + 1)], ids=["empty", "over-the-limit"]
+)
+async def test_chat_rejects_empty_and_oversized_text(client, seeded, engine, text):
+    # The point of the cap: a rejected body must never reach the engine, whose
+    # single lock every other chat request is queued behind.
+    assert (await client.post("/api/chat", json={"text": text})).status_code == 422
+    assert engine.calls == []
+
+
+@pytest.mark.anyio
+async def test_chat_accepts_text_at_the_limit(client, seeded, engine):
+    response = await client.post("/api/chat", json={"text": "а" * MAX_CHAT_TEXT})
+    assert response.status_code == 200
+    assert engine.calls
 
 
 @pytest.mark.anyio
