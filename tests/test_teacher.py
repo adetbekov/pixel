@@ -20,6 +20,7 @@ from backend.main import app
 from backend.state import read_state
 from backend.teacher import FALLBACK_PLAN, GeminiTeacher
 from backend.teacher.client import (
+    DEFAULT_MODEL,
     FALLBACK_REPLY,
     TIMEOUT_S,
     TOTAL_DEADLINE_S,
@@ -326,6 +327,21 @@ def test_no_retry_is_dialled_with_nothing_left_to_spend(seeded):
     assert len(gemini.budgets) == 1, "a second call with < MIN_CALL_BUDGET_S left is not worth it"
     assert "out of time" in result.error
     assert result.raw_plan == FALLBACK_PLAN
+
+
+def test_the_default_model_is_the_one_the_owner_picked(monkeypatch):
+    # The hot path runs on the cheap 2.5 model split the bill uses, written with
+    # the `models/` prefix like the miner. A silent drift here is billed per miss.
+    monkeypatch.delenv("GEMINI_TEACHER_MODEL", raising=False)
+    assert DEFAULT_MODEL == "models/gemini-2.5-flash-lite"
+    assert GeminiTeacher()._model == DEFAULT_MODEL
+
+
+def test_the_env_still_overrides_the_default_model(monkeypatch):
+    monkeypatch.setenv("GEMINI_TEACHER_MODEL", "models/some-other-model")
+    assert GeminiTeacher()._model == "models/some-other-model"
+    # An explicit argument wins over both — that is what every test above relies on.
+    assert GeminiTeacher(model="fake-model")._model == "fake-model"
 
 
 def test_the_sdk_still_has_the_surface_we_call():

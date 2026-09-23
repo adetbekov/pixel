@@ -28,13 +28,20 @@ log = logging.getLogger(__name__)
 #: 8-primitive plan, not a chain of reasoning; stage 4 mines offline and can
 #: afford a bigger model.
 #:
-#: JEB-1500 named `gemini-3.5-flash-lite`. Model ids resolve server-side, so the
-#: SDK is not the authority on what exists — but its convenience `Literal` lists
-#: `gemini-3.1-flash-lite` and no `-lite` sibling of `gemini-3.5-flash`, which is
-#: the only evidence available without a key. TODO: confirm against
-#: `client.models.list()` once `GEMINI_API_KEY` lands, then settle this default.
-#: Overridable via `GEMINI_TEACHER_MODEL` either way.
-DEFAULT_MODEL = "gemini-3.1-flash-lite"
+#: The owner settled this on 2026-09-23: the same cheap 2.5 model split the bill
+#: already runs (`src/services/image_parser.py`), $0.30 / 1M in, $2.50 / 1M out.
+#: The miner uses it too (`backend/miner/generate.py`), so both halves of the
+#: project name the model the same way, `models/` prefix included.
+#:
+#: Careful if a thinking budget is ever added here: `models/gemini-2.5-flash-lite`
+#: rejects `thinking_budget=1` with `400 INVALID_ARGUMENT` and wants >= 512
+#: (measured in split the bill, `src/services/gemini_thinking_budget.py`). The
+#: teacher passes no budget today — don't add one without that floor.
+#:
+#: TODO: once `GEMINI_API_KEY` lands (JEB-1508), confirm against
+#: `client.models.list()` that the model is visible and that this is the id form
+#: the live call accepts. Overridable via `GEMINI_TEACHER_MODEL` either way.
+DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
 
 #: Per-call ceiling, as JEB-1500 specifies.
 TIMEOUT_S = 8.0
