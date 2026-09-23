@@ -6,22 +6,30 @@ name: Guard main PR head
 # fix PRs target `dev`; only the deliberate `dev → main` release PR is allowed
 # through. See jeb-git-pr / jeb-release.
 
-# `pull_request`, NOT `pull_request_target` — deliberate, and only for now
-# (JEB-1522). The four original studio repos use `pull_request_target` because
-# it resolves the workflow from the *base* branch, which the head cannot
-# rewrite. pixel's `main` does not carry this file yet: under
-# `pull_request_target` the guard would resolve from a `main` without it, never
-# report, and — once `main PRs must come from dev` is a required context —
-# permanently block the very release PR that would deliver the file, with
-# `enforce_admins: true` leaving no bypass.
+# BOTH triggers on purpose — transitional dual-trigger phase (JEB-1525).
 #
-# Mandatory order (jeb-release, "Ordering trap"):
-#   1. this file lands on `dev` under `pull_request`
-#   2. it reports on a live PR into `main`, then the context is required
-#   3. a release carries the file to `main`
-#   4. only then may the trigger be switched to `pull_request_target`
+# GitHub resolves `pull_request` from the PR's *merge ref* (head merged into
+# base) and `pull_request_target` from the *base* branch. `pull_request_target`
+# is the end state the four other studio repos use (JEB-1368), because a head
+# cannot rewrite the copy that decides its own gate.
+#
+# Swapping one key for the other in a single step deadlocks the release that
+# would deliver the swap: on the `dev → main` PR neither trigger fires —
+# `pull_request` is gone from the merge ref, and `pull_request_target` is not
+# on `main` yet. The required context `main PRs must come from dev` would then
+# never report, with `strict: true` and `enforce_admins: true` leaving no
+# bypass. So both keys ride together until a release carries this copy to
+# `main`; the transitional `pull_request` is dropped in its own PR afterwards
+# (JEB-1525 step 5). warmplace (#96 → #104) and split-the-bill (#673 → #682)
+# migrated exactly this way.
+#
+# Safe under `pull_request_target` only because this job checks nothing out and
+# runs no head-controlled code — never add a checkout step below.
 on:
   pull_request:
+    types: [opened, reopened, synchronize, edited]
+    branches: [main]
+  pull_request_target:
     types: [opened, reopened, synchronize, edited]
     branches: [main]
 
