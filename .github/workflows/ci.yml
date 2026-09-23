@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [dev, main]
 
+# Both jobs only read the checkout — nothing pushes, comments on the PR or writes
+# packages. Third-party install scripts (`pip install -e`, `npm ci`) run in the same
+# environment as GITHUB_TOKEN, so it gets the narrowest scope that still works.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
