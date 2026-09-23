@@ -184,6 +184,19 @@ def test_an_unreachable_model_exits_two_and_a_finding_still_wins(monkeypatch, ca
     assert contract.main() == 1
 
 
+def test_the_exit_two_alert_names_the_quota_as_a_cause():
+    """The probe now exits 2 on a refused day, so the issue that exit opens has to
+    say so. Without it the reader is sent to debug a missing key or a broken
+    install for the one cause that is neither — and is the expected one."""
+    workflow = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
+    # The `2)` arm of the `case` that builds the alert, up to the next arm.
+    branch = workflow.split("\n            2)\n", 1)[1].split("\n            *)\n", 1)[0]
+
+    assert "429" in branch
+    assert "RESOURCE_EXHAUSTED" in branch
+    assert "free tier" in branch
+
+
 def test_the_reported_shape_is_read_from_the_source_not_hardcoded():
     """The failure message names the call shape so a reader knows what was
     probed. Hard-coding it would go stale in the very commit that changes the
