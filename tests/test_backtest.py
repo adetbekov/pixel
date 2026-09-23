@@ -198,3 +198,29 @@ def test_a_when_naming_something_that_is_not_a_state_scale_is_refused():
 def test_a_built_skill_is_marked_as_mined(candidate):
     assert (candidate.origin, candidate.status) == ("mined", "active")
     assert candidate.questions == {}
+
+
+def test_a_candidate_that_takes_another_cluster_is_not_published(active, candidate, cases):
+    """JEB-1548: `show_trick` pulled "покажи сальто" at 0.78 with every control green."""
+    outsider = Case(id=99, user_text="покажи сальто", state=MID_STATE, actions=TEACHER_PLANS[0])
+    report = backtest(
+        engine({"покажи сальто": "show_trick"}), active, candidate, cases, [outsider]
+    )
+    assert report.match_rate == pytest.approx(1.0)
+    assert report.regression is None
+    assert report.overreach == '"покажи сальто" (another cluster) -> show_trick @ 0.90'
+    assert not report.publishable
+
+
+def test_the_rest_of_the_pool_is_left_alone(active, candidate, cases):
+    outsider = Case(id=99, user_text="покорми", state=MID_STATE, actions=TEACHER_PLANS[0])
+    report = backtest(engine(), active, candidate, cases, [outsider])
+    assert report.overreach is None
+    assert report.publishable
+
+
+def test_the_backtest_never_routes_through_the_examples_lookup(active, candidate, cases):
+    """The candidate's `examples` *are* its cluster — the lookup would score 1.0 blind."""
+    blind = FakeEngine("unknown", 0.99)
+    report = backtest(blind, active, candidate, cases)
+    assert report.matched == 0

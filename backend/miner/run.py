@@ -98,7 +98,11 @@ def _mine() -> int:
     created = 0
     for group in groups:
         cluster = [cases[index] for index in group]
-        proposal = _propose(engine, generator, cluster, active, taken, rejected)
+        # The rest of the pool is the over-broad control set, free of charge:
+        # real commands this candidate is not for (see backtest, check 3).
+        member = set(group)
+        outsiders = [case for index, case in enumerate(cases) if index not in member]
+        proposal = _propose(engine, generator, cluster, outsiders, active, taken, rejected)
         if proposal is None:
             continue
         taken.add(proposal.skill.id)
@@ -120,6 +124,7 @@ def _propose(
     engine: DecisionEngine,
     generator: SkillGenerator,
     cluster: list[Case],
+    outsiders: list[Case],
     active: list[Skill],
     taken: set[str],
     rejected: set[tuple[int, ...]],
@@ -142,11 +147,14 @@ def _propose(
         log.warning("miner: candidate id %r is already in use", skill.id)
         return None
 
-    report = backtest(engine, active, skill, cluster)
+    report = backtest(engine, active, skill, cluster, outsiders)
     if report.regression is not None:
         log.warning(
             "miner: %r rejected — it breaks an active skill: %s", skill.id, report.regression
         )
+        return None
+    if report.overreach is not None:
+        log.warning("miner: %r rejected — it is drafted too wide: %s", skill.id, report.overreach)
         return None
     if not report.publishable:
         log.info(

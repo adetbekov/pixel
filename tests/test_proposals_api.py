@@ -416,3 +416,35 @@ async def test_a_concurrent_run_is_refused_not_queued(client, seeded, miner_engi
 
     assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
     assert seen == [MineResult(started=False, proposals=0)]
+
+
+@pytest.mark.anyio
+async def test_the_run_asks_the_teacher_to_group_before_anything_else(
+    client, seeded, miner_engine, generator
+):
+    """JEB-1548: one grouping call per run, and the vectors are not consulted."""
+    fake = generator(draft_json(), grouping=[[0, 1, 2, 3, 4]])
+    fill_pool(seeded)
+
+    proposal = await mined_proposal(client)
+    assert len(fake.grouping_calls) == 1
+    assert TRICK_COMMANDS[0] in fake.grouping_calls[0]["contents"]
+    assert miner_engine.embedded == []
+    assert len(proposal["sample_ids"]) == 5
+
+
+@pytest.mark.anyio
+async def test_a_command_the_teacher_left_out_kills_an_over_broad_candidate(
+    client, seeded, miner_engine, generator
+):
+    """The rest of the pool is the control set no `examples[0]` check can be."""
+    generator(draft_json(), grouping=[[0, 1, 2, 3, 4], [5]])
+    fill_pool(seeded, [*TRICK_COMMANDS, "покажи сальто"])
+    miner_engine.routes = {**TRICK_ROUTES, "покажи сальто": "show_trick"}
+
+    assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+    assert (await client.get("/api/proposals")).json() == []
+    # Rejected, not mined: the cases stay in the pool for a narrower draft later.
+    assert (
+        seeded.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0").fetchone()["n"] == 6
+    )

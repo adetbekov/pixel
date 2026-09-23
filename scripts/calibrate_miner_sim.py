@@ -33,6 +33,10 @@ Four sections, in the order the argument is made:
      which is the case the miner exists for.
   4. **Latency.** `mine_once()` runs inline in `POST /api/chat`, and the pool it
      embeds only shrinks for cases that became a proposal — so this grows.
+  5. **The teacher, scored the same way.** One Gemini `group` call per pool,
+     over the same simulated histories, on the same purity/recall scale. This is
+     the section that demoted the cosine to a fallback (JEB-1548) — it needs
+     GEMINI_API_KEY and is skipped without one.
 """
 
 from __future__ import annotations
@@ -254,6 +258,52 @@ def report_latency(engine) -> None:
     print("   both hold LayaEngine._lock, so an embed also stalls every other request's router")
 
 
+def report_teacher(vectors: np.ndarray, labels: list[str], trials: int = 12) -> None:
+    """The same score for the grouper that does not need vectors at all.
+
+    Far fewer trials than the sweep: each one is a live call, not arithmetic over
+    a matrix already in memory. The pool sizes are the ones a real run sees.
+    """
+    from backend.miner.generate import build_generator
+
+    print(f"\n=== 5. one Gemini grouping call, {trials} pools ===")
+    generator = build_generator()
+    if generator is None:
+        print("  skipped: no GEMINI_API_KEY")
+        return
+
+    texts, _ = corpus()
+    rng = np.random.default_rng(7)
+    tally: Counter = Counter()
+    for _ in range(trials):
+        order = rng.permutation(len(labels))
+        index = order[: int(rng.choice([10, 15, 20, 25]))]
+        pool = [labels[i] for i in index]
+        counts = Counter(pool)
+        present = {
+            name
+            for name, count in counts.items()
+            if not name.startswith("noise:") and count >= DEFAULT_MIN_CLUSTER
+        }
+        tally["runs"] += 1
+        tally["present"] += len(present)
+        for group in generator.group([texts[i] for i in index]):
+            if len(group) < DEFAULT_MIN_CLUSTER:
+                continue
+            names = {pool[i] for i in group}
+            tally["groups"] += 1
+            if len(names) == 1:
+                tally["pure"] += 1
+                tally["found"] += int(names.pop() in present)
+
+    purity = tally["pure"] / tally["groups"] if tally["groups"] else 0.0
+    recall = tally["found"] / tally["present"] if tally["present"] else 0.0
+    print("   purity  recall  calls/run")
+    print(f"   {purity:.3f}   {recall:.3f}   {tally['groups'] / tally['runs']:.2f}")
+    print("  compare against section 2 at the MINER_SIM in use: the cosine buys purity")
+    print("  with recall, and a cluster it never finds is a skill never learned")
+
+
 def main() -> None:
     from backend.brain.engine import LayaEngine
 
@@ -269,6 +319,7 @@ def main() -> None:
     report_sweep(vectors, labels)
     report_centering(vectors, labels)
     report_latency(engine)
+    report_teacher(vectors, labels)
 
 
 if __name__ == "__main__":

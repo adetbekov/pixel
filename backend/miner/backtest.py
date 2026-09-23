@@ -1,7 +1,7 @@
 """Does the candidate actually work — and did it break anything that did?
 
 The user is asked to approve a skill, so the skill has to have been tried first.
-Two checks, and a proposal needs both:
+Three checks, and a proposal needs all of them:
 
 **1. Does it cover its own cluster?** Every case is re-routed against
 ``active + candidate``. A match means the router picked *the candidate* above
@@ -23,6 +23,21 @@ candidate can score 1.0 on its own cluster while knocking ``feed`` off the map.
 So one control phrase per active skill (``examples[0]``, so the control set
 grows with the library) is routed through the same trial registry, and if a
 single one stops reaching its own skill the proposal is not published at all.
+
+**3. Is it over-broad?** (JEB-1548.) Checks 1 and 2 only ever look at phrases
+the library already claims, so neither can see a candidate reaching for commands
+that are in nobody's ``examples`` yet. Measured on the live checkpoint: an
+accepted ``show_trick`` ("показать фокус") pulled "покажи сальто" to itself at
+0.78 while every ``examples[0]`` control passed cleanly. The pool has the right
+control set for free — the *other* cases in ``teacher_log``, the ones the
+grouper put in other clusters. They are commands a real user typed that this
+candidate is not for, so a candidate that wins any of them is drafted too wide
+and is not proposed.
+
+All three route with ``use_examples=False``. The router's exact-``examples``
+lookup would answer checks 1 and 3 from the candidate's own draft rather than
+from the head, scoring every candidate 1.0 on its cluster and proving nothing;
+here the question is only ever what the ``choice`` head does.
 """
 
 from __future__ import annotations
@@ -55,10 +70,17 @@ class Backtest:
     #: ``None`` when every active skill still routes to itself; otherwise the
     #: phrase that moved and where it went, so the log says what broke.
     regression: str | None = None
+    #: ``None`` when the candidate left the rest of the pool alone; otherwise the
+    #: outside-cluster command it took and the confidence it took it at.
+    overreach: str | None = None
 
     @property
     def publishable(self) -> bool:
-        return self.regression is None and self.match_rate >= min_match_rate()
+        return (
+            self.regression is None
+            and self.overreach is None
+            and self.match_rate >= min_match_rate()
+        )
 
 
 def check_regressions(
@@ -69,7 +91,7 @@ def check_regressions(
         if not skill.examples:
             continue
         phrase = skill.examples[0]
-        outcome = route(engine, trial, phrase, CONTROL_STATE)
+        outcome = route(engine, trial, phrase, CONTROL_STATE, use_examples=False)
         if isinstance(outcome, RouterHit) and outcome.skill_id == skill.id:
             continue
         went = outcome.skill_id if isinstance(outcome, RouterHit) else "miss"
@@ -77,10 +99,26 @@ def check_regressions(
     return None
 
 
+def check_overreach(
+    engine: DecisionEngine, trial: list[Skill], candidate: Skill, outsiders: list[Case]
+) -> str | None:
+    """First pool command from *outside* the cluster that the candidate takes."""
+    for case in outsiders:
+        outcome = route(engine, trial, case.user_text, CONTROL_STATE, use_examples=False)
+        if isinstance(outcome, RouterHit) and outcome.skill_id == candidate.id:
+            went = f"{candidate.id} @ {outcome.confidence:.2f}"
+            return f'"{case.user_text}" (another cluster) -> {went}'
+    return None
+
+
 def backtest(
-    engine: DecisionEngine, active: list[Skill], candidate: Skill, cases: list[Case]
+    engine: DecisionEngine,
+    active: list[Skill],
+    candidate: Skill,
+    cases: list[Case],
+    outsiders: list[Case] | None = None,
 ) -> Backtest:
-    """Run the candidate against its own cluster and against the library.
+    """Run the candidate against its own cluster, the library and the rest of the pool.
 
     The candidate is appended, never inserted: that is where ``load_skills``
     puts a mined skill (``ORDER BY rowid``), so the trial registry has to have
@@ -91,7 +129,9 @@ def backtest(
     matched = sum(
         1
         for case in cases
-        if _covers(route(engine, trial, case.user_text, case.state), candidate, case)
+        if _covers(
+            route(engine, trial, case.user_text, case.state, use_examples=False), candidate, case
+        )
     )
     rate = matched / len(cases) if cases else 0.0
     return Backtest(
@@ -99,6 +139,7 @@ def backtest(
         matched=matched,
         total=len(cases),
         regression=check_regressions(engine, trial, active),
+        overreach=check_overreach(engine, trial, candidate, outsiders or []),
     )
 
 
