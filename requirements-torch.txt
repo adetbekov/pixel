@@ -1,0 +1,13 @@
+# The one place the torch wheel is pinned. The Dockerfile, the `test` job and the
+# `image build` gate all install from / read this file, so there is nothing to keep
+# in sync by hand — a stale copy in a second place is exactly what JEB-1516 was.
+#
+# `laya` depends on torch and the default PyPI wheel is the CUDA build (~1 GB).
+# Pixel runs on CPU everywhere, so the CPU index is part of the pin, and so is the
+# `+cpu` local version — a CUDA wheel can then never satisfy it silently.
+#
+# Bump deliberately: the documented redeploy is `docker build .` on the NAS, so an
+# unpinned torch rebuilds an already-green commit against whatever the index serves
+# that day and the image stops being a function of the commit.
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
