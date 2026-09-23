@@ -139,17 +139,24 @@ _WORKFLOWS = _ROOT / ".github" / "workflows"
 # Keyed by branch, because `main` and `dev` need not gate the same set. The
 # audited branch selects the map; `--branch` names it.
 #
-# Today the two lists are identical: both of pixel's CI jobs are declared
-# `on: pull_request: branches: [dev, main]`, so each reports for a PR into
-# either branch. `main` grows two release-only contexts as their gates land —
-# `main PRs must come from dev` (JEB-1522) and the image build (JEB-1518). Each
-# goes in here in the PR that adds it to `main`'s protection, not before:
-# asserting a context that is not yet required is a finding, and asserting one
-# no PR into that branch can produce would wedge the branch.
+# Both of pixel's CI jobs are declared `on: pull_request: branches: [dev, main]`,
+# so each reports for a PR into either branch and both lists carry them. `main`
+# is that pair plus the release-only gates, which `dev` must NOT require:
+#
+#   * `main PRs must come from dev` — guard-main-head.yml is
+#     `on: pull_request: branches: [main]` (JEB-1522), so no PR into `dev` can
+#     start it. Requiring it on `dev` would leave every such PR blocked on a
+#     context nothing reports.
+#
+# The image build (JEB-1518) joins `main` the same way, in the PR that adds it
+# to `main`'s protection — not before: asserting a context that is not yet
+# required is a finding, and asserting one no PR into that branch can produce
+# would wedge the branch.
 REQUIRED_CONTEXTS = {
     "main": {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
+        "main PRs must come from dev": "guard-main-head.yml",
     },
     "dev": {
         "lint + tests": "ci.yml",
@@ -355,16 +362,23 @@ def parse_workflow(source: str) -> dict:
 
 
 def checkout_stands_for(branch: str) -> bool:
-    """Is the working tree the copy a PR into `branch` would carry?
+    """Does the working tree stand in for the copy a PR into `branch` carries?
 
     On a `pull_request` run actions/checkout leaves the *merge* ref checked out —
-    head merged into base — which is exactly the copy GitHub reads for
-    `pull_request`, both for this PR's own base and for the later `dev -> main`
-    release PR whose head is `dev`. On the scheduled run the tree is the default
-    branch and stands for it. A `workflow_dispatch` from some other branch stands
-    for neither: using that tree as the audited branch's proposed copy would
-    report ordinary branch divergence as a defect, so the audited branch's own
-    committed copy is used instead.
+    head merged into base — and for the PR's **own** base that is exactly the
+    copy GitHub reads for `pull_request`. For the *other* audited branch it is
+    not that copy but a stand-in for it: this PR's changes are what a later
+    `dev -> main` release PR would carry, so evaluating them against `main` now
+    fails on the `dev` PR rather than on the release. That errs toward earlier
+    detection deliberately — it is cheaper to fail here than to wedge the
+    release path — which is why the check returns True for every audited branch
+    on a `pull_request` event.
+
+    On the scheduled run the tree is the default branch and stands for it. A
+    `workflow_dispatch` from some other branch stands for neither: using that
+    tree as the audited branch's proposed copy would report ordinary branch
+    divergence as a defect, so the audited branch's own committed copy is used
+    instead.
     """
     if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
         return True

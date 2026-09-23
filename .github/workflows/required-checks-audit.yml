@@ -78,9 +78,16 @@ jobs:
         # Exit 1 (a real finding) and exit 2 (protection unreadable) mean
         # opposite things and must reach the alert step apart, per branch — so
         # each branch's code is published as its own step output *before* the
-        # step fails. The job's own code is 1 if either branch found something
-        # (a finding is the actionable answer and outranks an unreadable one)
-        # and 2 only when nothing could be read at all.
+        # step fails, and the alert step branches on those, not on the job's.
+        #
+        # The job's own code only has to be nonzero; collapsing two branches
+        # into one number loses information either way. It is 1 when either
+        # branch returned a finding and 2 only when neither did and one could
+        # not be read — a rule about *aggregating two branches*, not about
+        # ranking the two answers. Within one branch the script's own rule
+        # stands and is the opposite: a run that could not evaluate part of the
+        # gate has not passed it, whatever else it saw, so that branch's own
+        # code is 2 and its findings are printed alongside.
         #
         # `set -uo pipefail` does NOT clear `-e` — a `run:` step is already
         # executing under `-e` (with `shell: bash` above,

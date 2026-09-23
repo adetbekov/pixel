@@ -18,8 +18,8 @@ import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _ROOT / "scripts" / "assert_required_checks.py"
-_CI = _ROOT / ".github" / "workflows" / "ci.yml"
-_AUDIT = _ROOT / ".github" / "workflows" / "required-checks-audit.yml"
+_WORKFLOWS = _ROOT / ".github" / "workflows"
+_AUDIT = _WORKFLOWS / "required-checks-audit.yml"
 
 
 def _load():
@@ -83,12 +83,33 @@ def test_map_covers_dev_and_main():
 
 
 @pytest.mark.parametrize("branch", ["dev", "main"])
-def test_every_asserted_context_is_a_real_job_name_in_ci_yml(branch):
-    """The rename this script exists to catch must not already have happened."""
-    names, _unresolved = arc.job_display_names(arc.parse_workflow(_CI.read_text()))
+def test_every_asserted_context_is_a_real_job_name_in_the_file_it_names(branch):
+    """The rename this script exists to catch must not already have happened.
+
+    Each entry is checked against the workflow *it* names, not against one
+    hardcoded file: `main` is served by two of them already, and pinning the
+    filename would make adding a third gate fail here instead of where it
+    belongs.
+    """
     for context, workflow_file in arc.REQUIRED_CONTEXTS[branch].items():
-        assert workflow_file == "ci.yml"
+        path = _WORKFLOWS / workflow_file
+        assert path.exists(), f"{context!r} names a workflow that is not in the repo"
+        names, _unresolved = arc.job_display_names(arc.parse_workflow(path.read_text()))
         assert context in names
+
+
+@pytest.mark.parametrize("branch", ["dev", "main"])
+def test_every_asserted_context_is_reachable_for_the_branch_it_is_asserted_on(branch):
+    """A context no PR into `branch` can produce would wedge `branch`.
+
+    This is what keeps `dev`'s map a strict subset of `main`'s rather than a
+    copy of it: `main PRs must come from dev` is declared
+    `on: pull_request: branches: [main]`, so requiring it on `dev` would leave
+    every PR into `dev` blocked on a context nothing reports.
+    """
+    for context, workflow_file in arc.REQUIRED_CONTEXTS[branch].items():
+        doc = arc.parse_workflow((_WORKFLOWS / workflow_file).read_text())
+        assert arc.reachability_findings(context, workflow_file, doc, doc, branch) == []
 
 
 @pytest.mark.parametrize("branch", ["dev", "main"])
