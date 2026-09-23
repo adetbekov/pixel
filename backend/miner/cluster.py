@@ -1,0 +1,114 @@
+"""Grouping the misses: which commands are asking for the same thing.
+
+Single-link agglomerative clustering on cosine similarity. "Single-link above a
+threshold" is exactly "connected components of the graph where an edge means
+``cos >= MINER_SIM``", so that is how it is computed — a union-find over an
+``n x n`` matrix. The pool is tens of rows; O(n^2) is the cheap option here, and
+sklearn is a very large dependency for thirty lines of numpy.
+
+Threshold. 0.75 is the default and ``MINER_SIM`` overrides it, but not upwards
+past ~0.85: at that point only near-identical phrasings join, every cluster
+stays under the minimum size, and the miner silently never proposes anything.
+
+Fallback. Without sentence vectors the commands are grouped by one Gemini call
+instead. It exists so a missing ``embed_fn_from_agent`` degrades instead of
+stopping the pipeline — it is not the default path, and it is not free.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Callable
+
+import numpy as np
+
+from ..brain.engine import DecisionEngine
+
+log = logging.getLogger(__name__)
+
+DEFAULT_SIM = 0.75
+DEFAULT_MIN_CLUSTER = 3
+
+#: Grouper = "given these commands, which belong together" -> groups of indices.
+Grouper = Callable[[list[str]], list[list[int]]]
+
+
+def sim_threshold() -> float:
+    return float(os.environ.get("MINER_SIM", DEFAULT_SIM))
+
+
+def min_cluster_size() -> int:
+    """Below this a cluster is not mined and its cases stay in the pool.
+
+    Two commands are a coincidence; three are a habit worth a skill. Cases below
+    the bar are left ``mined=0`` deliberately — they ripen as more arrive.
+    """
+    return int(os.environ.get("MINER_MIN_CLUSTER", DEFAULT_MIN_CLUSTER))
+
+
+def components(similarity: np.ndarray, threshold: float) -> list[list[int]]:
+    """Connected components of ``similarity >= threshold``, in input order."""
+    size = similarity.shape[0]
+    parent = list(range(size))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for left in range(size):
+        for right in range(left + 1, size):
+            if similarity[left, right] >= threshold:
+                parent[find(left)] = find(right)
+
+    groups: dict[int, list[int]] = {}
+    for node in range(size):
+        groups.setdefault(find(node), []).append(node)
+    return sorted(groups.values(), key=lambda group: group[0])
+
+
+def cosine_matrix(vectors: list[list[float]]) -> np.ndarray:
+    matrix = np.asarray(vectors, dtype=float)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    # A zero vector has no direction; leaving the norm at 1 makes it similar to
+    # nothing at all, which is the honest answer.
+    matrix = matrix / np.where(norms == 0.0, 1.0, norms)
+    return matrix @ matrix.T
+
+
+def group_texts(
+    engine: DecisionEngine, texts: list[str], grouper: Grouper | None = None
+) -> list[list[int]]:
+    """Group commands into clusters of indices into ``texts``."""
+    if len(texts) < 2:
+        return [[0]] if texts else []
+
+    try:
+        vectors = engine.embed(texts)
+    except Exception as exc:  # noqa: BLE001 — a broken encoder must not stop mining
+        # Either the engine says it cannot embed (EmbeddingsUnavailable) or the
+        # encoder itself blew up. Both mean the same thing here: fall back.
+        log.warning("miner: no local embeddings (%r), grouping with the teacher instead", exc)
+        vectors = []
+
+    if len(vectors) == len(texts) and all(vectors):
+        return components(cosine_matrix(vectors), sim_threshold())
+
+    if grouper is None:
+        log.warning("miner: no embeddings and no fallback grouper — nothing to cluster")
+        return []
+    return _validate_groups(grouper(texts), len(texts))
+
+
+def _validate_groups(groups: list[list[int]], size: int) -> list[list[int]]:
+    """Trust nothing a model returned: indices in range, each used at most once."""
+    seen: set[int] = set()
+    cleaned = []
+    for group in groups:
+        members = sorted({i for i in group if isinstance(i, int) and 0 <= i < size} - seen)
+        if members:
+            seen.update(members)
+            cleaned.append(members)
+    return sorted(cleaned, key=lambda group: group[0])

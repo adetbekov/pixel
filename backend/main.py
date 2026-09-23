@@ -14,6 +14,7 @@ from . import db
 from .api import router
 from .brain.engine import LayaEngine, set_engine
 from .brain.skill import seed_db
+from .miner import build_generator, set_generator
 from .teacher import build_teacher, set_teacher
 
 FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
@@ -43,7 +44,12 @@ async def lifespan(app: FastAPI):
     if teacher is None:
         log.warning("GEMINI_API_KEY is not set — the teacher is off, Laya only")
 
+    # The miner reads what the teacher wrote, so the two share a key and switch
+    # off together: no teacher means an empty `teacher_log` and nothing to mine.
+    set_generator(build_generator())
+
     yield
+    set_generator(None)
     set_teacher(None)
     set_engine(None)
     db.close()

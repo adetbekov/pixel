@@ -1,0 +1,216 @@
+"""One mining run, start to finish.
+
+Synchronous inside the request that triggers it — the pool is tens of rows and
+one run is seconds. That is a prototype decision, not an architectural one,
+which is why the whole run is :func:`mine_once` and nothing else: moving it to a
+background worker is a change of caller, not of this module.
+
+Two triggers, one body: every ``MINER_BATCH``-th new unmined case, and
+``POST /api/mine``. A second concurrent run is refused rather than queued — it
+would re-read the same pool and race the first one to the same proposals.
+
+Locking. Gemini calls and routing happen with ``db.lock`` released: the reads
+come first, the writes come last, and nothing network-shaped happens in between
+while holding a non-reentrant lock.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sqlite3
+import threading
+import uuid
+from dataclasses import dataclass
+
+from .. import db
+from ..brain.engine import DecisionEngine, get_engine
+from ..brain.skill import Skill, load_skills
+from ..state import iso, utcnow
+from .backtest import backtest
+from .case import Case, load_pool, pool_size
+from .cluster import group_texts, min_cluster_size
+from .generate import SkillGenerator, get_generator
+
+log = logging.getLogger(__name__)
+
+DEFAULT_BATCH = 5
+
+_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class MineResult:
+    started: bool
+    proposals: int
+
+
+def batch_size() -> int:
+    return int(os.environ.get("MINER_BATCH", DEFAULT_BATCH))
+
+
+def mining_due(conn: sqlite3.Connection) -> bool:
+    """True on every ``MINER_BATCH``-th unmined case.
+
+    Counted, not accumulated: a run that mines nothing leaves the pool where it
+    was, so the next case brings the count to the following multiple and the
+    trigger fires again instead of going quiet forever.
+    """
+    size = pool_size(conn)
+    return size > 0 and size % batch_size() == 0
+
+
+def mine_once() -> MineResult:
+    """Mine the pool once. ``started=False`` means another run holds the lock."""
+    if not _lock.acquire(blocking=False):
+        log.info("miner: a run is already in progress")
+        return MineResult(started=False, proposals=0)
+    try:
+        return MineResult(started=True, proposals=_mine())
+    finally:
+        _lock.release()
+
+
+def _mine() -> int:
+    generator = get_generator()
+    if generator is None:
+        # No API key: nothing writes `teacher_log` either, so this is the
+        # ordinary key-less configuration and not an error.
+        return 0
+    try:
+        engine = get_engine()
+    except RuntimeError:
+        log.warning("miner: no decision engine — a candidate could not be backtested")
+        return 0
+
+    conn = db.get_conn()
+    with db.lock:
+        cases = load_pool(conn)
+        active = load_skills(conn, only_active=True)
+        taken = _taken_ids(conn)
+        rejected = _rejected_signatures(conn)
+
+    if len(cases) < min_cluster_size():
+        return 0
+
+    groups = group_texts(engine, [case.user_text for case in cases], generator.group)
+    created = 0
+    for group in groups:
+        cluster = [cases[index] for index in group]
+        proposal = _propose(engine, generator, cluster, active, taken, rejected)
+        if proposal is None:
+            continue
+        taken.add(proposal.skill.id)
+        with db.lock:
+            _save(conn, proposal)
+        created += 1
+    return created
+
+
+@dataclass(frozen=True)
+class MinedProposal:
+    id: str
+    skill: Skill
+    match_rate: float
+    sample_ids: list[int]
+
+
+def _propose(
+    engine: DecisionEngine,
+    generator: SkillGenerator,
+    cluster: list[Case],
+    active: list[Skill],
+    taken: set[str],
+    rejected: set[tuple[int, ...]],
+) -> MinedProposal | None:
+    """One cluster -> one proposal, or ``None`` and the reason in the log."""
+    if len(cluster) < min_cluster_size():
+        return None
+
+    signature = tuple(sorted(case.id for case in cluster))
+    if signature in rejected:
+        # The user already said no to exactly these cases. Re-proposing them on
+        # the very next run is how a suggestion panel becomes noise.
+        log.info("miner: cluster %s was already rejected", list(signature))
+        return None
+
+    skill = generator.propose(cluster, active)
+    if skill is None:
+        return None
+    if skill.id in taken:
+        log.warning("miner: candidate id %r is already in use", skill.id)
+        return None
+
+    report = backtest(engine, active, skill, cluster)
+    if report.regression is not None:
+        log.warning(
+            "miner: %r rejected — it breaks an active skill: %s", skill.id, report.regression
+        )
+        return None
+    if not report.publishable:
+        log.info(
+            "miner: %r rejected — match_rate %.2f on %d cases",
+            skill.id,
+            report.match_rate,
+            report.total,
+        )
+        return None
+
+    return MinedProposal(
+        id=str(uuid.uuid4()),
+        skill=skill,
+        match_rate=round(report.match_rate, 3),
+        sample_ids=list(signature),
+    )
+
+
+def _taken_ids(conn: sqlite3.Connection) -> set[str]:
+    """Skill ids the candidate may not reuse — library plus pending proposals."""
+    ids = {row["id"] for row in conn.execute("SELECT id FROM skills")}
+    for row in conn.execute("SELECT skill_json FROM skill_proposals WHERE status = 'pending'"):
+        try:
+            ids.add(json.loads(row["skill_json"])["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ids
+
+
+def _rejected_signatures(conn: sqlite3.Connection) -> set[tuple[int, ...]]:
+    """The case sets the user has already turned down.
+
+    The signature is read back off the rejected proposal rather than stored in a
+    column of its own: ``sample_ids`` already *is* the set of cases, so a second
+    copy could only ever disagree with it.
+    """
+    signatures = set()
+    for row in conn.execute("SELECT sample_ids FROM skill_proposals WHERE status = 'rejected'"):
+        try:
+            signatures.add(tuple(sorted(json.loads(row["sample_ids"]))))
+        except (TypeError, ValueError):
+            continue
+    return signatures
+
+
+def _save(conn: sqlite3.Connection, proposal: MinedProposal) -> None:
+    """Write the proposal and take its cases out of the pool — in that order.
+
+    ``mined=1`` is set only here, so a cluster that failed generation or the
+    backtest stays available: more cases may arrive and make it work.
+    """
+    conn.execute(
+        "INSERT INTO skill_proposals (id, skill_json, match_rate, sample_ids, status, created_at)"
+        " VALUES (?, ?, ?, ?, 'pending', ?)",
+        (
+            proposal.id,
+            proposal.skill.model_dump_json(),
+            proposal.match_rate,
+            json.dumps(proposal.sample_ids),
+            iso(utcnow()),
+        ),
+    )
+    conn.executemany(
+        "UPDATE teacher_log SET mined = 1, cluster_id = ? WHERE id = ?",
+        [(proposal.id, case_id) for case_id in proposal.sample_ids],
+    )
+    conn.commit()
