@@ -36,8 +36,7 @@ services:
       MINER_MIN_MATCH: ${MINER_MIN_MATCH:-0.8}
     volumes:
       - pixel_data:/data
-    networks:
-      - npm_network
+    networks: [npm_network
     # mmBERT-base (322M) is resident in the process. 2 GB is the floor; 3 GB
     # leaves room for the first load, which peaks well above the steady state.
     mem_limit: 3g
