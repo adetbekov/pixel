@@ -232,8 +232,17 @@ docker compose -p pixel up -d --force-recreate     # or: redeploy the `pixel` st
 PRs target `dev`; `main` is the release branch. CI runs lint + tests, the frontend lint and an
 `image build` gate on every PR, and emits `check_suite`, which is the review hand-off gate.
 
-`image build` builds the same `Dockerfile` the NAS redeploy builds, so a broken image fails the PR
-instead of the stand. It then asks the built image what it actually installed: torch must equal the
+`image build` covers both halves of the deployment — `Dockerfile` **and** `docker-compose.yml`.
+
+It starts with the compose file, because that check costs under a second and needs no image:
+`docker compose config` parses it, validates it against the schema and resolves every
+`${VAR:-default}`, then `.github/scripts/verify_compose.py` asserts the stack runs the image the
+redeploy above actually builds. Both are load-bearing on a stand where `pull_policy: never` means a
+tag nobody builds is not an error but a silently stale container, and where the compose file is
+otherwise first executed on production.
+
+Then it builds the same `Dockerfile` the NAS redeploy builds, so a broken image fails the PR
+instead of the stand. It asks the built image what it actually installed: torch must equal the
 pin in `requirements-torch.txt` — the one file the image *and* the test job install from — it must
 not be a CUDA wheel, and `laya` must land inside the range in `pyproject.toml`. Then it smoke-runs
 the container with `PIXEL_SKIP_MODEL=1` and asserts 200 from `/api/state`, `/` and `/app.js`. The
