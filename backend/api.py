@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -20,6 +21,7 @@ from .brain.engine import get_engine
 from .brain.router import RouterHit, route
 from .brain.skill import load_skills
 from .state import apply_actions, iso, read_state, utcnow
+from .teacher import get_teacher, log_case
 
 router = APIRouter(prefix="/api")
 
@@ -55,7 +57,7 @@ TIRED_PLAN: list[dict[str, Any]] = [
     {"action": "say", "args": {"text": "Я устал, давай позже"}},
 ]
 
-# What a router miss answers with until stage 3 hands it to Gemini instead.
+# What a router miss answers with when the teacher is off (no GEMINI_API_KEY).
 MISS_PLAN: list[dict[str, Any]] = [
     {"action": "set_face", "args": {"face": "curious"}},
     {"action": "say", "args": {"text": "Я пока не понял"}},
@@ -133,6 +135,9 @@ class Metrics(BaseModel):
     avg_latency_gemini_ms: float
     skills_active: int
     total_commands: int
+    #: Teacher calls in the last 24h — Gemini is the only thing here that costs
+    #: money, so the spend is visible without opening the console.
+    teacher_calls_24h: int = 0
 
 
 def _log_interaction(
@@ -244,9 +249,12 @@ def post_action(payload: ActionIn) -> dict:
 
 @router.post("/chat", response_model=Reply)
 def post_chat(payload: ChatIn) -> dict:
-    """The fast path: Laya picks a skill, the skill's rules pick the plan.
+    """Laya first, always; Gemini only on a miss.
 
-    Stage 3 will send a miss to Gemini; today it answers with :data:`MISS_PLAN`.
+    The order is the product, not an implementation detail: asking both, or
+    asking Gemini first, would destroy the one metric that says whether Pixel is
+    learning anything. `started` is taken before the router so `latency_ms`
+    covers the miss the user waited through as well as the Gemini call.
     """
     started = time.perf_counter()
     try:
@@ -263,15 +271,52 @@ def post_chat(payload: ChatIn) -> dict:
         skills = load_skills(conn, only_active=True)
 
     outcome = route(engine, skills, payload.text, state)
-    hit = isinstance(outcome, RouterHit)
-    return execute_plan(
+    if isinstance(outcome, RouterHit):
+        return execute_plan(
+            user_text=payload.text,
+            raw_plan=outcome.raw_plan,
+            engine="laya",
+            started=started,
+            skill_id=outcome.skill_id,
+            confidence=outcome.confidence,
+        )
+
+    teacher = get_teacher()
+    if teacher is None:
+        # No API key: Pixel runs on Laya alone and says so politely.
+        return execute_plan(
+            user_text=payload.text,
+            raw_plan=MISS_PLAN,
+            engine="laya",
+            started=started,
+            confidence=outcome.confidence,
+        )
+
+    # Deliberately outside every lock: `db.lock` is not reentrant and this is a
+    # network call that can sit for the full TIMEOUT_S.
+    result = teacher.explain(payload.text, state, skills)
+    reply = execute_plan(
         user_text=payload.text,
-        raw_plan=outcome.raw_plan if hit else MISS_PLAN,
-        engine="laya",
+        raw_plan=result.raw_plan,
+        engine="gemini",
         started=started,
-        skill_id=outcome.skill_id if hit else None,
         confidence=outcome.confidence,
+        fallback_reply=result.reply,
     )
+
+    with db.lock:
+        log_case(
+            conn,
+            interaction_id=reply["interaction_id"],
+            user_text=payload.text,
+            # The state the teacher reasoned about, before its own plan moved it.
+            state=state,
+            confidence=outcome.confidence,
+            raw_response=result.raw_response,
+            actions=reply["actions"],
+            error=result.error,
+        )
+    return reply
 
 
 @router.post("/feedback", response_model=Ok)
@@ -351,6 +396,17 @@ def get_metrics() -> dict:
         skills_active = conn.execute(
             "SELECT COUNT(*) AS n FROM skills WHERE status = 'active'"
         ).fetchone()["n"]
+        # `teacher_log` has no timestamp column, so the age comes from the
+        # interaction it belongs to. `iso()` always renders UTC with a fixed
+        # date-time prefix, so comparing the strings orders the instants — the
+        # optional `.ffffff` only ever appears after the part that differs.
+        since = iso(utcnow() - timedelta(hours=24))
+        teacher_calls = conn.execute(
+            "SELECT COUNT(*) AS n FROM teacher_log t"
+            " JOIN interactions i ON i.id = t.interaction_id"
+            " WHERE i.ts >= ?",
+            (since,),
+        ).fetchone()["n"]
 
     by_engine = {row["engine"]: row for row in rows}
     laya = by_engine.get("laya")
@@ -367,4 +423,5 @@ def get_metrics() -> dict:
         "avg_latency_gemini_ms": round(gemini["avg_ms"], 1) if gemini else 0.0,
         "skills_active": int(skills_active),
         "total_commands": int(total),
+        "teacher_calls_24h": int(teacher_calls),
     }

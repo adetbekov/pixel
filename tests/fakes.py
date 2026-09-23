@@ -1,9 +1,11 @@
-"""A decision engine with scripted answers and no model behind it.
+"""Scripted stand-ins for both models, so CI needs neither weights nor network.
 
-CI never downloads weights, so every test that exercises the router, the skills
-or /api/chat runs against this instead of Laya.
+``FakeEngine`` replaces Laya. ``FakeGeminiClient`` replaces the ``google.genai``
+client inside :class:`backend.teacher.client.GeminiTeacher`, which takes its
+client as an argument precisely so the retry and fallback paths are testable.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 from backend.brain.engine import Answer, ChoiceResult, SingleQuestionMixin
@@ -33,3 +35,37 @@ class FakeEngine(SingleQuestionMixin):
             probabilities = {key: float(key == self.pick) for key in options}
             return {ROUTER_QUESTION: ChoiceResult(self.pick, self.confidence, probabilities)}
         return {name: self.answers[name] for name in questions if name in self.answers}
+
+
+@dataclass
+class FakeInteraction:
+    output_text: str
+
+
+class FakeInteractions:
+    """``client.interactions`` — one scripted answer per call.
+
+    A scripted entry is either the raw text the model would return, or an
+    exception instance to raise instead (a timeout, a 500). The last entry is
+    reused if the teacher asks more times than the script has answers.
+    """
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = script
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> FakeInteraction:
+        self.calls.append(kwargs)
+        answer = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
+        if isinstance(answer, BaseException):
+            raise answer
+        return FakeInteraction(output_text=answer)
+
+
+class FakeGeminiClient:
+    def __init__(self, *script: Any) -> None:
+        self.interactions = FakeInteractions(list(script))
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        return self.interactions.calls
