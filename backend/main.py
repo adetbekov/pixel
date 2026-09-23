@@ -14,6 +14,7 @@ from . import db
 from .api import router
 from .brain.engine import LayaEngine, set_engine
 from .brain.skill import seed_db
+from .teacher import build_teacher, set_teacher
 
 FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
 
@@ -35,7 +36,15 @@ async def lifespan(app: FastAPI):
     else:
         set_engine(LayaEngine())
 
+    # A missing GEMINI_API_KEY is a supported setup, not a crash: Pixel runs on
+    # Laya alone and a router miss answers with the polite stub.
+    teacher = build_teacher()
+    set_teacher(teacher)
+    if teacher is None:
+        log.warning("GEMINI_API_KEY is not set — the teacher is off, Laya only")
+
     yield
+    set_teacher(None)
     set_engine(None)
     db.close()
 

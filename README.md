@@ -20,7 +20,7 @@ Tracking issue: JEB-1495.
 
 1. **Which skill?** One `choice` question over every active skill plus a mandatory `unknown`
    option. Below the skill's threshold (`ROUTER_THRESHOLD`, default `0.6`), or on `unknown`, the
-   router reports a miss and runs nothing — stage 3 hands that miss to Gemini.
+   router reports a miss and hands it to the teacher.
 2. **How should it behave?** All of the chosen skill's questions in a single batched call. A skill
    with no questions skips this pass.
 
@@ -32,13 +32,36 @@ Laya is reached only through `DecisionEngine` (`backend/brain/engine.py`) — th
 imports `laya`. The checkpoint is `convaiinnovations/laya` + `subfolder="multilingual"`; the English
 root checkpoint answers Cyrillic confidently and wrongly.
 
+## The slow path — the teacher
+
+Only a router miss reaches Gemini (`backend/teacher/`). The order is the product: Laya first,
+always, because "share of commands handled without Gemini" is the metric the whole project is
+measured on. `latency_ms` on a teacher reply covers the router miss as well as the Gemini call —
+it is what the user actually waited.
+
+Gemini writes no code. It returns a `{reply, actions}` plan, and that plan passes two independent
+checks: the response schema (`backend/teacher/schema.py`) for the shape, and `validate_plan`
+(`backend/actions.py`) for membership of the action library. The second is the one that matters —
+a schema cannot stop `{"action": "hack_nasa"}` in a string field. An invalid or empty plan is
+retried once with the reason, and a second failure answers with a fixed fallback plan; a timeout
+(8 s) or an API error does the same. The user never sees a traceback.
+
+Every teacher call writes a row to `teacher_log` — state, original command, router confidence, the
+raw model response and the validated plan. That table is the only input stage 4's skill miner has,
+so fallbacks are logged too. `raw_response` is never returned over the API.
+
+Without `GEMINI_API_KEY` the app still starts: the teacher is off, a miss answers with a polite
+stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` overrides the model
+(default `gemini-3.1-flash-lite`).
+
 ```
 pip install -e ".[dev]"
 uvicorn backend.main:app --reload     # first run downloads the weights (~650 MB) into HF_HOME
 PIXEL_SKIP_MODEL=1 uvicorn backend.main:app   # UI and buttons only; /api/chat answers 503
 ```
 
-Tests never touch the model or the network — they run against a `FakeEngine` (`tests/fakes.py`).
+Tests never touch the model or the network — they run against `FakeEngine` and `FakeGeminiClient`
+(`tests/fakes.py`).
 
 ## Pipeline
 

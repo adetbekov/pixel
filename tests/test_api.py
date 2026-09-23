@@ -184,6 +184,7 @@ async def test_metrics(client):
         "avg_latency_gemini_ms",
         "skills_active",
         "total_commands",
+        "teacher_calls_24h",
     }
     assert body["total_commands"] == 1
     # No Laya and no Gemini yet — the share must not divide by zero.
