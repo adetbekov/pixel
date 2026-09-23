@@ -46,12 +46,13 @@ def test_the_threshold_is_configurable(monkeypatch):
     assert group_texts(engine, ["a", "b"]) == [[0], [1]]
 
 
-def test_the_default_sits_in_the_measured_band():
+def test_the_default_sits_in_the_measured_band(monkeypatch):
     """0.88, calibrated on real Laya vectors in JEB-1509.
 
     Pinned because it is not a round number anybody would guess back: below
     ~0.87 the clusters come out mixed, past ~0.91 none reach the minimum size.
     """
+    monkeypatch.delenv("MINER_SIM", raising=False)
     assert DEFAULT_SIM == 0.88
     assert sim_threshold() == DEFAULT_SIM
 

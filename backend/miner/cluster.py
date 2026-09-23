@@ -7,17 +7,18 @@ threshold" is exactly "connected components of the graph where an edge means
 sklearn is a very large dependency for thirty lines of numpy.
 
 Threshold. 0.88, and ``MINER_SIM`` overrides it. The number is measured against
-the real ``multilingual`` vectors (JEB-1509), not chosen. Mean-pooled encoder
-states are anisotropic — every cosine comes out high, and on a probe of Russian
-commands the across-intent spread (median 0.68, p90 0.81, max 0.86) runs
-straight through the within-intent one (min 0.61, median 0.81). Only a narrow
-band at the top tells the two apart: over simulated pools 0.75 got 999 of every
-1000 mineable clusters mixed and still spent a Gemini call per run, 0.88 is the
-lowest value at which no mixed cluster survived, and past ~0.91 nothing reaches
+the real ``multilingual`` vectors, by ``scripts/calibrate_miner_sim.py``
+(JEB-1509) — run it before changing it. Mean-pooled encoder states are
+anisotropic: every cosine comes out high, and on that script's probe of Russian
+commands the across-intent spread (median 0.685, p90 0.793, max 0.887) runs
+straight through the within-intent one (min 0.511, median 0.830). Only a narrow
+band at the top tells the two apart. Over simulated pools 0.75 got 999 of every
+1000 mineable clusters mixed and still spent a Gemini call per run; 0.88 is the
+lowest value at which no mixed cluster survived; past ~0.91 nothing reaches
 ``MINER_MIN_CLUSTER`` at all. What the high bar costs is recall: about a third
 of repeated intents group, and they are the near-identical phrasings — "спой
-песню" and "давай ты споёшь" do not reach it. That is a limit of these vectors,
-not of the threshold.
+песню" and "давай ты споёшь" sit at 0.714 and do not reach it. That is a limit
+of these vectors, not of the threshold.
 
 Centering the pool before the cosine (the usual anisotropy fix) was measured
 too and is not used: it separates a large mixed probe better, and it shatters a
