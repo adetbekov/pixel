@@ -227,5 +227,3 @@ setInterval(pollState, STATE_POLL_MS);
 
 /* Ручная проверка выражений и анимаций из консоли. */
 window.pixel = { setFace, playPlan };
-
-const brokenProbe = {
