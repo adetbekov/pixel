@@ -50,6 +50,27 @@ jobs:
 
 MAP = {"lint + tests": "ci.yml", "frontend lint": "ci.yml"}
 
+# A stand-in for `gates recorded`: required on the branch, published by an API
+# caller, no workflow to cross-check.
+API_CONTEXT = arc.ApiPublishedContext(
+    endpoint="POST /repos/<owner>/<repo>/statuses/<sha>",
+    publisher="a bot",
+    reason="it is a commit status, not a check run",
+)
+
+
+def _workflow_backed(branch: str) -> dict[str, str]:
+    """The `branch` entries that name a workflow file, as the tests below need.
+
+    An `ApiPublishedContext` entry has no file and no job name, so walking it
+    here would assert the very thing the script deliberately cannot answer.
+    """
+    return {
+        context: source
+        for context, source in arc.REQUIRED_CONTEXTS[branch].items()
+        if isinstance(source, str)
+    }
+
 
 @pytest.fixture
 def workflows(tmp_path, monkeypatch):
@@ -91,7 +112,7 @@ def test_every_asserted_context_is_a_real_job_name_in_the_file_it_names(branch):
     filename would make adding a third gate fail here instead of where it
     belongs.
     """
-    for context, workflow_file in arc.REQUIRED_CONTEXTS[branch].items():
+    for context, workflow_file in _workflow_backed(branch).items():
         path = _WORKFLOWS / workflow_file
         assert path.exists(), f"{context!r} names a workflow that is not in the repo"
         names, _unresolved = arc.job_display_names(arc.parse_workflow(path.read_text()))
@@ -107,7 +128,7 @@ def test_every_asserted_context_is_reachable_for_the_branch_it_is_asserted_on(br
     `on: pull_request: branches: [main]`, so requiring it on `dev` would leave
     every PR into `dev` blocked on a context nothing reports.
     """
-    for context, workflow_file in arc.REQUIRED_CONTEXTS[branch].items():
+    for context, workflow_file in _workflow_backed(branch).items():
         doc = arc.parse_workflow((_WORKFLOWS / workflow_file).read_text())
         assert arc.reachability_findings(context, workflow_file, doc, doc, branch) == []
 
@@ -188,6 +209,87 @@ def test_context_required_on_github_but_absent_from_the_map_is_a_finding(workflo
     assert len(findings) == 1
     assert "'image build'" in findings[0]
     assert "is not asserted here" in findings[0]
+
+
+# --- contexts published over the statuses API (JEB-1598) ---------------------
+
+
+@pytest.fixture
+def api_map(workflows, monkeypatch):
+    """`dev` also requires a context no workflow produces."""
+    monkeypatch.setattr(
+        arc,
+        "REQUIRED_CONTEXTS",
+        {"dev": {**MAP, "gates recorded": API_CONTEXT}, "main": dict(MAP)},
+    )
+    return workflows
+
+
+def test_gates_recorded_is_asserted_on_dev_as_an_api_published_context():
+    """The live `dev` list carries it, so the map must — and as the right kind.
+
+    A plain filename here would make assertion 2 fail on every run, because
+    `gates recorded` is a commit status with no workflow, no job and no run.
+    """
+    entry = arc.REQUIRED_CONTEXTS["dev"]["gates recorded"]
+    assert isinstance(entry, arc.ApiPublishedContext)
+    assert "statuses" in entry.endpoint
+    assert entry.publisher and entry.reason
+
+
+def test_gates_recorded_is_not_asserted_on_main():
+    """JEB-1595: `main` deliberately does not require it and must not start."""
+    assert "gates recorded" not in arc.REQUIRED_CONTEXTS["main"]
+
+
+def test_api_published_context_is_green_without_a_workflow(api_map):
+    """Assertions 2 and 4 are skipped for it — and nothing else complains."""
+    notes: list[str] = []
+    undetermined: list[str] = []
+    findings = _check(
+        api_map,
+        ["lint + tests", "frontend lint", "gates recorded"],
+        notes=notes,
+        undetermined=undetermined,
+    )
+    assert findings == []
+    assert notes == []
+    assert undetermined == []
+
+
+def test_api_published_context_missing_from_protection_is_a_finding(api_map):
+    """Assertion 1: dropping it from live `dev` protection is caught."""
+    findings = _check(api_map, ["lint + tests", "frontend lint"])
+    assert len(findings) == 1
+    assert "'gates recorded'" in findings[0]
+    assert "missing from dev's protection" in findings[0]
+    # ...named by its real publisher, not by a workflow file that does not exist.
+    assert "statuses" in findings[0]
+    assert ".github/workflows/" not in findings[0]
+
+
+def test_dropping_the_api_published_entry_from_the_map_is_still_a_finding(workflows):
+    """Assertion 3 keeps covering it: the map cannot quietly stop asserting it.
+
+    `workflows` leaves REQUIRED_CONTEXTS without `gates recorded`, which is the
+    state this issue found in the repo.
+    """
+    findings = _check(workflows, ["lint + tests", "frontend lint", "gates recorded"])
+    assert len(findings) == 1
+    assert "'gates recorded'" in findings[0]
+    assert "is not asserted here" in findings[0]
+
+
+def test_api_published_context_is_not_fetched_as_a_workflow(api_map, monkeypatch):
+    """There is no file to GET, so the base-copy fetch must not invent one."""
+    asked: list[str] = []
+    monkeypatch.setattr(
+        arc,
+        "fetch_workflow_source",
+        lambda repo, ref, filename, token: asked.append(filename),
+    )
+    arc.fetch_base_workflows("adetbekov/pixel", "dev", None)
+    assert asked == ["ci.yml"]
 
 
 # --- assertion 4: trigger reachability ---------------------------------------

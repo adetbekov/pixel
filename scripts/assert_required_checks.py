@@ -80,6 +80,16 @@ Four independent assertions, because they fail independently:
      gate unevaluated while the audit reported green, which is this issue's own
      failure shape.
 
+Not every required context is produced by an Actions job. A commit status posted
+with `POST /repos/{repo}/statuses/{sha}` is required and reported exactly like a
+check run, but it has no workflow, no job and no run — so there is no job `name:`
+to cross-check and no trigger whose reachability could be evaluated. Those
+entries carry an `ApiPublishedContext` instead of a filename (JEB-1598), which
+names the publisher and makes assertions 2 and 4 skip *for a stated reason*
+rather than by accident. Assertions 1 and 3 do not care where a context comes
+from and still cover them, which is the point: the audit must notice such a
+context being dropped from protection.
+
 A job `name:` carrying an unexpandable `${{ }}` template is reported as a
 `::warning::` note ("cannot verify"), never a finding: membership stays
 asserted, and an answer that could not be read is never reported as a failed
@@ -98,8 +108,9 @@ secret to provision, rotate, or leak.
 
 Exit codes, kept distinct on purpose — an error is NOT "unprotected":
 
-  0  every required context is present, matches its job name, and is reachable
-     by a trigger that fires for PRs into the audited branch
+  0  every required context is present and — for the ones a workflow produces —
+     matches its job name and is reachable by a trigger that fires for PRs into
+     the audited branch
   1  a real finding: a context is missing from the required list, a context no
      longer matches any job name, a context is declared by a workflow no event
      can start for a PR into that branch, or the branch is not protected
@@ -129,12 +140,52 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOWS = _ROOT / ".github" / "workflows"
 
+
+class ApiPublishedContext:
+    """A required context published over the statuses API, not by an Actions job.
+
+    `POST /repos/{repo}/statuses/{sha}` creates a commit status that branch
+    protection requires and reports exactly like a check run — but there is no
+    workflow file, no job `name:` and no run behind it. Assertion 2 (context <->
+    job name) and assertion 4 (trigger reachability) have nothing to read, so
+    they are skipped for entries carrying this marker.
+
+    It is a distinct type rather than `None` on purpose: `None` reads as an
+    omission at every call site, and the next reader cannot tell a deliberate
+    skip from a half-finished dict entry. This object says *why* it is skipped
+    and *who* publishes the context, so the skip is a stated answer.
+
+    Assertions 1 (the context is in the live required list) and 3 (the live list
+    holds nothing this dict does not assert) are unaffected — they compare two
+    sets of context strings and never touch a workflow. That is deliberate: the
+    whole reason to carry an API-published context here is so the audit notices
+    it being dropped from protection.
+    """
+
+    __slots__ = ("endpoint", "publisher", "reason")
+
+    def __init__(self, endpoint: str, publisher: str, reason: str) -> None:
+        self.endpoint = endpoint
+        self.publisher = publisher
+        self.reason = reason
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"ApiPublishedContext({self.endpoint!r})"
+
+
+def produced_by(source: str | ApiPublishedContext) -> str:
+    """How a required context comes to exist, for a human-readable finding."""
+    if isinstance(source, ApiPublishedContext):
+        return f"published by {source.publisher} over {source.endpoint}"
+    return f"produced by .github/workflows/{source}"
+
+
 # Every context required on a protected branch, mapped to the workflow file whose
-# job `name:` must equal it. Adding a required context on GitHub without adding
-# it here leaves the new gate unmonitored (assertion 3 fails on exactly that);
-# removing one here silently retires the assertion, which is the drift this
-# script exists to catch — so **both edits belong in the same PR as the
-# protection change**.
+# job `name:` must equal it — or to an `ApiPublishedContext` when no workflow
+# produces it. Adding a required context on GitHub without adding it here leaves
+# the new gate unmonitored (assertion 3 fails on exactly that); removing one here
+# silently retires the assertion, which is the drift this script exists to catch
+# — so **both edits belong in the same PR as the protection change**.
 #
 # Keyed by branch, because `main` and `dev` need not gate the same set. The
 # audited branch selects the map; `--branch` names it.
@@ -153,7 +204,26 @@ _WORKFLOWS = _ROOT / ".github" / "workflows"
 # requiring one no PR into that branch can produce would wedge the branch. It
 # landed with #17, reported on live PRs into both branches, and JEB-1524 made it
 # required on `dev` and `main`; this dict edit is that change's other half.
-REQUIRED_CONTEXTS = {
+#
+# `gates recorded` is `dev`-only and is **not** a check run (JEB-1571, JEB-1598):
+# it is a commit status hand-published over the statuses API, so it carries an
+# `ApiPublishedContext` and assertions 2 and 4 skip it. It must NOT be added to
+# `main` (JEB-1595): the merge bot refuses `base=main` and no feature PR can
+# reach `main`, so requiring it there would gate the release path on a status
+# nothing publishes.
+_GATES_RECORDED = ApiPublishedContext(
+    endpoint="POST /repos/<owner>/<repo>/statuses/<sha>",
+    publisher=(
+        "the PR Auto-Merge Bot on a feature PR, and the release-manager on the "
+        "main -> dev back-merge"
+    ),
+    reason=(
+        "it is a commit status, not a check run: there is no workflow file, no job "
+        "name to match and no Actions run whose trigger could be evaluated"
+    ),
+)
+
+REQUIRED_CONTEXTS: dict[str, dict[str, str | ApiPublishedContext]] = {
     "main": {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
@@ -164,6 +234,7 @@ REQUIRED_CONTEXTS = {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
         "image build": "ci.yml",
+        "gates recorded": _GATES_RECORDED,
     },
 }
 
@@ -180,8 +251,11 @@ class CannotDetermine(Exception):
     """The answer could not be read. Never a synonym for 'not protected'."""
 
 
-def contexts_for(branch: str) -> dict[str, str]:
-    """The `context -> workflow file` map this script asserts for `branch`.
+def contexts_for(branch: str) -> dict[str, str | ApiPublishedContext]:
+    """The `context -> producer` map this script asserts for `branch`.
+
+    A producer is a workflow filename, or an `ApiPublishedContext` when the
+    context is a commit status with no workflow behind it.
 
     An unaudited branch is CannotDetermine, not an empty map: an empty map would
     make every assertion vacuously true and the script would print `OK` for a
@@ -242,11 +316,15 @@ def fetch_base_workflows(repo: str, ref: str, token: str | None) -> dict[str, st
     """`filename -> source-on-ref` for every workflow `ref`'s context map names.
 
     Only the files that declare a required context are fetched — the same set
-    assertions 1 and 2 already walk.
+    assertions 1 and 2 already walk. Contexts published over the statuses API
+    name no file and are skipped here for the same reason assertion 4 skips
+    them: there is nothing to fetch.
     """
     return {
         filename: fetch_workflow_source(repo, ref, filename, token)
-        for filename in sorted(set(contexts_for(ref).values()))
+        for filename in sorted(
+            value for value in set(contexts_for(ref).values()) if isinstance(value, str)
+        )
     }
 
 
@@ -674,10 +752,18 @@ def check(
         if context not in present:
             findings.append(
                 f"required status check missing from {branch}'s protection: {context!r} "
-                f"(produced by .github/workflows/{workflow_file}). Without it GitHub "
-                f"allows the merge even when the check is red. Restore it with "
+                f"({produced_by(workflow_file)}). Without it GitHub allows the merge even "
+                f"when the check is red. Restore it with "
                 f"PATCH /repos/<repo>/branches/{branch}/protection/required_status_checks."
             )
+
+        # A context published over the statuses API has no workflow file, so
+        # assertions 2 and 4 have nothing to read and are skipped here — for the
+        # reason the entry itself states, not by accident. Membership above and
+        # assertion 3 below both still cover it, which is why carrying it in this
+        # dict is worth anything at all.
+        if isinstance(workflow_file, ApiPublishedContext):
+            continue
 
         path = workflows_dir / workflow_file
         if not path.exists():
@@ -747,9 +833,11 @@ def check(
             f"required status check on {branch} is not asserted here: {context!r} is in "
             f"{branch}'s required list but missing from REQUIRED_CONTEXTS[{branch!r}] in "
             f"scripts/assert_required_checks.py, so this audit does not monitor it and would "
-            f"not notice it being dropped. Add {context!r} to REQUIRED_CONTEXTS[{branch!r}] — "
-            f"mapped to the .github/workflows/ file whose job name produces it — in the same "
-            f"PR as the protection change."
+            f"not notice it being dropped. Add {context!r} to REQUIRED_CONTEXTS[{branch!r}] in "
+            f"the same PR as the protection change — mapped to the .github/workflows/ file "
+            f"whose job name produces it, or to an ApiPublishedContext(...) when it is a "
+            f"commit status posted over POST /repos/<repo>/statuses/<sha> and no workflow "
+            f"produces it. Do not resolve this by dropping the context from protection."
         )
 
     return findings
@@ -824,12 +912,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"::error::{finding}")
         return EXIT_FINDING
 
-    print(
-        f"OK: all {len(asserted)} asserted contexts are required on {args.branch}, their "
-        f"context strings match their job names, every one of them is reachable by a "
-        f"trigger that fires for PRs into {args.branch}, and {args.branch} requires "
-        f"nothing this script does not assert."
+    api_published = sorted(
+        (
+            (context, source)
+            for context, source in asserted.items()
+            if isinstance(source, ApiPublishedContext)
+        ),
+        key=lambda item: item[0],
     )
+    print(
+        f"OK: all {len(asserted)} asserted contexts are required on {args.branch}, the "
+        f"{len(asserted) - len(api_published)} produced by a workflow match their job names "
+        f"and are reachable by a trigger that fires for PRs into {args.branch}, and "
+        f"{args.branch} requires nothing this script does not assert."
+    )
+    # Never silently: a reader must be able to tell which contexts the job-name
+    # and reachability assertions did not cover, and why.
+    for context, source in api_published:
+        print(
+            f"  note: {context!r} is asserted as required only — {source.reason}. "
+            f"Published by {source.publisher} over {source.endpoint}."
+        )
     return EXIT_OK
 
 

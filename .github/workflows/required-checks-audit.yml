@@ -1,11 +1,15 @@
 name: Required Checks Audit
 
 # Asserts that a protected branch's protection still REQUIRES every context the
-# path through it depends on — today `lint + tests` and `frontend lint` on both
-# `dev` and `main` — that those context strings still match the job names that
-# produce them, and that each of those jobs can actually be started by an event
-# on a PR into that branch. The authoritative lists, the rationale and the exit
-# codes all live in scripts/assert_required_checks.py (JEB-1523).
+# path through it depends on, that those context strings still match the job
+# names that produce them, and that each of those jobs can actually be started
+# by an event on a PR into that branch. The per-branch lists are deliberately
+# not restated here — they drift; the authoritative lists (REQUIRED_CONTEXTS),
+# the rationale and the exit codes all live in
+# scripts/assert_required_checks.py (JEB-1523). A context with no workflow
+# behind it — `gates recorded` on `dev`, a commit status hand-published over the
+# statuses API — is asserted as required only, and the script says so in its
+# output (JEB-1598).
 #
 # Why a scheduled workflow and not only a PR check: the required-check list
 # lives on GitHub, not in the diff, so it can drift with no commit to hang a PR
