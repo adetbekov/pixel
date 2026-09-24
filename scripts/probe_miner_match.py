@@ -126,7 +126,13 @@ def report_backtest(engine, active: list[Skill], candidate: Skill, cases: list[C
         print(f"    when={rule.when or '{}'} -> {[s['action'] for s in rule.actions]}")
 
     for case in cases:
-        outcome = route(engine, [*active, candidate], case.user_text, case.state)
+        # `use_examples=False`, exactly as the backtest routes: a candidate's
+        # `examples` *are* the cluster under test, so the router's step-0 lookup
+        # would answer every line below from the draft itself and print 1.00
+        # against a `match_rate` computed from the head (JEB-1548).
+        outcome = route(
+            engine, [*active, candidate], case.user_text, case.state, use_examples=False
+        )
         picked = outcome.skill_id if isinstance(outcome, RouterHit) else "miss"
         routed = picked == candidate.id
         got = sorted(action_set(outcome.raw_plan)) if isinstance(outcome, RouterHit) else []
