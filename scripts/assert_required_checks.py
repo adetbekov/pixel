@@ -197,12 +197,27 @@ REQUIRED_CONTEXTS = {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
         "image build": "ci.yml",
+        # Produced by the `live-contract-imports` job in ci.yml (JEB-1601, #63);
+        # required on both branches by JEB-1605. It belongs in the required list
+        # for the same reason the three above do and `Live Gemini Contract` and
+        # `Required Checks Audit` do not: those two read the outside world — the
+        # live model API and GitHub's own protection — and can go red for a
+        # reason that is not in the diff, so gating a merge on them would hand
+        # an outage a veto. This job is hermetic: it installs the extras the
+        # live-contract probe imports and resolves the import graph, with no key
+        # and no call to a model, so red means the diff broke an import.
+        "live gemini contract imports": "ci.yml",
         "main PRs must come from dev": "guard-main-head.yml",
     },
     "dev": {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
         "image build": "ci.yml",
+        # Same job, same rationale as the `main` entry above (JEB-1605): the
+        # `live-contract-imports` job in ci.yml, hermetic, so a red one is a
+        # real defect in the diff and worth a server-side gate. Every feature PR
+        # lands here, so this is the copy that does the day-to-day blocking.
+        "live gemini contract imports": "ci.yml",
         # Not a workflow job (JEB-1596): the PR auto-merge bot posts this as a
         # commit status via POST /repos/adetbekov/pixel/statuses/<sha> once
         # TechLead APPROVED and the qa_gate comment both match the current head
