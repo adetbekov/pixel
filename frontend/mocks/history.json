@@ -31,6 +31,17 @@
   },
   {
     "interaction_id": 63,
+    "user_text": "спой песню",
+    "reply": "Мой учитель сейчас недоступен — закончилась квота. Попробуй чуть позже",
+    "engine": "gemini",
+    "skill_id": null,
+    "confidence": 0.19,
+    "latency_ms": 420,
+    "feedback": null,
+    "teacher_unavailable": true
+  },
+  {
+    "interaction_id": 64,
     "user_text": "покрутись",
     "reply": "Кручусь!",
     "engine": "laya",

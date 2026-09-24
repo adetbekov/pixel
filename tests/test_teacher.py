@@ -16,6 +16,7 @@ from backend.actions import ACTIONS, MAX_SAY_LEN
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
 from backend.main import app
+from backend.miner.case import load_pool
 from backend.state import read_state
 from backend.teacher import FALLBACK_PLAN, QUOTA_PLAN, QUOTA_REPLY, GeminiTeacher
 from backend.teacher.client import (
@@ -323,6 +324,61 @@ async def test_a_non_quota_failure_keeps_its_retry(client, seeded, missing, teac
 
     assert len(gemini.calls) == 2
     assert body["reply"] == "Тада!"
+    assert body["teacher_unavailable"] is False, "a retried failure is not an outage"
+
+
+@pytest.mark.anyio
+async def test_a_quota_refusal_is_flagged_for_the_client(client, seeded, missing, teacher):
+    """The reply alone is not a contract — the UI needs a field it can branch on.
+
+    `engine` cannot carry it: it is the frozen stage-1 shape and a new value
+    there breaks every client that reads it. `teacher_log.error` cannot either —
+    it never leaves the server. Hence the added flag, default false, which an
+    old frontend simply ignores (JEB-1603).
+    """
+    teacher(quota_error())
+    quota = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert quota["teacher_unavailable"] is True
+    assert quota["engine"] == "gemini", "the frozen field keeps its frozen meaning"
+
+
+@pytest.mark.anyio
+async def test_an_ordinary_answer_is_not_flagged_unavailable(client, seeded, missing, teacher):
+    teacher(GOOD_PLAN)
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+    assert body["teacher_unavailable"] is False
+
+
+@pytest.mark.anyio
+async def test_a_quota_refusal_keeps_its_label_after_a_reload(client, seeded, missing, teacher):
+    """The flag goes through the database, or the reload relabels an outage.
+
+    `GET /api/history` is what redraws the chat after F5, and it reads rows, not
+    the `TeacherResult` that wrote them.
+    """
+    teacher(quota_error())
+    await client.post("/api/chat", json={"text": "покажи фокус"})
+    teacher(GOOD_PLAN)
+    await client.post("/api/chat", json={"text": "покажи другой фокус"})
+
+    history = (await client.get("/api/history")).json()
+
+    assert [item["teacher_unavailable"] for item in history] == [True, False]
+    assert history[0]["reply"] == QUOTA_REPLY
+
+
+@pytest.mark.anyio
+async def test_a_quota_refusal_never_reaches_the_mining_pool(
+    client, conn, seeded, missing, teacher
+):
+    """A billing outage is not an example of anything — it must not be learned."""
+    teacher(quota_error())
+    await client.post("/api/chat", json={"text": "покажи фокус"})
+
+    state = json.loads(teacher_rows(conn)[0]["state_json"])
+    assert state["error"], "the error field is what keeps the row out of the pool"
+    assert load_pool(conn) == []
 
 
 @pytest.mark.anyio

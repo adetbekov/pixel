@@ -31,6 +31,10 @@ REPLY_KEYS = {
     "skill_id",
     "confidence",
     "latency_ms",
+    # Only ever true on a router miss whose teacher hit the quota wall, but the
+    # key is on every reply: a field that comes and goes is not a frozen shape
+    # (JEB-1603).
+    "teacher_unavailable",
     "state",
 }
 

@@ -29,6 +29,7 @@
   --ink-ok:     #35c67a;
   --ink-accent: #57b3ff;
   --ink-bad:    #ff9a9a;
+  --ink-warn:   #e3b341;
 
   --r-panel: 18px;
   --r-input: 12px;
@@ -53,6 +54,7 @@
     --ink-ok:     #12673a;
     --ink-accent: #14559f;
     --ink-bad:    #a11d16;
+    --ink-warn:   #7a5200;
   }
 }
 
@@ -313,6 +315,10 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
 .badge-laya   { background: rgb(53 198 122 / .16); border-color: rgb(53 198 122 / .5); color: var(--ink-ok); }
 .badge-gemini { background: rgb(87 179 255 / .16); border-color: rgb(87 179 255 / .5); color: var(--ink-accent); }
 .badge-button { background: var(--surface-2); border-color: var(--line); color: var(--text-dim); }
+/* Учитель недоступен — предупреждение, а не ошибка приложения: отсюда жёлтый.
+   Текст берёт --ink-warn по той же причине, что и остальные плашки: --warn как
+   текст даёт на светлой теме 1.8:1. */
+.badge-unavailable { background: rgb(227 179 65 / .16); border-color: rgb(227 179 65 / .5); color: var(--ink-warn); }
 
 .vote { display: flex; gap: 4px; margin-left: auto; }
 .vote button {

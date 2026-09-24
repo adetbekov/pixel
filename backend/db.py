@@ -100,6 +100,15 @@ MIGRATIONS: dict[str, dict[str, str]] = {
     "skill_proposals": {
         "generalization": "REAL",
     },
+    # A router miss whose teacher was never reached — the Gemini quota wall —
+    # still logs `engine = 'gemini'`, because that is the frozen shape stage 1
+    # gave the response. Without this column the reload redraws that bubble as
+    # an ordinary Gemini answer and the user is back to "робот тупой" instead of
+    # "учитель недоступен" (JEB-1603). NULL on a row written before it existed,
+    # which reads as false and is true of every such row.
+    "interactions": {
+        "teacher_unavailable": "INTEGER",
+    },
 }
 
 lock = threading.Lock()

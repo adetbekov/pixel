@@ -115,6 +115,15 @@ invalid or carries a blank `reply` is retried once with the reason, and a second
 with a fixed fallback plan; a timeout or an API error does the same. The user never sees a
 traceback.
 
+**One error is not retried: `429 RESOURCE_EXHAUSTED`.** The retry cannot work — the API's own
+`retryDelay` is 5–54 s live and `TOTAL_DEADLINE_S` is 12 — and it spends a second unit of the very
+quota that just ran out, which halved the real daily ceiling (JEB-1600). A quota refusal also stops
+pretending to be a misunderstanding: it answers «закончилась квота, попробуй чуть позже» and carries
+`teacher_unavailable: true` on the reply and in `GET /api/history`, so the chat badge reads
+"Учитель недоступен" rather than "Gemini" (JEB-1603). `engine` stays `gemini` — the field is frozen
+and an old client keeps reading it. Like every other failure the row keeps its `error` in
+`teacher_log`, so the miner never learns from it.
+
 **The teacher improvises; it does not decline.** A pet with eight primitives can *act out* far more
 than it can do literally, and the prompt now says so: "покажи фокус" is a spin, a jump and a happy
 face. Before that rule, four of five phrasings of that command came back as "я не умею показывать

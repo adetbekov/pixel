@@ -19,6 +19,13 @@ const quickButtons = [...quickEl.querySelectorAll('button')];
 const ENGINE_LABELS = { laya: 'Laya', gemini: 'Gemini', button: 'Кнопка' };
 const ENGINE_CLASSES = { laya: 'badge-laya', gemini: 'badge-gemini', button: 'badge-button' };
 
+/* Учитель не ответил вовсе — сегодня это исчерпанная квота Gemini. `engine`
+   остаётся 'gemini' (форма ответа заморожена на этапе 1), поэтому метку
+   выбирает отдельный флаг `teacher_unavailable`: иначе исчерпанная квота
+   неотличима от «модель не поняла команду» (JEB-1603). */
+const UNAVAILABLE_LABEL = 'Учитель недоступен';
+const UNAVAILABLE_CLASS = 'badge-unavailable';
+
 /* ─── Индикаторы ────────────────────────────────────────────────────────── */
 
 function levelClass(value) {
@@ -58,8 +65,14 @@ function addMessage(kind, text) {
   return wrap;
 }
 
-function engineBadge(engine) {
+function engineBadge(engine, unavailable = false) {
   const badge = document.createElement('span');
+  if (unavailable) {
+    badge.className = `badge ${UNAVAILABLE_CLASS}`;
+    badge.textContent = UNAVAILABLE_LABEL;
+    badge.title = 'Квота учителя исчерпана — попробуйте позже';
+    return badge;
+  }
   const key = String(engine ?? '');
   badge.className = `badge ${ENGINE_CLASSES[key] ?? ''}`.trim();
   badge.textContent = ENGINE_LABELS[key] ?? (key || 'неизвестно');
@@ -105,7 +118,7 @@ function addReply(reply, vote = null) {
 
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.append(engineBadge(reply.engine));
+  meta.append(engineBadge(reply.engine, Boolean(reply.teacher_unavailable)));
 
   if (Number.isFinite(reply.latency_ms)) {
     const latency = document.createElement('span');

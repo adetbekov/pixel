@@ -154,6 +154,13 @@ class TeacherResult:
     declined (see :class:`backend.teacher.schema.TeacherPlan`). It changes
     nothing the user sees — a declined answer is still a plan and still a reply —
     and everything for the miner, which must not learn a refusal.
+
+    ``unavailable`` says the teacher was never reached at all — today only the
+    quota wall. Unlike ``error``, which never leaves the server, this one rides
+    out over the API: it is what lets the chat label the bubble "учитель
+    недоступен" instead of blaming the robot for not understanding (JEB-1603).
+    The reason stays in ``error``, and that is still what keeps the row out of
+    the mining pool.
     """
 
     raw_plan: list[dict[str, Any]]
@@ -161,6 +168,7 @@ class TeacherResult:
     raw_response: str
     error: str | None = None
     handled: bool = True
+    unavailable: bool = False
 
 
 def _fallback(reason: str, raw_response: str = "") -> TeacherResult:
@@ -181,6 +189,10 @@ def _quota_exhausted(reason: str) -> TeacherResult:
 
     `handled` is false for the same reason it is on `_fallback` — nothing was
     taught here, and the miner must never learn a billing outage as a skill.
+
+    `unavailable` is the same fact told to the *client*: `error` never leaves
+    the server, so without it the chat cannot tell an exhausted key from a
+    misunderstanding either (JEB-1603).
     """
     return TeacherResult(
         raw_plan=list(QUOTA_PLAN),
@@ -188,6 +200,7 @@ def _quota_exhausted(reason: str) -> TeacherResult:
         raw_response="",
         error=f"{QUOTA_ERROR}: {reason}",
         handled=False,
+        unavailable=True,
     )
 
 

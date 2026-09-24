@@ -91,6 +91,13 @@ class Reply(BaseModel):
     skill_id: str | None
     confidence: float | None
     latency_ms: int
+    #: The teacher could not be reached at all — today the Gemini quota wall.
+    #: `engine` stays `"gemini"` on purpose: it is the frozen shape a stage-1
+    #: client already reads, and a new value there would break it. This is an
+    #: added field with a default, so an old frontend simply ignores it and a
+    #: new one labels the bubble "учитель недоступен" instead of blaming the
+    #: robot for not understanding (JEB-1603).
+    teacher_unavailable: bool = False
     state: StateOut
 
 
@@ -147,6 +154,9 @@ class HistoryItem(BaseModel):
     confidence: float | None = None
     latency_ms: int = 0
     feedback: int | None = None
+    #: Same flag as on :class:`Reply`, so a reloaded chat redraws the bubble
+    #: with the same label it had live.
+    teacher_unavailable: bool = False
 
 
 class Proposal(BaseModel):
@@ -199,12 +209,13 @@ def _log_interaction(
     latency_ms: int,
     actions: list[Action],
     reply_text: str,
+    teacher_unavailable: bool = False,
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO interactions"
         " (ts, user_text, engine, skill_id, confidence, latency_ms, actions_json, reply_text,"
-        "  feedback)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        "  feedback, teacher_unavailable)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         (
             iso(utcnow()),
             user_text,
@@ -214,6 +225,7 @@ def _log_interaction(
             latency_ms,
             json.dumps([a.to_dict() for a in actions], ensure_ascii=False),
             reply_text,
+            int(teacher_unavailable),
         ),
     )
     conn.commit()
@@ -236,6 +248,7 @@ def execute_plan(
     skill_id: str | None = None,
     confidence: float | None = None,
     fallback_reply: str = "Готово!",
+    teacher_unavailable: bool = False,
     now: datetime | None = None,
 ) -> dict:
     """The single execution path: validate, apply, log, and shape a ``Reply``.
@@ -262,6 +275,7 @@ def execute_plan(
             latency_ms=latency_ms,
             actions=actions,
             reply_text=reply,
+            teacher_unavailable=teacher_unavailable,
         )
     return {
         "interaction_id": interaction_id,
@@ -271,6 +285,7 @@ def execute_plan(
         "skill_id": skill_id,
         "confidence": confidence,
         "latency_ms": latency_ms,
+        "teacher_unavailable": teacher_unavailable,
         "state": state.to_dict(),
     }
 
@@ -361,6 +376,7 @@ def post_chat(payload: ChatIn) -> dict:
         started=started,
         confidence=outcome.confidence,
         fallback_reply=result.reply,
+        teacher_unavailable=result.unavailable,
         now=now,
     )
 
@@ -423,7 +439,7 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
     with db.lock:
         rows = conn.execute(
             "SELECT id, user_text, reply_text, engine, skill_id, confidence, latency_ms,"
-            " feedback FROM interactions ORDER BY id DESC LIMIT ?",
+            " feedback, teacher_unavailable FROM interactions ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [
@@ -436,6 +452,9 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
             "confidence": row["confidence"],
             "latency_ms": row["latency_ms"],
             "feedback": row["feedback"],
+            # NULL on a row written before the column existed — an old row was
+            # never a quota refusal anyway, so `False` is the honest reading.
+            "teacher_unavailable": bool(row["teacher_unavailable"]),
         }
         for row in reversed(rows)
     ]
