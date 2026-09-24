@@ -1,33 +1,45 @@
 """Grouping the misses: which commands are asking for the same thing.
 
-Single-link agglomerative clustering on cosine similarity. "Single-link above a
-threshold" is exactly "connected components of the graph where an edge means
-``cos >= MINER_SIM``", so that is how it is computed — a union-find over an
-``n x n`` matrix. The pool is tens of rows; O(n^2) is the cheap option here, and
-sklearn is a very large dependency for thirty lines of numpy.
+**One Gemini call is the primary path, and the local vectors are the fallback.**
+That is the opposite of how this module started, and it is the measured answer,
+not a preference. Both groupers were scored on the same probe and the same
+simulated pools (`scripts/calibrate_miner_sim.py`, section 5):
 
-Threshold. 0.88, and ``MINER_SIM`` overrides it. The number is measured against
-the real ``multilingual`` vectors, by ``scripts/calibrate_miner_sim.py``
-(JEB-1509) — run it before changing it. Mean-pooled encoder states are
-anisotropic: every cosine comes out high, and on that script's probe of Russian
-commands the across-intent spread (median 0.685, p90 0.793, max 0.887) runs
-straight through the within-intent one (min 0.511, median 0.830). Only a narrow
-band at the top tells the two apart. Over simulated pools 0.75 got 999 of every
-1000 mineable clusters mixed and still spent a Gemini call per run; 0.88 is the
-lowest value at which no mixed cluster survived; past ~0.91 nothing reaches
-``MINER_MIN_CLUSTER`` at all. What the high bar costs is recall: about a third
-of repeated intents group, and they are the near-identical phrasings — "спой
-песню" and "давай ты споёшь" sit at 0.714 and do not reach it. That is a limit
-of these vectors, not of the threshold.
+    grouper                      purity  recall  clusters/run
+    Laya cosine, single-link      1.000   0.322     0.79
+    one Gemini `group` call       0.875   0.808     2.00
 
-Centering the pool before the cosine (the usual anisotropy fix) was measured
-too and is not used: it separates a large mixed probe better, and it shatters a
-small pool that is genuinely all one intent, because there the pool mean *is*
-the intent. That is the case the miner exists for.
+The cosine path is pure only because it is nearly a duplicate detector: it finds
+a third of the repeated intents in the pool, and the ones it finds are the
+near-identical phrasings. Two and a half times the recall is worth 0.875 purity
+here, because an impure cluster is not a shipped skill — it still has to survive
+``backend/miner/backtest.py``, which is where it dies. A missed cluster is
+simply never learned, and "share of commands handled without Gemini" is the
+metric the whole project is measured on.
 
-Fallback. Without sentence vectors the commands are grouped by one Gemini call
-instead. It exists so a missing ``embed_fn_from_agent`` degrades instead of
-stopping the pipeline — it is not the default path, and it is not free.
+What it costs: one extra ``models.generate_content`` on flash-lite per mining
+run — not per cluster — measured at ~0.9 s. The run already spends one of those
+per proposal.
+
+Why the cosine cannot carry it (JEB-1548, live ``multilingual`` checkpoint). Its
+similarity ranges overlap, so no threshold separates them at any linkage. On the
+worked example the *smallest* same-intent pair, "фокус покажи" / "а фокус
+умеешь?", sits at 0.76, while "расскажи про квантовую физику" / "а фокус
+умеешь?" — different topics entirely — sits at 0.85. Mean-pooled encoder states
+are anisotropic; removing a reference corpus mean, whitening, average- and
+complete-link and mutual-kNN were all measured and none of them opened a gap.
+
+So the fallback keeps the threshold that is at least *safe*: 0.88, overridable
+with ``MINER_SIM``, is the lowest value at which no mixed cluster survived on
+that probe, and past ~0.91 nothing reaches ``MINER_MIN_CLUSTER`` at all.
+Centering the pool before the cosine is the usual anisotropy fix and is not
+used: it shatters a small pool that is genuinely all one intent, because there
+the pool mean *is* the intent — the case the miner exists for.
+
+Single-link on a threshold is exactly "connected components of the graph where
+an edge means ``cos >= MINER_SIM``", so that is how it is computed — a union-find
+over an ``n x n`` matrix. The pool is tens of rows; O(n^2) is the cheap option
+here, and sklearn is a very large dependency for thirty lines of numpy.
 """
 
 from __future__ import annotations
@@ -96,25 +108,39 @@ def cosine_matrix(vectors: list[list[float]]) -> np.ndarray:
 def group_texts(
     engine: DecisionEngine, texts: list[str], grouper: Grouper | None = None
 ) -> list[list[int]]:
-    """Group commands into clusters of indices into ``texts``."""
+    """Group commands into clusters of indices into ``texts``.
+
+    The teacher groups; the local vectors only take over when it cannot. An
+    empty answer counts as "cannot": ``SkillGenerator.group`` swallows its own
+    failures and returns ``[]``, and a run that mines nothing is the one outcome
+    worth spending the cheap fallback on.
+    """
     if len(texts) < 2:
         return [[0]] if texts else []
 
+    if grouper is not None:
+        groups = _validate_groups(grouper(texts), len(texts))
+        if groups:
+            return groups
+        log.warning("miner: the teacher grouped nothing — falling back to local vectors")
+
+    return _group_by_vectors(engine, texts)
+
+
+def _group_by_vectors(engine: DecisionEngine, texts: list[str]) -> list[list[int]]:
+    """Single-link over ``MINER_SIM``, or nothing if the encoder cannot embed."""
     try:
         vectors = engine.embed(texts)
     except Exception as exc:  # noqa: BLE001 — a broken encoder must not stop mining
         # Either the engine says it cannot embed (EmbeddingsUnavailable) or the
-        # encoder itself blew up. Both mean the same thing here: fall back.
-        log.warning("miner: no local embeddings (%r), grouping with the teacher instead", exc)
-        vectors = []
-
-    if len(vectors) == len(texts) and all(vectors):
-        return components(cosine_matrix(vectors), sim_threshold())
-
-    if grouper is None:
-        log.warning("miner: no embeddings and no fallback grouper — nothing to cluster")
+        # encoder itself blew up. Both mean the same thing here: no clustering.
+        log.warning("miner: no local embeddings either (%r) — nothing to cluster", exc)
         return []
-    return _validate_groups(grouper(texts), len(texts))
+
+    if len(vectors) != len(texts) or not all(vectors):
+        log.warning("miner: the encoder returned no usable vectors — nothing to cluster")
+        return []
+    return components(cosine_matrix(vectors), sim_threshold())
 
 
 def _validate_groups(groups: list[list[int]], size: int) -> list[list[int]]:

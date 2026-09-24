@@ -106,6 +106,101 @@ def test_a_raising_call_is_a_finding_naming_the_exception():
     assert "TimeoutError: deadline exceeded" in finding
 
 
+def quota_error():
+    """The exact refusal the free tier answers with once the day is spent."""
+    errors = pytest.importorskip("google.genai.errors")
+    return errors.ClientError(
+        429,
+        {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "message": (
+                    "Quota exceeded for metric: generativelanguage.googleapis.com/"
+                    "generate_content_free_tier_requests, limit: 20"
+                ),
+            }
+        },
+    )
+
+
+def raising_probe(exc: BaseException, calls: list[int] | None = None) -> contract.Probe:
+    def boom():
+        if calls is not None:
+            calls.append(1)
+        raise exc
+
+    return contract.Probe(
+        name="GeminiTeacher._call",
+        call=boom,
+        shape_of=contract.GeminiTeacher._call,
+        parse=contract.TeacherPlan.model_validate_json,
+    )
+
+
+def test_an_exhausted_quota_is_not_a_contract_finding():
+    """The free-tier day is 20 calls and the live stand spends from the same
+    twenty (JEB-1553), so a refused night is routine. Reported as a finding it
+    opens an issue saying the answer no longer parses — when no answer came."""
+    with pytest.raises(contract.ProbeUnavailable) as raised:
+        contract.run(raising_probe(quota_error()))
+
+    assert "429" in str(raised.value)
+    assert "RESOURCE_EXHAUSTED" in str(raised.value)
+    assert "GeminiTeacher._call" in str(raised.value)
+
+
+def test_a_quota_refusal_is_not_retried():
+    """The window is a day, not a minute — measured. A second call buys nothing
+    and the first one already proved the day is spent."""
+    calls: list[int] = []
+    with pytest.raises(contract.ProbeUnavailable):
+        contract.run(raising_probe(quota_error(), calls))
+
+    assert len(calls) == 1
+
+
+def test_an_api_error_that_is_not_quota_stays_a_finding():
+    """Only the quota refusal is exempt: a 500 or a 400 on the shape we call is
+    still the call failing, and the gate must keep saying so."""
+    errors = pytest.importorskip("google.genai.errors")
+    server_error = errors.ServerError(500, {"error": {"code": 500, "status": "INTERNAL"}})
+
+    finding = contract.run(raising_probe(server_error))
+
+    assert finding is not None
+    assert "ServerError" in finding
+
+
+def test_an_unreachable_model_exits_two_and_a_finding_still_wins(monkeypatch, capsys):
+    """Two shapes, two verdicts. Nothing checked is exit 2; one shape proving the
+    contract broke is worth alerting on even when the other never ran."""
+    monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
+    pytest.importorskip("google.genai")
+
+    monkeypatch.setattr(contract, "PROBES", (raising_probe(quota_error()),))
+    assert contract.main() == 2
+    err = capsys.readouterr().err
+    assert "not a pass and not a finding" in err
+    assert "RESOURCE_EXHAUSTED" in err
+
+    monkeypatch.setattr(contract, "PROBES", (raising_probe(quota_error()), probe(FENCED_PLAN)))
+    assert contract.main() == 1
+
+
+def test_the_exit_two_alert_names_the_quota_as_a_cause():
+    """The probe now exits 2 on a refused day, so the issue that exit opens has to
+    say so. Without it the reader is sent to debug a missing key or a broken
+    install for the one cause that is neither — and is the expected one."""
+    workflow = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
+    # The `2)` arm of the `case` that builds the alert, up to the next arm.
+    branch = workflow.split("\n            2)\n", 1)[1].split("\n            *)\n", 1)[0]
+
+    assert "429" in branch
+    assert "RESOURCE_EXHAUSTED" in branch
+    assert "free tier" in branch
+
+
 def test_the_reported_shape_is_read_from_the_source_not_hardcoded():
     """The failure message names the call shape so a reader knows what was
     probed. Hard-coding it would go stale in the very commit that changes the

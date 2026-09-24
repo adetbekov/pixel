@@ -91,19 +91,32 @@ def test_hash_vectors_never_reach_the_threshold():
     assert off_diagonal.max() < 0.75
 
 
-def test_without_embeddings_the_teacher_groups_instead():
-    class NoEmbeddings(FakeEngine):
-        def embed(self, texts):
-            raise EmbeddingsUnavailable("laya has no embed_fn_from_agent")
-
+def test_the_teacher_groups_and_the_vectors_are_never_touched():
+    """JEB-1548 inverted this: the teacher is the primary grouper, not the plan B."""
+    engine = FakeEngine(embeddings=TRICK_EMBEDDINGS)
     calls = []
 
     def grouper(texts):
         calls.append(texts)
         return [[0, 1], [2]]
 
-    assert group_texts(NoEmbeddings(), ["a", "b", "c"], grouper) == [[0, 1], [2]]
+    assert group_texts(engine, ["a", "b", "c"], grouper) == [[0, 1], [2]]
     assert calls == [["a", "b", "c"]]
+    assert engine.embedded == []
+
+
+def test_a_teacher_that_grouped_nothing_falls_back_to_the_vectors(trick_engine):
+    """`SkillGenerator.group` swallows its own failures and answers `[]`."""
+    assert group_texts(trick_engine, TRICK_COMMANDS, lambda texts: []) == [[0, 1, 2, 3, 4]]
+    assert trick_engine.embedded == [TRICK_COMMANDS]
+
+
+def test_neither_grouper_leaves_the_pool_alone():
+    class NoEmbeddings(FakeEngine):
+        def embed(self, texts):
+            raise EmbeddingsUnavailable("laya has no embed_fn_from_agent")
+
+    assert group_texts(NoEmbeddings(), ["a", "b", "c"], lambda texts: []) == []
 
 
 def test_a_grouping_from_a_model_is_not_trusted():
@@ -117,7 +130,7 @@ def test_a_grouping_from_a_model_is_not_trusted():
     assert group_texts(engine, ["a", "b", "c"], grouper) == [[0, 1], [2]]
 
 
-def test_no_embeddings_and_no_grouper_clusters_nothing():
+def test_no_grouper_and_no_embeddings_clusters_nothing():
     engine = FakeEngine()
     engine.embed = lambda texts: []
     assert group_texts(engine, ["a", "b", "c"]) == []
