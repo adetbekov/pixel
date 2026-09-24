@@ -26,12 +26,12 @@ services:
       GEMINI_MINER_MODEL: ${GEMINI_MINER_MODEL:-models/gemini-2.5-flash-lite}
       LAYA_MODEL: ${LAYA_MODEL:-multilingual}
       LAYA_DEVICE: ${LAYA_DEVICE:-cpu}
-      ROUTER_THRESHOLD: ${ROUTER_THRESHOLD:-0.6}
+      ROUTER_THRESHOLD: ${ROUTER_THRESHOLD:-0.66}
       # 1 = start without Laya (~2 s, /api/chat answers 503). Useful to split a
       # network problem from a weights problem; leave at 0 in normal operation.
       PIXEL_SKIP_MODEL: ${PIXEL_SKIP_MODEL:-0}
       MINER_BATCH: ${MINER_BATCH:-5}
-      MINER_SIM: ${MINER_SIM:-0.75}
+      MINER_SIM: ${MINER_SIM:-0.88}
       MINER_MIN_CLUSTER: ${MINER_MIN_CLUSTER:-3}
       MINER_MIN_MATCH: ${MINER_MIN_MATCH:-0.8}
     volumes:
