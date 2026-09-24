@@ -1,0 +1,108 @@
+name: Gate lock
+
+# Branch protection on `dev` gates on CI but requires ZERO approving reviews, so
+# any holder of the shared studio PAT can merge the instant the last check turns
+# green. On `adetbekov/pixel#3` (JEB-1498) that happened 3 seconds after CI went
+# green — before the `check_suite.completed` handler that dispatches the static
+# gate had finished reading the PR state. The review dispatch lost a race it had
+# no way to win, so no TechLead verdict and no `qa_gate_pixel_3` pair were ever
+# recorded. The `Un-gated dev Merge Detector` found 18 more in `pixel` in the
+# same 2-day window (JEB-1571).
+#
+# Raising `required_approving_review_count` is NOT the fix: the studio submits no
+# GitHub PR reviews at all, so every PR would block forever and the
+# `PR Auto-Merge Bot` would deadlock. Restricting merge by actor does not
+# discriminate either — every agent and the human owner share one PAT.
+#
+# This job holds a required status context `gates recorded` PENDING from the
+# moment the PR is opened until a gate receipt for THIS head SHA appears as a
+# comment on the PR. While it is pending GitHub refuses the merge for everyone,
+# `enforce_admins: true` included. The race window is therefore closed at its
+# source: there is no instant at which the PR is mergeable but un-gated.
+#
+# The receipt is posted by the `Gate Receipt Publisher` autopilot once it has
+# verified, in Multica, that the head carries a canonical TechLead verdict and a
+# matching `qa_gate_<REPO>_<PRNUM>` / `qa_gate_sha_<REPO>_<PRNUM>` pair. CI
+# cannot read Multica itself — the `multica` CLI has no token-minting command, so
+# the only credential that exists is the workspace owner's full-access token and
+# this repo is public (JEB-1571). Hence the receipt indirection.
+
+# `pull_request_target` only, on purpose — same reasoning as guard-main-head.yml
+# (JEB-1368). GitHub reads `pull_request` from the PR head and
+# `pull_request_target` from the base branch. Under `pull_request` the head could
+# rewrite this job to `exit 0`, keep the name, and report the required context
+# green on a PR that was never gated. Reading the base copy closes that.
+#
+# Safe under `pull_request_target` only because this job checks nothing out and
+# runs no head-controlled code — never add a checkout step below.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    branches: [dev]
+
+# Read-only. The job reads PR comments and nothing else; it writes nothing.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+# A new head supersedes the poller waiting on the old one. The cancelled run
+# reports against the superseded SHA, which is no longer the head, so branch
+# protection is unaffected.
+concurrency:
+  group: gate-lock-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gates-recorded:
+    # This string IS the required status context. Renaming the job renames the
+    # context and silently un-protects `dev` — keep it in sync with
+    # `required_status_checks.contexts` on the `dev` branch.
+    name: gates recorded
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Wait for the gate receipt on this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+
+          # The `main -> dev` back-merge is the release-manager's own merge
+          # (jeb-release) and carries no feature gates by construction. Exempt it
+          # explicitly rather than leaving it to deadlock. Every other head is
+          # subject to the lock.
+          if [ "$HEAD_REF" = "main" ]; then
+            echo "back-merge main -> dev: exempt from the gate lock (jeb-release)."
+            exit 0
+          fi
+
+          MARKER="<!-- multica-gate-receipt sha=${HEAD_SHA} -->"
+          echo "Waiting for a gate receipt carrying: ${MARKER}"
+          echo "Poster: the 'Gate Receipt Publisher' autopilot, after it verifies"
+          echo "the TechLead verdict + qa_gate pair for this head in Multica."
+
+          DEADLINE=$(( $(date +%s) + 44 * 60 ))
+          while :; do
+            # Collect first, match second. `gh ... | grep -q` would close the
+            # pipe on the first hit, kill `gh` with SIGPIPE, and — under
+            # `pipefail` — turn a FOUND receipt into a false negative that loops
+            # until the deadline.
+            BODIES="$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+                        --jq '.[].body' || true)"
+            # Exact substring match on the full 40-char head SHA. A receipt for a
+            # superseded head does not release this one.
+            if printf '%s' "$BODIES" | grep -qF "$MARKER"; then
+              echo "Gate receipt found for ${HEAD_SHA}."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::No gate receipt for head ${HEAD_SHA} after 44 minutes. This PR has no recorded TechLead verdict / qa_gate pair for this head, so it must not merge into dev. See JEB-1571."
+              exit 1
+            fi
+            sleep 20
+          done
