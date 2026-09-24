@@ -8,6 +8,8 @@ which is the only input stage 4's skill miner has.
 
 from .client import (
     FALLBACK_PLAN,
+    QUOTA_PLAN,
+    QUOTA_REPLY,
     GeminiTeacher,
     Teacher,
     TeacherResult,
@@ -19,6 +21,8 @@ from .log import log_case
 
 __all__ = [
     "FALLBACK_PLAN",
+    "QUOTA_PLAN",
+    "QUOTA_REPLY",
     "GeminiTeacher",
     "Teacher",
     "TeacherResult",
