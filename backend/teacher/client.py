@@ -5,6 +5,10 @@ The contract this module keeps with the rest of the app: :meth:`Teacher.explain`
 a hallucinated primitive, unparsable JSON — none of them reach the caller as an
 exception, and none of them show the user a traceback. The worst case is
 :data:`FALLBACK_PLAN` plus a reason recorded in ``teacher_log``.
+
+The one failure that gets its own worst case is a 429: it is not the robot
+failing to understand, it is the robot having no teacher to ask, so it answers
+with :data:`QUOTA_PLAN` and stops retrying. See :func:`_is_quota_error`.
 """
 
 from __future__ import annotations
@@ -91,6 +95,73 @@ FALLBACK_PLAN: list[dict[str, Any]] = [
     {"action": "say", "args": {"text": FALLBACK_REPLY}},
 ]
 
+#: "The teacher is out of quota" is not "the teacher did not understand you".
+#:
+#: Measured on the stand on 2026-09-24 (JEB-1600): 15 of 28 `teacher_log` rows
+#: were `429 RESOURCE_EXHAUSTED`, every one of them shown to the user as
+#: :data:`FALLBACK_REPLY` — so a billing problem read as Pixel being stupid, and
+#: "teach me another way" invited a retry that could not possibly work. A
+#: separate reply and a separate face is the whole difference.
+QUOTA_REPLY = "Мой учитель сейчас недоступен — закончилась квота. Попробуй чуть позже"
+
+#: `sad`, and deliberately not `sleepy`: `sleepy` is already what a low-energy
+#: robot wears (`TIRED_PLAN` in `backend/api.py`, and the stand showed that face
+#: at `energy 85`), so reusing it would re-merge quota with tiredness on the very
+#: channel this change exists to separate.
+QUOTA_PLAN: list[dict[str, Any]] = [
+    {"action": "set_face", "args": {"face": "sad"}},
+    {"action": "say", "args": {"text": QUOTA_REPLY}},
+]
+
+#: The machine-readable half of the same fact, carried to the UI on `Reply` and
+#: `HistoryItem` as `teacher_status`. The reply text is for the human and is
+#: free to be rewritten or localised; a client that has to branch — a different
+#: badge, a hint about billing — reads this instead. Matching on `QUOTA_REPLY`
+#: would work today and break silently on the first copy edit.
+QUOTA_STATUS = "quota_exhausted"
+
+#: What `teacher_log.state_json.error` starts with when the cause was quota, so
+#: the rows are greppable without re-parsing whichever SDK's message shape wrote
+#: them. The pool excludes them either way — any `error` keeps a row out.
+QUOTA_ERROR = "teacher unavailable: API quota exhausted"
+
+#: Substrings that mean "rate limited", across both client libraries that have
+#: written into this log. google-genai raises `ClientError: 429
+#: RESOURCE_EXHAUSTED`; the openai-compatible client this used to run on raised
+#: `RateLimitError: Error code: 429`. Matched on the message because neither
+#: exception type is importable here — the SDK stays off a key-less app's import
+#: path, and the old one is not in the tree at all.
+#:
+#: `TOO MANY REQUESTS` is the third shape and the only one nothing in the tree
+#: raises today: `httpx.HTTPStatusError` renders a 429 as `Client error '429 Too
+#: Many Requests' for url ...` and names no quota at all, so without this marker
+#: the match below would see the `429` and still answer `False`.
+_QUOTA_MARKERS = (
+    "RESOURCE_EXHAUSTED",
+    "RATELIMITERROR",
+    "RATE LIMIT",
+    "QUOTA",
+    "TOO MANY REQUESTS",
+)
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Is this a 429 — i.e. an error that waiting out costs more than we have?
+
+    A 429 does not become a 200 in the 250 ms the retry loop used to take, and
+    Google says so in the response itself: the `RetryInfo.retryDelay` observed on
+    the stand ran 5-54 s against a `TOTAL_DEADLINE_S` of 12. So the retry could
+    never land — it only ever burned a second unit of a 20/day quota, halving the
+    number of commands the user actually gets.
+
+    `code` is google-genai's own HTTP status attribute; the message match is for
+    every other shape, including the plain `httpx` one.
+    """
+    if getattr(exc, "code", None) == 429 or getattr(exc, "status_code", None) == 429:
+        return True
+    text = f"{type(exc).__name__}: {exc}".upper()
+    return "429" in text and any(marker in text for marker in _QUOTA_MARKERS)
+
 
 @dataclass(frozen=True)
 class TeacherResult:
@@ -105,6 +176,11 @@ class TeacherResult:
     declined (see :class:`backend.teacher.schema.TeacherPlan`). It changes
     nothing the user sees — a declined answer is still a plan and still a reply —
     and everything for the miner, which must not learn a refusal.
+
+    ``teacher_status`` is the opposite: it changes nothing the miner sees and
+    exists for the UI. ``None`` on every ordinary answer, :data:`QUOTA_STATUS`
+    when the teacher could not be reached at all, and it travels out over the
+    API on ``Reply`` and ``HistoryItem``.
     """
 
     raw_plan: list[dict[str, Any]]
@@ -112,6 +188,7 @@ class TeacherResult:
     raw_response: str
     error: str | None = None
     handled: bool = True
+    teacher_status: str | None = None
 
 
 def _fallback(reason: str, raw_response: str = "") -> TeacherResult:
@@ -124,6 +201,22 @@ def _fallback(reason: str, raw_response: str = "") -> TeacherResult:
         # already keeps it out of the mining pool; saying so twice costs nothing
         # and means the two flags can never disagree about the same row.
         handled=False,
+    )
+
+
+def _quota_exhausted(reason: str) -> TeacherResult:
+    """The fallback's quota-shaped sibling: a different face and a different line.
+
+    `handled` is false for the same reason it is on `_fallback` — nothing was
+    taught here, and the miner must never learn a billing outage as a skill.
+    """
+    return TeacherResult(
+        raw_plan=list(QUOTA_PLAN),
+        reply=QUOTA_REPLY,
+        raw_response="",
+        error=f"{QUOTA_ERROR}: {reason}",
+        handled=False,
+        teacher_status=QUOTA_STATUS,
     )
 
 
@@ -247,6 +340,12 @@ class GeminiTeacher:
             except Exception as exc:  # noqa: BLE001 — a 500 must not reach the user
                 last_reason = f"{type(exc).__name__}: {exc}"
                 log.warning("teacher call failed (attempt %d): %s", attempt + 1, last_reason)
+                # A 429 is the one failure the retry cannot help with: the API
+                # names a retryDelay longer than TOTAL_DEADLINE_S, so the second
+                # call is guaranteed to fail *and* costs another unit of the
+                # daily quota. Stop here and say why. See `_is_quota_error`.
+                if _is_quota_error(exc):
+                    return _quota_exhausted(last_reason)
                 continue
 
             result, last_reason = _parse(last_raw)

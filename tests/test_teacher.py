@@ -8,20 +8,29 @@ the caller gets a plan made of library actions and the case lands in
 
 import inspect
 import json
+import sqlite3
 
 import httpx
 import pytest
 
+from backend import db
 from backend.actions import ACTIONS, MAX_SAY_LEN
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
 from backend.main import app
 from backend.state import read_state
-from backend.teacher import FALLBACK_PLAN, GeminiTeacher
+from backend.teacher import (
+    FALLBACK_PLAN,
+    QUOTA_PLAN,
+    QUOTA_REPLY,
+    QUOTA_STATUS,
+    GeminiTeacher,
+)
 from backend.teacher.client import (
     DEFAULT_MODEL,
     FALLBACK_REPLY,
     MIN_SERVER_DEADLINE_S,
+    QUOTA_ERROR,
     TIMEOUT_S,
     TOTAL_DEADLINE_S,
 )
@@ -189,6 +198,207 @@ async def test_a_timeout_falls_back_without_a_traceback(client, conn, seeded, mi
     assert body["latency_ms"] >= 0
     assert len(gemini.calls) == 2, "a network failure gets one retry"
     assert "TimeoutException" in json.loads(teacher_rows(conn)[0]["state_json"])["error"]
+
+
+#: The `retryDelay` Google actually sent on the stand — nearly three times
+#: `TOTAL_DEADLINE_S`, which is what makes the retry unwinnable by construction.
+QUOTA_RETRY_DELAY_S = 32
+
+#: Verbatim from the stand on 2026-09-24 (JEB-1600, container `7d2e195585cf`),
+#: trimmed to the fields the classifier can see.
+QUOTA_RESPONSE = {
+    "error": {
+        "code": 429,
+        "message": (
+            "You exceeded your current quota, please check your plan and billing details. "
+            "* Quota exceeded for metric: "
+            "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+            "limit: 20, model: gemini-2.5-flash-lite\n"
+            f"Please retry in {QUOTA_RETRY_DELAY_S}.769315624s."
+        ),
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [
+                    {
+                        "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                        "quotaValue": "20",
+                    }
+                ],
+            },
+            {
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": f"{QUOTA_RETRY_DELAY_S}s",
+            },
+        ],
+    }
+}
+
+
+def quota_error():
+    """The real `google.genai` exception, not a stand-in for it.
+
+    The classifier reads `code` and the rendered message, and both are the SDK's
+    to shape — a hand-rolled double could keep passing through a rename that
+    breaks the live path. The SDK is a hard dependency of the image, so importing
+    it here costs a test run nothing.
+    """
+    from google.genai import errors
+
+    return errors.ClientError(429, QUOTA_RESPONSE)
+
+
+@pytest.mark.anyio
+async def test_a_429_is_not_retried_and_says_so(client, conn, seeded, missing, teacher):
+    """Branch 1 of JEB-1600: quota, and the one failure a retry cannot help with.
+
+    The API names a `retryDelay` of 32 s inside the very response that failed,
+    against a 12 s `TOTAL_DEADLINE_S` — so the second call could not land even
+    with a perfect backoff, and the old `continue` fired it 247 ms later. It
+    always failed, and it always cost a second unit of a 20-per-day quota, which
+    is what halved the number of commands the stand could serve.
+    """
+    error = quota_error()
+    assert QUOTA_RETRY_DELAY_S > TOTAL_DEADLINE_S, "otherwise waiting it out would be an option"
+    gemini = teacher(error)
+
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert len(gemini.calls) == 1, "a 429 must never spend a second unit of quota"
+    assert body["reply"] == QUOTA_REPLY
+    assert [a["action"] for a in body["actions"]] == [s["action"] for s in QUOTA_PLAN]
+
+    state = json.loads(teacher_rows(conn)[0]["state_json"])
+    assert state["error"].startswith(QUOTA_ERROR)
+    assert "RESOURCE_EXHAUSTED" in state["error"], "the operator gets the cause, not a paraphrase"
+    assert state["handled"] is False, "an outage is not something the miner may learn"
+
+
+@pytest.mark.anyio
+async def test_a_quota_outage_is_flagged_for_the_client_not_just_worded_differently(
+    client, conn, seeded, missing, teacher
+):
+    """The reply is for the human; `teacher_status` is what a client branches on.
+
+    Matching `reply` against `QUOTA_REPLY` would work today and break on the
+    first copy edit or the first locale — silently, since both strings are still
+    perfectly valid replies. So the UI gets a flag: `"quota_exhausted"` here,
+    `None` on every ordinary answer, additive so a client that predates it is
+    unaffected. `engine` stays `gemini` — the miss was routed to the teacher and
+    the metrics count it there; it says who was *asked*, not who answered.
+    """
+    teacher(quota_error())
+    quota = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert quota["teacher_status"] == QUOTA_STATUS
+    assert quota["engine"] == "gemini", "it is still the teacher's turn that failed"
+    assert quota["reply"] != FALLBACK_REPLY
+    assert quota["actions"] != FALLBACK_PLAN
+    # `sleepy` is the low-energy face (`TIRED_PLAN`), and reusing it would merge
+    # quota with tiredness on the channel this change exists to separate.
+    assert quota["state"]["face"] == "sad"
+
+    # And it survives a reload, or the bubble silently downgrades to a plain
+    # Gemini answer the moment the page is refreshed.
+    history = (await client.get("/api/history")).json()
+    assert history[-1]["teacher_status"] == QUOTA_STATUS
+
+
+@pytest.mark.anyio
+async def test_an_ordinary_answer_carries_no_status(client, seeded, missing, teacher):
+    """The other half of the flag: it is `None` unless something went wrong.
+
+    Without this the field could be a constant and every test above would still
+    pass, while the UI drew a quota badge on every Gemini reply.
+    """
+    teacher(GOOD_PLAN)
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+    assert body["teacher_status"] is None
+    assert (await client.get("/api/history")).json()[-1]["teacher_status"] is None
+
+
+@pytest.mark.anyio
+async def test_an_ordinary_fallback_carries_no_status_either(client, seeded, missing, teacher):
+    """"Did not understand" is not an outage — `FALLBACK_PLAN` keeps a null flag."""
+    teacher(HACKED_PLAN)
+    body = (await client.post("/api/chat", json={"text": "взломай насу"})).json()
+    assert body["reply"] == FALLBACK_REPLY
+    assert body["teacher_status"] is None
+
+
+def test_an_old_database_gains_the_column_instead_of_breaking(tmp_path):
+    """The stand's `pixel.db` predates `teacher_status`, and is not thrown away.
+
+    `interactions` is in the frozen schema, so `CREATE TABLE IF NOT EXISTS` skips
+    the old table entirely and only `migrate()` can add the column — miss that
+    and `/api/history` is a 500 against every database that already has rows.
+    """
+    path = str(tmp_path / "legacy.db")
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE interactions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT,"
+        " user_text TEXT, engine TEXT, skill_id TEXT, confidence REAL, latency_ms INTEGER,"
+        " actions_json TEXT, reply_text TEXT, feedback INTEGER)"
+    )
+    legacy.execute(
+        "INSERT INTO interactions (ts, user_text, engine, latency_ms, actions_json, reply_text)"
+        " VALUES ('2026-09-24T20:53:27Z', 'сделай зарядку', 'gemini', 977, '[]', 'Я не понял')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = db.init(path)
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(interactions)")}
+        assert "teacher_status" in columns
+        # The pre-existing row keeps its data and reads back as "no status",
+        # which is what `/api/history` then serves for it.
+        row = conn.execute("SELECT * FROM interactions").fetchone()
+        assert row["user_text"] == "сделай зарядку"
+        assert row["teacher_status"] is None
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_the_older_rate_limit_shape_is_recognised_too(client, seeded, missing, teacher):
+    """`teacher_log` on the stand holds 8 rows from the openai-compatible client.
+
+    That client is gone from the tree, its rows are not: whichever SDK a future
+    deployment runs, a 429 is a 429, and the classifier matches on the message
+    rather than on an importable exception type.
+    """
+
+    class RateLimitError(Exception):
+        pass
+
+    gemini = teacher(
+        RateLimitError(
+            "Error code: 429 - {'error': {'message': 'Rate limit exceeded for model "
+            "gemini-2.5-flash-lite (limit: 20 requests per day on Free Tier). "
+            "Please retry in 29s'}}"
+        )
+    )
+
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert len(gemini.calls) == 1
+    assert body["reply"] == QUOTA_REPLY
+
+
+@pytest.mark.anyio
+async def test_a_non_quota_failure_keeps_its_retry(client, seeded, missing, teacher):
+    """The counterweight: only 429 loses the retry.
+
+    A 503 on this model is routine on bursts and a second call genuinely fixes
+    it, so classifying too broadly would trade one defect for another.
+    """
+    gemini = teacher(httpx.ConnectError("connection reset"), GOOD_PLAN)
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+
+    assert len(gemini.calls) == 2
+    assert body["reply"] == "Тада!"
 
 
 @pytest.mark.anyio
