@@ -8,12 +8,20 @@ manual ``POST /api/mine`` calls this directly, because it wants the count back.
 What a run costs, measured on the live checkpoint
 (``scripts/calibrate_miner_sim.py``, section 6): a run is roughly one teacher
 grouping call plus a few forward passes per cluster case and per active skill.
-It takes ``LayaEngine._lock`` once **per pass**, never for the series, so a chat
-that arrives mid-run waits for the forward pass in flight and not for the run:
-245 ms at p50 against a run of several seconds, measured on the live checkpoint
-(JEB-1599, ``scripts/bench_router_under_mining.py``). That is also why
-``MINER_POOL_WINDOW`` is not a latency knob — it decides how long a run lasts,
-not what one chat inside it pays.
+What a concurrent chat waits for depends on which part of the run holds the
+engine lock, and the two parts differ by 4x (JEB-1599,
+``scripts/bench_router_under_mining.py``, live checkpoint, window 40):
+
+* the **backtest** takes ``LayaEngine._lock`` once per forward pass and holds
+  it 260 ms at p50, so a chat that arrives here waits one pass, not the series;
+* the **grouping step**, when the teacher answers ``[]`` and
+  :func:`backend.miner.cluster.group_texts` falls back to local vectors, is one
+  ``engine.embed`` over the whole window under a single acquisition — held
+  1092 ms at p50 (572 ms at window 20). A chat that lands inside that waits all
+  of it, and the wait grows with ``MINER_POOL_WINDOW`` linearly.
+
+So the window is a latency knob on the fallback path and only a run-length knob
+on the teacher-grouped one.
 
 The one term that scales with the *pool* rather than the cluster is the
 backtest's over-broad check, and :func:`backend.miner.backtest.backtest`

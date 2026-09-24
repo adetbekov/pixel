@@ -109,11 +109,14 @@ def load_pool(conn: sqlite3.Connection, *, bounded: bool = True) -> list[Case]:
     ``LayaEngine._lock`` more times than the last one, and running it on a
     background thread hides that rather than fixing it.
 
-    What the window does **not** do is make a concurrent chat faster. The lock
-    is taken per forward pass, so that chat waits one pass whatever the window
-    is: pool 20 and pool 40 read the same p50/p95 band (JEB-1599,
-    ``scripts/bench_router_under_mining.py``). The window bounds how long a run
-    lasts — how much of the day a chat can land inside one — not the wait.
+    It is also the bound on the worst wait a concurrent chat can take, and that
+    is this fallback path specifically: ``engine.embed`` takes the engine lock
+    **once for the whole batch**, so a chat that arrives inside it waits the
+    whole embed — measured at 1092 ms at p50 for a window of 40 and 572 ms for
+    20, linear in the window (JEB-1599,
+    ``scripts/bench_router_under_mining.py``). When the teacher grouper answers
+    instead, nothing embeds and the window is a run-length knob only: there the
+    chat waits one backtest forward pass (260 ms) whatever the window is.
 
     A case that falls out of the window is not deleted and not marked mined — it
     is simply too old to still be the pattern worth a skill. Mining it later is

@@ -138,13 +138,21 @@ class LayaEngine(SingleQuestionMixin):
         # One shared model, one forward pass at a time. Never taken together
         # with `db.lock` — see the ordering note in `backend/api.py`.
         #
-        # Taken and released *per pass*, which is what bounds what a concurrent
-        # caller waits: a chat arriving mid-mining queues behind the backtest's
-        # current forward pass, never behind the whole run. Measured on the live
-        # checkpoint (JEB-1599, `scripts/bench_router_under_mining.py`): lock
-        # wait per pass is 0 ms with the miner idle and 245 ms at p50 / 286 ms
-        # at p95 with a run in flight, while time *inside* `predict` is 220 ms
-        # against 233 ms — so the wait is the miner's pass, not CPU contention.
+        # How long one holder keeps it is *not* uniform, and what a concurrent
+        # caller waits follows from which method has it. Measured on the live
+        # checkpoint (JEB-1599, `scripts/bench_router_under_mining.py`):
+        #
+        # * `ask` — one acquisition per forward pass, held 260 ms at p50. So a
+        #   chat arriving while the miner backtests waits one pass, not the run.
+        # * `embed` — ONE acquisition for the whole batch, held 1092 ms at p50
+        #   for 40 texts and 572 ms for 20. That is the miner's fallback
+        #   grouping path (`backend/miner/cluster.py`), and a chat that arrives
+        #   inside it waits the whole embed: lock wait max was 1045 ms in that
+        #   arm against 477 ms when the teacher grouped.
+        #
+        # Batching `embed` is still right — it is one encoder call over the
+        # pool, not N — but "the lock is only ever held for one pass" is false,
+        # and anything reasoning about worst-case chat latency has to read this.
         self._lock = threading.Lock()
         self._embed_fn: Any | None = None
 

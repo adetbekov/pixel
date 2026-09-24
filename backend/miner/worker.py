@@ -14,17 +14,31 @@ what :func:`backend.miner.run.mine_once` already refuses with its own lock. A
 trigger that arrives while a run is in flight and one already queued is dropped,
 not buffered: the pool it would read is still there on the next miss.
 
-What this does **not** remove is the engine lock: a chat arriving mid-run still
-queues behind the backtest's current forward pass. Measured, rather than feared
-(JEB-1599, ``scripts/bench_router_under_mining.py``, live checkpoint, pool 40,
-three runs of n=40): that wait is 245 ms at p50 / 286 ms per pass, taking
-``POST /api/chat`` from p50 396…470 ms / p95 719…889 ms idle to p50 650…827 ms /
-p95 1020…1183 ms while a run is in flight, and time *inside* ``predict`` is
-unchanged (220 ms against 233 ms) — so it is the miner's pass that is waited on,
-not the CPU. Accepted as it stands:
-the wait is one pass because the lock is per pass, ``MINER_POOL_WINDOW`` shortens
-the run and not the wait (pool 20 reads the same band), and the only thing that
-would remove it is a second resident copy of a 322M-parameter checkpoint.
+What this does **not** remove is the engine lock: a chat arriving mid-run queues
+behind whatever the run is holding it for. Measured rather than feared
+(JEB-1599, ``scripts/bench_router_under_mining.py``, live checkpoint, window 40,
+n=40 per arm, a shared box — the spread is the neighbours):
+
+    arm                chat p50   chat p95   lock wait p50/max
+    miner idle           456 ms     832 ms       0 /    0 ms
+    mining, teacher      926 ms    1206 ms     254 /  477 ms
+    mining, fallback     936 ms    1104 ms     270 / 1045 ms
+
+and a chat is 1.5 forward passes, so the per-request add is the wait times that,
+not one wait. Time *inside* ``predict`` is unchanged across the arms (272 ms
+idle against 223…224 ms under mining), so it is the miner's hold that is waited
+on and not the CPU.
+
+The two mining arms differ in what holds the lock, not in how often: the
+backtest holds it 260 ms per forward pass, while the fallback grouper's
+whole-pool ``embed`` holds it once for 1092 ms (572 ms at window 20 — linear).
+That is the 1045 ms tail, and it is the only place ``MINER_POOL_WINDOW`` bounds
+a *wait* rather than a run length.
+
+Accepted as it stands: on the teacher-grouped path the wait is one pass and the
+window does not change it; on the fallback path the window already bounds the
+worst case; and the only thing that would remove either is a second resident
+copy of a 322M-parameter checkpoint.
 
 ``POST /api/mine`` does not come through here. It is the manual run and its
 caller wants the proposal count back, so it stays synchronous.
