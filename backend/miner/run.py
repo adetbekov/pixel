@@ -11,9 +11,11 @@ grouping call plus a few forward passes per cluster case and per active skill,
 and it holds ``LayaEngine._lock`` for all of them, so every other request's
 router waits. The one term that scales with the *pool* rather than the cluster
 is the backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
-only reaches it for a candidate that would otherwise be published — which, while
-a draft keeps failing on ``match_rate``, is none of them. Keep it that way: the
-pool has no ``LIMIT`` and does not shrink for a candidate that was rejected.
+only reaches it for a candidate no regression has already rejected. Since
+``match_rate`` became a measure of what production will do (JEB-1562) that is
+nearly every candidate, where it used to be almost none: one pass-1 per unmined
+row, per candidate. The pool has no ``LIMIT`` and does not shrink for a candidate
+that was rejected, so this is the term to watch as the pool grows.
 
 Two triggers, one body: every ``MINER_BATCH``-th new mineable case, and
 ``POST /api/mine``. A second concurrent run is refused rather than queued — it
@@ -184,18 +186,26 @@ def _propose(
         return None
     if not report.publishable:
         log.info(
-            "miner: %r rejected — match_rate %.2f (agreement %.2f) on %d cases",
+            "miner: %r rejected — match_rate %.2f (generalization %.2f, agreement %.2f)"
+            " on %d cases",
             skill.id,
             report.match_rate,
+            report.generalization,
             report.agreement,
             report.total,
         )
         return None
 
+    # This line is the only place the two ungated numbers are read, which is the
+    # whole reason they are computed: `generalization` well under `match_rate`
+    # means the cluster is covered but a *sixth* phrasing will still cost a Gemini
+    # call, and a low `agreement` means the teacher improvised differently every
+    # time (JEB-1547, JEB-1562).
     log.info(
-        "miner: %r proposed — match_rate %.2f (agreement %.2f) on %d cases",
+        "miner: %r proposed — match_rate %.2f (generalization %.2f, agreement %.2f) on %d cases",
         skill.id,
         report.match_rate,
+        report.generalization,
         report.agreement,
         report.total,
     )

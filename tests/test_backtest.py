@@ -17,7 +17,9 @@ from backend.state import RobotState
 
 from .fakes import FakeEngine
 from .trick_cluster import (
+    LATER_TRICK,
     MID_STATE,
+    SEED_CONTROLS,
     TEACHER_PLANS,
     TRICK_COMMANDS,
     TRICK_DRAFT,
@@ -63,6 +65,7 @@ def test_a_candidate_that_covers_its_cluster_is_publishable(active, candidate, c
     report = backtest(engine(), active, candidate, cases)
     assert report.matched == 5
     assert report.match_rate == pytest.approx(1.0)
+    assert report.generalization == pytest.approx(1.0)
     assert report.agreement == pytest.approx(1.0)
     assert report.regression is None
     assert report.publishable
@@ -84,9 +87,10 @@ def test_a_different_plan_is_agreement_not_coverage(active, candidate, cases):
     assert report.publishable
 
 
-def test_a_candidate_the_router_misses_agrees_with_nothing(active, candidate, cases):
+def test_a_candidate_the_router_misses_agrees_with_nothing(active, candidate):
     """Agreement is counted over routed cases only — an unrouted case cannot agree."""
-    report = backtest(FakeEngine("unknown"), active, candidate, cases)
+    report = backtest(FakeEngine("unknown"), active, candidate, cases_that_miss())
+    assert report.match_rate == pytest.approx(0.0)
     assert report.agreement == pytest.approx(0.0)
 
 
@@ -96,16 +100,18 @@ def test_wording_differences_do_not_break_agreement(active, candidate, cases):
     assert backtest(engine(), active, candidate, cases).agreement == pytest.approx(1.0)
 
 
-def test_a_candidate_the_router_never_picks_scores_zero(active, candidate, cases):
-    report = backtest(FakeEngine("unknown"), active, candidate, cases)
+def test_a_cluster_the_router_sends_elsewhere_scores_zero(active, candidate):
+    report = backtest(engine(), active, candidate, cases_that_miss())
     assert report.match_rate == pytest.approx(0.0)
     assert not report.publishable
 
 
-def test_a_candidate_below_the_threshold_is_not_a_hit(active, candidate, cases):
-    report = backtest(engine(), active, candidate, cases)
-    shy = backtest(FakeEngine(routes=TRICK_ROUTES, confidence=0.4), active, candidate, cases)
-    assert report.publishable
+def test_a_phrase_the_head_reaches_below_its_threshold_is_not_covered(active, candidate):
+    """The threshold still decides every phrase the draft did not list."""
+    unlisted = [Case(id=6, user_text=LATER_TRICK, state=MID_STATE, actions=TEACHER_PLANS[0])]
+    confident = backtest(engine(), active, candidate, unlisted)
+    shy = backtest(FakeEngine(routes=TRICK_ROUTES, confidence=0.4), active, candidate, unlisted)
+    assert confident.match_rate == pytest.approx(1.0)
     assert shy.match_rate == pytest.approx(0.0)
 
 
@@ -247,11 +253,63 @@ def test_the_rest_of_the_pool_is_left_alone(active, candidate, cases):
     assert report.publishable
 
 
-def test_the_backtest_never_routes_through_the_examples_lookup(active, candidate, cases):
-    """The candidate's `examples` *are* its cluster — the lookup would score 1.0 blind."""
-    blind = FakeEngine("unknown", 0.99)
+def test_coverage_counts_the_examples_lookup_because_production_does(active, candidate, cases):
+    """JEB-1562, and the whole point of the number.
+
+    The generator copies the cluster into `examples` word for word, so after
+    acceptance every one of these five phrases routes to the candidate at 1.0
+    through step 0 and the head is never asked. A blind head does not change that
+    — and the old `use_examples=False` measurement said it did, which is how a
+    cluster that production covers completely got refused.
+    """
+    # Blind on the cluster, and the seed controls still route, so the only thing
+    # under test here is check 1.
+    blind = FakeEngine(routes=SEED_CONTROLS, confidence=0.99)
     report = backtest(blind, active, candidate, cases)
-    assert report.matched == 0
+    assert report.match_rate == pytest.approx(1.0)
+    assert report.publishable
+    # And the head's own answer is reported, not thrown away: it is 0.0 here, which
+    # is what a *sixth* phrasing of this command would get.
+    assert report.generalization == pytest.approx(0.0)
+
+
+def test_generalization_is_the_head_alone(active, candidate, cases):
+    """Two phrasings the head reaches out of five, with coverage flat at 1.0."""
+    head = FakeEngine(
+        routes={**SEED_CONTROLS, "покажи фокус": "show_trick", "удиви фокусом": "show_trick"}
+    )
+    report = backtest(head, active, candidate, cases)
+    assert report.match_rate == pytest.approx(1.0)
+    assert report.generalization == pytest.approx(0.4)
+
+
+def test_a_phrase_the_draft_forgot_to_list_falls_back_to_the_head(active, candidate, cases):
+    """Which is the tolerance MINER_MIN_MATCH buys: one such phrase in five."""
+    later = Case(id=6, user_text=LATER_TRICK, state=MID_STATE, actions=TEACHER_PLANS[0])
+    blind = FakeEngine(routes=SEED_CONTROLS, confidence=0.99)
+    report = backtest(blind, active, candidate, [*cases, later])
+    assert report.matched == 5
+    assert report.match_rate == pytest.approx(5 / 6)
+    assert report.publishable
+
+
+def test_a_phrase_an_active_skill_already_lists_is_not_the_candidates(active, candidate):
+    """Step 0 is first-in-registry-order and a mined skill is appended, so the
+    older skill keeps the phrase — coverage reports what production will do even
+    when the head would hand it over."""
+    stolen = [Case(id=1, user_text="привет", state=MID_STATE, actions=TEACHER_PLANS[0])]
+    report = backtest(engine({"привет": "show_trick"}), active, candidate, stolen)
+    assert report.match_rate == pytest.approx(0.0)
+    assert report.generalization == pytest.approx(1.0)
+    assert not report.publishable
+
+
+def test_the_cluster_costs_one_forward_pass_per_case(active, candidate, cases):
+    """Step 0 answers coverage without the head and a mined skill has no
+    `questions`, so the only pass a listed case pays for is `generalization`."""
+    probe = engine()
+    backtest(probe, active, candidate, cases)
+    assert len(probe.calls) == len(cases) + len(active)
 
 
 def test_a_candidate_that_lost_on_match_rate_never_pays_for_the_pool_scan(active, candidate):
