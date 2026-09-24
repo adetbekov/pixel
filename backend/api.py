@@ -92,6 +92,14 @@ class Reply(BaseModel):
     confidence: float | None
     latency_ms: int
     state: StateOut
+    #: Why the teacher did not answer, when it did not — `"quota_exhausted"` is
+    #: the only value today (`backend.teacher.client.QUOTA_STATUS`). `None` on
+    #: every ordinary reply, and additive with a default, so a client written
+    #: before this field keeps working and one written after it can tell a
+    #: quota outage from "the model did not understand" without matching on the
+    #: reply text. `engine` stays `"gemini"`: the miss was still routed to the
+    #: teacher, and the metrics count it there (JEB-1603).
+    teacher_status: str | None = None
 
 
 class ChatIn(BaseModel):
@@ -147,6 +155,9 @@ class HistoryItem(BaseModel):
     confidence: float | None = None
     latency_ms: int = 0
     feedback: int | None = None
+    #: The same flag as on `Reply`, so a reloaded chat redraws the quota bubble
+    #: the way it was first shown instead of silently downgrading it.
+    teacher_status: str | None = None
 
 
 class Proposal(BaseModel):
@@ -199,12 +210,13 @@ def _log_interaction(
     latency_ms: int,
     actions: list[Action],
     reply_text: str,
+    teacher_status: str | None = None,
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO interactions"
         " (ts, user_text, engine, skill_id, confidence, latency_ms, actions_json, reply_text,"
-        "  feedback)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        "  feedback, teacher_status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         (
             iso(utcnow()),
             user_text,
@@ -214,6 +226,7 @@ def _log_interaction(
             latency_ms,
             json.dumps([a.to_dict() for a in actions], ensure_ascii=False),
             reply_text,
+            teacher_status,
         ),
     )
     conn.commit()
@@ -236,6 +249,7 @@ def execute_plan(
     skill_id: str | None = None,
     confidence: float | None = None,
     fallback_reply: str = "Готово!",
+    teacher_status: str | None = None,
     now: datetime | None = None,
 ) -> dict:
     """The single execution path: validate, apply, log, and shape a ``Reply``.
@@ -262,6 +276,7 @@ def execute_plan(
             latency_ms=latency_ms,
             actions=actions,
             reply_text=reply,
+            teacher_status=teacher_status,
         )
     return {
         "interaction_id": interaction_id,
@@ -272,6 +287,7 @@ def execute_plan(
         "confidence": confidence,
         "latency_ms": latency_ms,
         "state": state.to_dict(),
+        "teacher_status": teacher_status,
     }
 
 
@@ -361,6 +377,7 @@ def post_chat(payload: ChatIn) -> dict:
         started=started,
         confidence=outcome.confidence,
         fallback_reply=result.reply,
+        teacher_status=result.teacher_status,
         now=now,
     )
 
@@ -423,7 +440,7 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
     with db.lock:
         rows = conn.execute(
             "SELECT id, user_text, reply_text, engine, skill_id, confidence, latency_ms,"
-            " feedback FROM interactions ORDER BY id DESC LIMIT ?",
+            " feedback, teacher_status FROM interactions ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [
@@ -436,6 +453,7 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
             "confidence": row["confidence"],
             "latency_ms": row["latency_ms"],
             "feedback": row["feedback"],
+            "teacher_status": row["teacher_status"],
         }
         for row in reversed(rows)
     ]

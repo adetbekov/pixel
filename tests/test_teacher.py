@@ -8,16 +8,24 @@ the caller gets a plan made of library actions and the case lands in
 
 import inspect
 import json
+import sqlite3
 
 import httpx
 import pytest
 
+from backend import db
 from backend.actions import ACTIONS, MAX_SAY_LEN
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
 from backend.main import app
 from backend.state import read_state
-from backend.teacher import FALLBACK_PLAN, QUOTA_PLAN, QUOTA_REPLY, GeminiTeacher
+from backend.teacher import (
+    FALLBACK_PLAN,
+    QUOTA_PLAN,
+    QUOTA_REPLY,
+    QUOTA_STATUS,
+    GeminiTeacher,
+)
 from backend.teacher.client import (
     DEFAULT_MODEL,
     FALLBACK_REPLY,
@@ -268,21 +276,89 @@ async def test_a_429_is_not_retried_and_says_so(client, conn, seeded, missing, t
 
 
 @pytest.mark.anyio
-async def test_quota_and_not_understood_are_different_answers(
+async def test_a_quota_outage_is_flagged_for_the_client_not_just_worded_differently(
     client, conn, seeded, missing, teacher
 ):
-    """Same fallback for both is how a billing problem read as Pixel being dumb.
+    """The reply is for the human; `teacher_status` is what a client branches on.
 
-    `FALLBACK_REPLY` invites the user to teach the robot another way — advice
-    that cannot work while the teacher is unreachable, and that costs another
-    unit of the quota to discover.
+    Matching `reply` against `QUOTA_REPLY` would work today and break on the
+    first copy edit or the first locale — silently, since both strings are still
+    perfectly valid replies. So the UI gets a flag: `"quota_exhausted"` here,
+    `None` on every ordinary answer, additive so a client that predates it is
+    unaffected. `engine` stays `gemini` — the miss was routed to the teacher and
+    the metrics count it there; it says who was *asked*, not who answered.
     """
     teacher(quota_error())
     quota = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
 
+    assert quota["teacher_status"] == QUOTA_STATUS
+    assert quota["engine"] == "gemini", "it is still the teacher's turn that failed"
     assert quota["reply"] != FALLBACK_REPLY
     assert quota["actions"] != FALLBACK_PLAN
-    assert quota["engine"] == "gemini", "it is still the teacher's turn that failed"
+    # `sleepy` is the low-energy face (`TIRED_PLAN`), and reusing it would merge
+    # quota with tiredness on the channel this change exists to separate.
+    assert quota["state"]["face"] == "sad"
+
+    # And it survives a reload, or the bubble silently downgrades to a plain
+    # Gemini answer the moment the page is refreshed.
+    history = (await client.get("/api/history")).json()
+    assert history[-1]["teacher_status"] == QUOTA_STATUS
+
+
+@pytest.mark.anyio
+async def test_an_ordinary_answer_carries_no_status(client, seeded, missing, teacher):
+    """The other half of the flag: it is `None` unless something went wrong.
+
+    Without this the field could be a constant and every test above would still
+    pass, while the UI drew a quota badge on every Gemini reply.
+    """
+    teacher(GOOD_PLAN)
+    body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
+    assert body["teacher_status"] is None
+    assert (await client.get("/api/history")).json()[-1]["teacher_status"] is None
+
+
+@pytest.mark.anyio
+async def test_an_ordinary_fallback_carries_no_status_either(client, seeded, missing, teacher):
+    """"Did not understand" is not an outage — `FALLBACK_PLAN` keeps a null flag."""
+    teacher(HACKED_PLAN)
+    body = (await client.post("/api/chat", json={"text": "взломай насу"})).json()
+    assert body["reply"] == FALLBACK_REPLY
+    assert body["teacher_status"] is None
+
+
+def test_an_old_database_gains_the_column_instead_of_breaking(tmp_path):
+    """The stand's `pixel.db` predates `teacher_status`, and is not thrown away.
+
+    `interactions` is in the frozen schema, so `CREATE TABLE IF NOT EXISTS` skips
+    the old table entirely and only `migrate()` can add the column — miss that
+    and `/api/history` is a 500 against every database that already has rows.
+    """
+    path = str(tmp_path / "legacy.db")
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE interactions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT,"
+        " user_text TEXT, engine TEXT, skill_id TEXT, confidence REAL, latency_ms INTEGER,"
+        " actions_json TEXT, reply_text TEXT, feedback INTEGER)"
+    )
+    legacy.execute(
+        "INSERT INTO interactions (ts, user_text, engine, latency_ms, actions_json, reply_text)"
+        " VALUES ('2026-09-24T20:53:27Z', 'сделай зарядку', 'gemini', 977, '[]', 'Я не понял')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = db.init(path)
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(interactions)")}
+        assert "teacher_status" in columns
+        # The pre-existing row keeps its data and reads back as "no status",
+        # which is what `/api/history` then serves for it.
+        row = conn.execute("SELECT * FROM interactions").fetchone()
+        assert row["user_text"] == "сделай зарядку"
+        assert row["teacher_status"] is None
+    finally:
+        db.close()
 
 
 @pytest.mark.anyio

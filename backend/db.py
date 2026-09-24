@@ -100,6 +100,15 @@ MIGRATIONS: dict[str, dict[str, str]] = {
     "skill_proposals": {
         "generalization": "REAL",
     },
+    # Why the teacher did not answer, when it did not — `"quota_exhausted"` is
+    # the only value today. `engine` says who was *asked*, and on a quota outage
+    # that is still `gemini`, so it cannot also say the answer came from nobody.
+    # NULL on every ordinary reply and on every row written before this column
+    # existed, which is exactly what `/api/history` then returns for them, so an
+    # old `pixel.db` redraws as it always did (JEB-1603).
+    "interactions": {
+        "teacher_status": "TEXT",
+    },
 }
 
 lock = threading.Lock()

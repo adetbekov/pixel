@@ -64,6 +64,7 @@ const REPLY = {
   skill_id: null,
   confidence: 0.31,
   latency_ms: LATENCY_MS,
+  teacher_status: null,
 };
 
 /** Разбирает `/proposals/{id}/accept` в `[id, 'accept']`; иначе `[]`. */

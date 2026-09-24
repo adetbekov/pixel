@@ -104,10 +104,21 @@ FALLBACK_PLAN: list[dict[str, Any]] = [
 #: separate reply and a separate face is the whole difference.
 QUOTA_REPLY = "Мой учитель сейчас недоступен — закончилась квота. Попробуй чуть позже"
 
+#: `sad`, and deliberately not `sleepy`: `sleepy` is already what a low-energy
+#: robot wears (`TIRED_PLAN` in `backend/api.py`, and the stand showed that face
+#: at `energy 85`), so reusing it would re-merge quota with tiredness on the very
+#: channel this change exists to separate.
 QUOTA_PLAN: list[dict[str, Any]] = [
-    {"action": "set_face", "args": {"face": "sleepy"}},
+    {"action": "set_face", "args": {"face": "sad"}},
     {"action": "say", "args": {"text": QUOTA_REPLY}},
 ]
+
+#: The machine-readable half of the same fact, carried to the UI on `Reply` and
+#: `HistoryItem` as `teacher_status`. The reply text is for the human and is
+#: free to be rewritten or localised; a client that has to branch — a different
+#: badge, a hint about billing — reads this instead. Matching on `QUOTA_REPLY`
+#: would work today and break silently on the first copy edit.
+QUOTA_STATUS = "quota_exhausted"
 
 #: What `teacher_log.state_json.error` starts with when the cause was quota, so
 #: the rows are greppable without re-parsing whichever SDK's message shape wrote
@@ -120,7 +131,18 @@ QUOTA_ERROR = "teacher unavailable: API quota exhausted"
 #: `RateLimitError: Error code: 429`. Matched on the message because neither
 #: exception type is importable here — the SDK stays off a key-less app's import
 #: path, and the old one is not in the tree at all.
-_QUOTA_MARKERS = ("RESOURCE_EXHAUSTED", "RATELIMITERROR", "RATE LIMIT", "QUOTA")
+#:
+#: `TOO MANY REQUESTS` is the third shape and the only one nothing in the tree
+#: raises today: `httpx.HTTPStatusError` renders a 429 as `Client error '429 Too
+#: Many Requests' for url ...` and names no quota at all, so without this marker
+#: the match below would see the `429` and still answer `False`.
+_QUOTA_MARKERS = (
+    "RESOURCE_EXHAUSTED",
+    "RATELIMITERROR",
+    "RATE LIMIT",
+    "QUOTA",
+    "TOO MANY REQUESTS",
+)
 
 
 def _is_quota_error(exc: Exception) -> bool:
@@ -154,6 +176,11 @@ class TeacherResult:
     declined (see :class:`backend.teacher.schema.TeacherPlan`). It changes
     nothing the user sees — a declined answer is still a plan and still a reply —
     and everything for the miner, which must not learn a refusal.
+
+    ``teacher_status`` is the opposite: it changes nothing the miner sees and
+    exists for the UI. ``None`` on every ordinary answer, :data:`QUOTA_STATUS`
+    when the teacher could not be reached at all, and it travels out over the
+    API on ``Reply`` and ``HistoryItem``.
     """
 
     raw_plan: list[dict[str, Any]]
@@ -161,6 +188,7 @@ class TeacherResult:
     raw_response: str
     error: str | None = None
     handled: bool = True
+    teacher_status: str | None = None
 
 
 def _fallback(reason: str, raw_response: str = "") -> TeacherResult:
@@ -188,6 +216,7 @@ def _quota_exhausted(reason: str) -> TeacherResult:
         raw_response="",
         error=f"{QUOTA_ERROR}: {reason}",
         handled=False,
+        teacher_status=QUOTA_STATUS,
     )
 
 
