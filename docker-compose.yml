@@ -23,7 +23,10 @@ services:
       # Empty key is a supported setup: Pixel starts and runs on Laya alone.
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_TEACHER_MODEL: ${GEMINI_TEACHER_MODEL:-models/gemini-2.5-flash-lite}
-      GEMINI_MINER_MODEL: ${GEMINI_MINER_MODEL:-models/gemini-2.5-flash-lite}
+      # Not the teacher's model, on purpose: the free-tier quota bucket is per
+      # (project, model) and this key is shared with warmplace. Reason in the
+      # docstring of backend/miner/generate.py; do not collapse the two.
+      GEMINI_MINER_MODEL: ${GEMINI_MINER_MODEL:-models/gemini-3.5-flash}
       LAYA_MODEL: ${LAYA_MODEL:-multilingual}
       LAYA_DEVICE: ${LAYA_DEVICE:-cpu}
       ROUTER_THRESHOLD: ${ROUTER_THRESHOLD:-0.66}
