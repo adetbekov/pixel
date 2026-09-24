@@ -105,11 +105,18 @@ class FakeScript:
     A mining run now opens with one (the teacher is the primary grouper — see
     ``backend/miner/cluster.py``), and counting it would shift every positional
     script in the suite by one and make "the first call" mean something else.
-    ``grouping`` is what it answers with; ``None`` means "the teacher grouped
-    nothing", which is what sends a test down the local-vector fallback.
+    ``grouping`` is what it answers with: a list of groups is wrapped in the
+    response shape, a raw string goes out verbatim so a test can pin what an
+    unparsable answer does, an exception instance is raised, and ``None`` means
+    "the teacher grouped nothing", which is what sends a test down the
+    local-vector fallback.
     """
 
-    def __init__(self, script: list[Any], grouping: list[list[int]] | None = None) -> None:
+    def __init__(
+        self,
+        script: list[Any],
+        grouping: list[list[int]] | str | BaseException | None = None,
+    ) -> None:
         self.script = script
         self.grouping = grouping
         self.calls: list[dict[str, Any]] = []
@@ -123,6 +130,10 @@ class FakeScript:
     def answer(self, kwargs: dict[str, Any]) -> str:
         if self._is_grouping(kwargs):
             self.grouping_calls.append(kwargs)
+            if isinstance(self.grouping, BaseException):
+                raise self.grouping
+            if isinstance(self.grouping, str):
+                return self.grouping
             return json.dumps({"groups": self.grouping or []})
 
         self.calls.append(kwargs)

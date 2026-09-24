@@ -393,21 +393,21 @@ async def test_a_fenced_draft_is_not_parsed(client, seeded, miner_engine, genera
     assert "did not match the schema" in caplog.text
 
 
-def test_the_fallback_grouping_goes_out_the_same_way():
+def test_the_grouping_call_goes_out_the_same_way():
     """`group()` shares `_call`, so it shared the defect — and hides it better.
 
-    The fallback grouping only runs when the local Laya vectors are unavailable,
-    so a broken call shape here shows up as nothing at all: `group` swallows the
-    parse error and returns `[]`, which reads as "no clusters" rather than as a
-    failure. Pin both halves — the shape that goes out, and that a bare-JSON
-    answer comes back parsed.
+    Grouping is the miner's first call and its failures are silent: `group`
+    swallows the parse error and returns `[]`, which reads as "no clusters"
+    rather than as a failure, and the run then falls back to the local vectors.
+    Pin both halves — the shape that goes out, and that a bare-JSON answer comes
+    back parsed.
     """
-    fake = FakeGeminiClient(json.dumps({"groups": [[0, 1], [2]]}))
+    fake = FakeGeminiClient(grouping=[[0, 1], [2]])
     generator = GeminiSkillGenerator(client=fake, model="fake-model")
 
     assert generator.group(["покажи фокус", "сделай фокус", "станцуй"]) == [[0, 1], [2]]
 
-    call = fake.calls[0]
+    call = fake.grouping_calls[0]
     assert call["model"] == "fake-model"
     assert call["config"]["response_mime_type"] == "application/json"
     assert "groups" in call["config"]["response_schema"]["properties"]
@@ -416,7 +416,7 @@ def test_the_fallback_grouping_goes_out_the_same_way():
 
 def test_a_fenced_grouping_is_not_parsed():
     """And the fence is a failure on this path too — an empty, silent one."""
-    fake = FakeGeminiClient('```json\n{"groups": [[0, 1]]}\n```')
+    fake = FakeGeminiClient(grouping='```json\n{"groups": [[0, 1]]}\n```')
     generator = GeminiSkillGenerator(client=fake, model="fake-model")
 
     assert generator.group(["покажи фокус", "сделай фокус"]) == []
