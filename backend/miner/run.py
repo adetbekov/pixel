@@ -145,6 +145,10 @@ class MinedProposal:
     id: str
     skill: Skill
     match_rate: float
+    #: Stored for the card, not for the gate: `match_rate` is ~1.00 whenever the
+    #: draft lists its own cluster, so this is the number of the two that actually
+    #: varies between drafts, and the user decides on the card (JEB-1581).
+    generalization: float
     sample_ids: list[int]
 
 
@@ -196,11 +200,12 @@ def _propose(
         )
         return None
 
-    # This line is the only place the two ungated numbers are read, which is the
-    # whole reason they are computed: `generalization` well under `match_rate`
-    # means the cluster is covered but a *sixth* phrasing will still cost a Gemini
-    # call, and a low `agreement` means the teacher improvised differently every
-    # time (JEB-1547, JEB-1562).
+    # `generalization` well under `match_rate` means the cluster is covered but a
+    # *sixth* phrasing will still cost a Gemini call; it is stored below and shown
+    # on the card, so the log line is no longer the only place it is read
+    # (JEB-1581). `agreement` still is: a low one means the teacher improvised
+    # differently every time, which is a fact about the raw material and would
+    # read as a verdict on the skill next to "принять?" (JEB-1547, JEB-1562).
     log.info(
         "miner: %r proposed — match_rate %.2f (generalization %.2f, agreement %.2f) on %d cases",
         skill.id,
@@ -213,6 +218,7 @@ def _propose(
         id=str(uuid.uuid4()),
         skill=skill,
         match_rate=round(report.match_rate, 3),
+        generalization=round(report.generalization, 3),
         sample_ids=list(signature),
     )
 
@@ -260,12 +266,14 @@ def _save(conn: sqlite3.Connection, proposal: MinedProposal) -> None:
     backtest stays available: more cases may arrive and make it work.
     """
     conn.execute(
-        "INSERT INTO skill_proposals (id, skill_json, match_rate, sample_ids, status, created_at)"
-        " VALUES (?, ?, ?, ?, 'pending', ?)",
+        "INSERT INTO skill_proposals"
+        " (id, skill_json, match_rate, generalization, sample_ids, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
         (
             proposal.id,
             proposal.skill.model_dump_json(),
             proposal.match_rate,
+            proposal.generalization,
             json.dumps(proposal.sample_ids),
             iso(utcnow()),
         ),

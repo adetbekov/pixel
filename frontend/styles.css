@@ -431,6 +431,12 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
 }
 .match span { display: block; margin-top: 3px; font-size: 11px; line-height: 1.3; color: var(--text-dim); }
 
+/* Второе число (`generalization`) — тот же блок, кегль меньше и цвет обычного
+   текста, а не акцент: оно рядом с первым для сравнения, а не вторая кнопка
+   внимания. Акцентом красится только то, на что смотрят сначала. */
+.match-general { margin-top: 9px; }
+.match-general b { font-size: 19px; color: var(--text); }
+
 .examples { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 6px; }
 .examples li {
   font-size: 13px; padding: 3px 10px; border-radius: 999px;

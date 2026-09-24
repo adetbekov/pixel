@@ -175,8 +175,8 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    accepts this skill**: every case is re-routed through `active + candidate` by exactly the call
    `/api/chat` will make afterwards — step 0, the exact `examples` lookup, included — and a match
    means the router landed on the candidate above its threshold. It must reach `MINER_MIN_MATCH`
-   (0.8), and it is the only number of the three that gates. Two others are computed and logged
-   beside it:
+   (0.8), and it is the only number of the three that gates. Two others are computed beside it,
+   and one of them also reaches the card:
    - `generalization` — the same share from the `choice` **head alone**, with no `examples` to read:
      what a phrasing nobody has typed yet would get. `match_rate` used to *be* this number
      (`use_examples=False`), and that made the gate a measurement of a router production never runs:
@@ -186,7 +186,10 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
      0.60 / 1.00 / 0.80 / 0.40 / 0.80 / 0.40 over six runs because the head scores the `id` and
      `description` Gemini rewrites every time. Refusing a candidate on it is also backwards: a weak
      description still takes the listed commands off Gemini, while a refusal leaves all of them on it
-     (JEB-1562).
+     (JEB-1562). It is stored on the proposal and shown on the card next to `match_rate`, because
+     `match_rate` is ~1.00 on every live draft and so says nothing when the user has to decide:
+     measured live, `praise_robot` came out 1.00 / 0.667 and the "фокус" cluster 1.00 / 0.60
+     (JEB-1581).
    - `agreement` — whether the candidate also *did what the teacher did* (action names only; the
      teacher never phrases a reply the same way twice). It used to gate too, and on live data that
      made the bar unreachable: five phrasings of one command produce several different teacher plans,
@@ -195,7 +198,9 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
      (JEB-1547).
 
    Both are measured by `scripts/probe_miner_match.py`, which is also what the threshold is
-   calibrated with. What keeps a bad candidate out is steps 4 and 5, and the user.
+   calibrated with. What keeps a bad candidate out is steps 4 and 5, and the user — who is shown
+   both numbers, with `agreement` deliberately left off the card: it is the spread of the *teacher's*
+   plans, and next to "принять?" it would read as a verdict on the skill.
 4. **Regression check.** A match rate cannot see the damage a new option does to the old ones: stage
    2 measured all 24 orderings of the four starter skills spreading the hit rate over 7/10…9/10, and
    alphabetical order pushing "покорми" under its threshold outright. So one control phrase per
