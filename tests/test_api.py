@@ -1,12 +1,26 @@
 """Contract tests — every one of the nine frozen endpoints, driven in-process."""
 
+import itertools
+from datetime import timedelta
+
 import httpx
 import pytest
 
+from backend import api as api_module
+from backend import state as state_module
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.engine import ScoreResult
 from backend.main import app
-from backend.state import read_state, utcnow, write_state
+from backend.state import (
+    EFFECTS,
+    RobotState,
+    clamp,
+    decay,
+    iso,
+    read_state,
+    utcnow,
+    write_state,
+)
 
 STATE_KEYS = {"mood", "energy", "fullness", "face"}
 REPLY_KEYS = {
@@ -242,3 +256,47 @@ async def test_favicon_is_served(client):
     # line is the only thing in the console (JEB-1526).
     assert (await client.get("/favicon.ico")).status_code == 200
     assert (await client.get("/favicon.svg")).status_code == 200
+
+
+@pytest.mark.anyio
+async def test_action_ticks_exactly_once(client, conn, monkeypatch):
+    """Regression for JEB-1569: one HTTP request, one advance of `last_tick_at`.
+
+    The clock hands out a value a minute later on every call, so an extra tick
+    inside the request would show up both in `last_tick_at` and in the mood it
+    charges for — measured from the response, never from the code.
+    """
+    start = utcnow()
+    write_state(conn, RobotState(70.0, 80.0, 10.0, "curious"), start)
+
+    reads = itertools.count()
+
+    def clock():
+        return start + timedelta(minutes=10 + next(reads))
+
+    # Both bindings: `api` imported `utcnow` by name at import time.
+    monkeypatch.setattr(state_module, "utcnow", clock)
+    monkeypatch.setattr(api_module, "utcnow", clock)
+
+    body = (await client.post("/api/action", json={"name": "pet"})).json()
+
+    stored = conn.execute("SELECT last_tick_at FROM robot_state WHERE id = 1").fetchone()
+    assert stored["last_tick_at"] == iso(start + timedelta(minutes=10))
+
+    expected = decay(RobotState(70.0, 80.0, 10.0, "curious"), 10.0)
+    for action in body["actions"]:
+        expected.mood = clamp(expected.mood + EFFECTS[action["action"]]["mood"])
+    assert body["state"]["mood"] == pytest.approx(expected.mood, abs=0.1)
+
+
+@pytest.mark.anyio
+async def test_get_state_does_not_advance_the_clock(client, conn):
+    """A poll is a read, not a tick — otherwise two open tabs decay twice as fast."""
+    start = utcnow()
+    write_state(conn, RobotState(70.0, 80.0, 10.0, "curious"), start)
+
+    for _ in range(6):
+        await client.get("/api/state")
+
+    stored = conn.execute("SELECT last_tick_at FROM robot_state WHERE id = 1").fetchone()
+    assert stored["last_tick_at"] == iso(start)
