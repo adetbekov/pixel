@@ -120,6 +120,13 @@ def _mine() -> int:
         rejected = _rejected_signatures(conn)
 
     if len(cases) < min_cluster_size():
+        # Silent until JEB-1593, like the per-cluster bar below: the two of them
+        # are how almost every zero-proposal run ends, and neither left a trace.
+        log.info(
+            "miner: the pool holds %d cases, fewer than MINER_MIN_CLUSTER (%d)",
+            len(cases),
+            min_cluster_size(),
+        )
         return 0
 
     groups = group_texts(engine, [case.user_text for case in cases], generator.group)
@@ -162,7 +169,18 @@ def _propose(
     rejected: set[tuple[int, ...]],
 ) -> MinedProposal | None:
     """One cluster -> one proposal, or ``None`` and the reason in the log."""
-    if len(cluster) < min_cluster_size():
+    minimum = min_cluster_size()
+    if len(cluster) < minimum:
+        # The commonest outcome of a run, and the one branch here that used to
+        # say nothing: a whole run could end at `{"started": true,
+        # "proposals": 0}` with an empty log, which reads as a broken miner
+        # rather than as a pool that has not ripened yet (JEB-1593).
+        log.info(
+            "miner: cluster %s is smaller than MINER_MIN_CLUSTER (%d < %d)",
+            [case.id for case in cluster],
+            len(cluster),
+            minimum,
+        )
         return None
 
     signature = tuple(sorted(case.id for case in cluster))

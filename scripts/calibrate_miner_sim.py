@@ -42,6 +42,10 @@ Four sections, in the order the argument is made:
      over-broad check gated (as shipped) and forced. `mine_once()` runs inline
      in `POST /api/chat` under `LayaEngine._lock`, and that check is the one term
      that scales with the pool rather than the cluster. Also needs a key.
+  7. **One intent, phrased two ways.** The grouper on pools that are a single
+     intent said as orders and as questions — the split JEB-1593 was filed on,
+     which section 5 cannot see because there a split intent only costs a little
+     recall. Needs a key.
 """
 
 from __future__ import annotations
@@ -115,6 +119,42 @@ NOISE: list[str] = [
     "включи музыку погромче",
     "закажи пиццу",
 ]
+
+#: One intent per pool, said three ways as an order and two as a question — the
+#: shape JEB-1593 was reported on. Section 7 scores the grouper on exactly this:
+#: a pool nobody would call ambiguous, where splitting by form is the only way to
+#: come out with nothing.
+MIXED_FORM: dict[str, list[str]] = {
+    "сальто": [
+        "сделай сальто",
+        "умеешь сальто?",
+        "сальто назад",
+        "а сальто умеешь?",
+        "сальто сделай мне",
+    ],
+    "обнять": [
+        "обними меня",
+        "умеешь обнимать?",
+        "обними покрепче",
+        "а обнять можешь?",
+        "обними разок",
+    ],
+    "петь": ["спой песню", "умеешь петь?", "спой мне", "а спеть можешь?", "спой что-нибудь"],
+    "танец": [
+        "станцуй",
+        "умеешь танцевать?",
+        "потанцуй",
+        "а танцевать умеешь?",
+        "станцуй для меня",
+    ],
+    "фокус": [
+        "покажи фокус",
+        "умеешь фокусы?",
+        "сделай фокус",
+        "а фокус покажешь?",
+        "удиви фокусом",
+    ],
+}
 
 
 def corpus() -> tuple[list[str], list[str]]:
@@ -382,6 +422,54 @@ def report_run_cost(engine, sizes: tuple[int, ...] = (10, 20, 40)) -> None:
     print("  the gap is the over-broad check, and it is what a rejected draft used to cost")
 
 
+def report_mixed_form(engine, runs: int = 3) -> None:
+    """Does one intent survive the grouper when it is phrased two ways?
+
+    Section 5 scores the grouper on pools whose intents are mostly phrased the
+    same way, and it cannot see the failure JEB-1593 was filed on: the grouper
+    splitting "сделай сальто" from "умеешь сальто?" until every piece sits under
+    `MINER_MIN_CLUSTER` and the run mines nothing. Here each pool is one intent,
+    so any group but a single one of five is that split.
+
+    Measured on `models/gemini-2.5-flash-lite`, 5 pools x 3 runs, before and
+    after the last paragraph of `GROUP_SYSTEM_PROMPT`:
+
+        prompt              whole intent   cases mined
+        without the rule        0/15           48/75
+        with it (shipped)      14/15           73/75
+
+    The one miss was the "сальто" pool coming back 3 + 2; six further runs of
+    that pool on the shipped prompt were 5/5 every time, so it is the sampling
+    noise of a live model, not a second failure mode.
+    """
+    from backend.miner.cluster import group_texts
+    from backend.miner.generate import build_generator
+
+    print(f"\n=== 7. one intent, orders and questions mixed, {runs} runs each ===")
+    generator = build_generator()
+    if generator is None:
+        print("  skipped: no GEMINI_API_KEY")
+        return
+
+    tally: Counter = Counter()
+    for intent, texts in MIXED_FORM.items():
+        sizes = []
+        for _ in range(runs):
+            # The miner's own entry point, so a grouping the model returned
+            # malformed is cleaned up here exactly as it would be in a run.
+            groups = group_texts(engine, texts, generator.group)
+            biggest = max((len(group) for group in groups), default=0)
+            sizes.append(biggest)
+            tally["runs"] += 1
+            tally["whole"] += int(len(groups) == 1)
+            tally["mined"] += biggest if biggest >= DEFAULT_MIN_CLUSTER else 0
+            tally["cases"] += len(texts)
+        print(f"   {intent:>8}: largest group {sizes} of {len(texts)}")
+    print(f"   whole intent in one group: {tally['whole']}/{tally['runs']}")
+    print(f"   cases a run would mine:    {tally['mined']}/{tally['cases']}")
+    print("  a split pool is not a bad proposal, it is no proposal and no log line")
+
+
 def main() -> None:
     from backend.brain.engine import LayaEngine
 
@@ -399,6 +487,7 @@ def main() -> None:
     report_latency(engine)
     report_teacher(vectors, labels)
     report_run_cost(engine)
+    report_mixed_form(engine)
 
 
 if __name__ == "__main__":

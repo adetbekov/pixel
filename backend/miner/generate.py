@@ -110,11 +110,28 @@ SYSTEM_PROMPT = f"""Ты — конструктор навыков для роб
 
 Ответ верни строго в заданной JSON-схеме."""
 
+#: The last paragraph is not decoration (JEB-1593). Without it the model splits
+#: one intent by the *form* of the phrase — imperatives in one group, questions
+#: in another — and every piece can land under ``MINER_MIN_CLUSTER``, so the run
+#: mines nothing and says nothing. Measured on ``models/gemini-2.5-flash-lite``,
+#: five mixed-form pools x 3 runs (``scripts/calibrate_miner_sim.py``, section 7):
+#: whole intent in one group 0/15 -> 14/15, cases mined 48/75 -> 73/75. On the
+#: mixed probe of section 5 (45 simulated pools) the same line moves purity
+#: 0.885 -> 0.826 and recall 0.873 -> 0.899, both inside that probe's noise
+#: (~0.04 s.e.) — it buys the split case and costs nothing measurable elsewhere.
+#: A merge pass over the returned groups was measured instead and dropped: asked
+#: to merge its own answer the model keeps it (3/3 runs unchanged on the
+#: "сальто" pool) unless the same rule is repeated in the merge prompt, and then
+#: it still recovers 4 of the 5 cases — for one extra Gemini call per run.
 GROUP_SYSTEM_PROMPT = """Ты группируешь команды пользователя по смыслу.
 
 Тебе дают пронумерованный список команд. Верни группы номеров: в одной группе — команды, \
 которые просят у робота одно и то же. Каждый номер ровно в одной группе. \
-Команду, похожую на которую в списке нет, положи в группу из одного номера."""
+Команду, похожую на которую в списке нет, положи в группу из одного номера.
+
+Форма фразы значения не имеет: приказ («сделай сальто»), вопрос («умеешь сальто?») \
+и просьба об ОДНОМ И ТОМ ЖЕ — это одна группа. Дели только по тому, ЧТО просят \
+сделать, а не по тому, КАК это сказано."""
 
 
 class SkillGenerator(Protocol):
