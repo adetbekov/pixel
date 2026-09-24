@@ -18,6 +18,7 @@ from backend.actions import ACTIONS, MAX_SAY_LEN
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
 from backend.main import app
+from backend.miner.case import load_pool
 from backend.state import read_state
 from backend.teacher import (
     FALLBACK_PLAN,
@@ -325,6 +326,31 @@ async def test_an_ordinary_fallback_carries_no_status_either(client, seeded, mis
     body = (await client.post("/api/chat", json={"text": "взломай насу"})).json()
     assert body["reply"] == FALLBACK_REPLY
     assert body["teacher_status"] is None
+
+
+@pytest.mark.anyio
+async def test_a_quota_outage_never_reaches_the_mining_pool(
+    client, conn, seeded, missing, teacher
+):
+    """A billing outage is not an example of anything, so it must not be mined.
+
+    Two separate checks in `backend/miner/case._parse` happen to hold it today —
+    the row has an `error`, and its `handled` is false — and both live in a
+    different module than the one that writes them. Asserting either field here
+    would pass while the outcome broke. So assert the outcome: drop both checks
+    and this test is the only thing in the suite that goes red (verified by
+    doing exactly that), while dropping one leaves it green, which is what makes
+    it a guard rather than a copy of the implementation.
+
+    What it guards against: the miner drafting "мой учитель сейчас недоступен"
+    into a permanent Laya skill — a command that then never reaches Gemini
+    again, answered by a lie in 300 ms.
+    """
+    teacher(quota_error())
+    await client.post("/api/chat", json={"text": "покажи фокус"})
+
+    assert len(teacher_rows(conn)) == 1, "the case is still logged — it is a real signal"
+    assert load_pool(conn) == []
 
 
 def test_an_old_database_gains_the_column_instead_of_breaking(tmp_path):
