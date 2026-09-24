@@ -41,8 +41,10 @@ treats the two halves differently: a claim on a phrase belonging to a cluster
 that is also being drafted is temporary and not a veto, a claim on a leftover
 nothing will ever list is permanent and is (JEB-1579).
 
-Costs a handful of `gemini-2.5-flash-lite` calls per run: one teacher call per
-command plus one generate call per cluster.
+Costs a handful of calls per run: one teacher call per command
+(`gemini-2.5-flash-lite`) plus one generate call per cluster
+(`gemini-3.5-flash` — the miner sits on its own model, see
+`backend/miner/generate.py`).
 """
 
 from __future__ import annotations

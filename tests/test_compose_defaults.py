@@ -99,6 +99,15 @@ def test_the_committed_compose_file_matches_the_code():
     assert mismatches(compose_environment()) == []
 
 
+def test_the_miner_and_the_teacher_default_to_different_models():
+    # JEB-1606. The free-tier quota bucket is counted per (project, model), and this
+    # project's key is shared with warmplace. Collapse the two defaults onto one
+    # model and both halves spend one 20-requests-a-day bucket: the miner starves
+    # silently and the teacher's misses come back as an opaque FALLBACK (JEB-1600).
+    # A stack redeploy without the Env override must not be able to cause that.
+    assert generate.DEFAULT_MODEL != teacher_client.DEFAULT_MODEL
+
+
 def test_every_compose_variable_is_accounted_for():
     # A knob added to compose and to nothing else is exactly how 0.6 survived: the
     # comparison has to notice the variable before it can compare it.

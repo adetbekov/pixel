@@ -4,11 +4,28 @@ This is the offline half of the teacher/miner split. Nobody waits on this call:
 it runs after the fact, once per cluster, and what it produces is a *schema*
 that will route thousands of later commands.
 
-The model is ``models/gemini-2.5-flash-lite`` ($0.30 / $2.50 per 1M) — the same
-cheap tier the receipt parser runs on, so its bill is known. Overridable with
-``GEMINI_MINER_MODEL``: if a noticeable share of drafts dies on the ``Skill``
-validation below, raise the model through the env var rather than loosening the
-validation.
+The model is ``models/gemini-3.5-flash`` — deliberately *not* the teacher's
+``models/gemini-2.5-flash-lite``. A free-tier quota bucket is counted per
+(project, model) pair, and this project's ``GEMINI_API_KEY`` is shared with the
+four ``warmplace`` containers, which all call ``gemini-2.5-flash``. Put the
+miner on the teacher's model and both halves eat one 20-requests-a-day bucket:
+the miner starves, :meth:`GeminiSkillGenerator.propose` returns ``None``
+silently, and the teacher's misses surface as the opaque ``FALLBACK`` "я не
+понял, научи меня по-другому" (JEB-1600). Keeping the two on different models is
+what makes the free tier workable here — do not "simplify" the miner back onto
+the teacher's model.
+
+Its price is **not measured**: no tariff for ``gemini-3.5-flash`` was checked
+when it was picked. Acceptable for now because the miner is offline and spends
+~3 calls per pass, not one per user message; measure before this call shape
+moves anywhere near the request path. A floating alias such as
+``gemini-flash-latest`` is not a substitute — it resolved to
+``gemini-3.8-flash`` on 2026-09-24 and can move buckets again with no commit
+here.
+
+Overridable with ``GEMINI_MINER_MODEL``: if a noticeable share of drafts dies on
+the ``Skill`` validation below, raise the model through the env var rather than
+loosening the validation — but keep it off the teacher's model.
 
 Like the teacher, this never raises at the caller: a bad draft costs one retry
 and then the cluster is left in the pool for the next run.
@@ -41,7 +58,9 @@ from .schema import MAX_DESCRIPTION_LEN, MAX_RULES, Grouping, SkillDraft
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
+#: Must stay different from `teacher.client.DEFAULT_MODEL` — see the module
+#: docstring: the free-tier quota bucket is per (project, model).
+DEFAULT_MODEL = "models/gemini-3.5-flash"
 
 TIMEOUT_S = 30.0
 
@@ -175,7 +194,8 @@ class GeminiSkillGenerator:
 
         Not ``interactions.create``, which is what this used to call — the same
         move the teacher made in JEB-1513, for the same measured reason: on
-        ``models/gemini-2.5-flash-lite`` that call shape ignores
+        ``models/gemini-2.5-flash-lite`` (what the miner ran on then) that call
+        shape ignores
         ``response_format`` and answers inside a ```` ```json ```` fence, which
         :func:`_parse` rejects on both attempts. Offline, that failure is
         *silent*: :meth:`propose` returns ``None``, the cluster goes back in the

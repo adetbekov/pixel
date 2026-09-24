@@ -59,7 +59,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | --- | --- | --- |
 | `GEMINI_API_KEY` | — | Empty = teacher and miner are off. A router miss answers with a polite stub. |
 | `GEMINI_TEACHER_MODEL` | `models/gemini-2.5-flash-lite` | Model that answers router misses. |
-| `GEMINI_MINER_MODEL` | `models/gemini-2.5-flash-lite` | Model that drafts new skills, offline. |
+| `GEMINI_MINER_MODEL` | `models/gemini-3.5-flash` | Model that drafts new skills, offline. Deliberately not the teacher's model — the free-tier quota bucket is per (project, model) and the key is shared. |
 | `PIXEL_DB_PATH` | `./pixel.db` | SQLite file. |
 | `LAYA_MODEL` | `multilingual` | Laya subfolder. The English root checkpoint answers Cyrillic confidently and wrongly. |
 | `LAYA_DEVICE` | `cpu` | Where the local model runs. |
@@ -186,8 +186,8 @@ The pipeline itself, once per run:
    example the closest same-intent pair sits at 0.76 and an unrelated pair at 0.85), so no
    threshold, linkage or normalisation separates them. An impure cluster still has to survive the
    backtest; a cluster that is never found is a skill that is never learned.
-2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-2.5-flash-lite`,
-   $0.30 / $2.50 per 1M) per cluster. Offline, nobody waiting, and what comes back is a schema that
+2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-3.5-flash`, price not
+   measured — the miner is offline and spends ~3 calls a pass) per cluster. Offline, nobody waiting, and what comes back is a schema that
    will route thousands of later commands; raise the model through the env var if drafts start
    failing validation, never loosen the validation. A mined skill carries no
    `questions` and branches only on the robot's own state; it is assembled into a real `Skill`, and
