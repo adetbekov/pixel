@@ -153,6 +153,12 @@ class Proposal(BaseModel):
     id: str
     skill: dict[str, Any]
     match_rate: float
+    #: What the `choice` head alone would do with the cluster — i.e. what a phrasing
+    #: nobody has typed yet gets. `match_rate` reads 1.00 on nearly every live draft
+    #: (the generator copies the cluster into `examples`), so this is the number on
+    #: the card that carries information. `None` for a proposal mined before the
+    #: column existed; the card then shows only `match_rate` (JEB-1581).
+    generalization: float | None = None
     sample_ids: list[int]
     status: str
     created_at: str
@@ -480,7 +486,7 @@ def get_proposals() -> list[dict]:
     conn = db.get_conn()
     with db.lock:
         rows = conn.execute(
-            "SELECT id, skill_json, match_rate, sample_ids, status, created_at"
+            "SELECT id, skill_json, match_rate, generalization, sample_ids, status, created_at"
             " FROM skill_proposals WHERE status = 'pending' ORDER BY created_at, rowid"
         ).fetchall()
     return [
@@ -488,6 +494,7 @@ def get_proposals() -> list[dict]:
             "id": row["id"],
             "skill": json.loads(row["skill_json"]),
             "match_rate": row["match_rate"],
+            "generalization": row["generalization"],
             "sample_ids": json.loads(row["sample_ids"]),
             "status": row["status"],
             "created_at": row["created_at"],

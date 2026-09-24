@@ -9,10 +9,12 @@ real endpoints.
 import inspect
 import json
 import math
+import sqlite3
 
 import httpx
 import pytest
 
+from backend import db
 from backend.brain.engine import set_engine
 from backend.brain.skill import load_skills
 from backend.main import app
@@ -23,6 +25,7 @@ from backend.teacher.client import MIN_SERVER_DEADLINE_S
 from .fakes import FakeEngine, FakeGeminiClient
 from .trick_cluster import (
     LATER_TRICK,
+    SEED_CONTROLS,
     TRICK_COMMANDS,
     TRICK_EMBEDDINGS,
     TRICK_ROUTES,
@@ -30,7 +33,15 @@ from .trick_cluster import (
     fill_pool,
 )
 
-PROPOSAL_KEYS = {"id", "skill", "match_rate", "sample_ids", "status", "created_at"}
+PROPOSAL_KEYS = {
+    "id",
+    "skill",
+    "match_rate",
+    "generalization",
+    "sample_ids",
+    "status",
+    "created_at",
+}
 
 
 @pytest.fixture()
@@ -75,6 +86,69 @@ async def test_five_similar_cases_become_exactly_one_proposal(
     assert proposal["match_rate"] >= 0.8
     assert proposal["status"] == "pending"
     assert len(proposal["sample_ids"]) == 5
+
+
+@pytest.mark.anyio
+async def test_the_card_gets_both_numbers_and_they_can_disagree(client, seeded, generator):
+    """`generalization` is the number that varies, so the endpoint has to carry it.
+
+    The head here answers three of the five trick phrases and misses the other
+    two, while every one of them is listed in the draft's `examples` — which is
+    the live shape (JEB-1562): `match_rate` 1.00 because step 0 answers, and a
+    `generalization` well under it because an unlisted phrasing would miss.
+    """
+    shallow = FakeEngine(
+        routes={**dict.fromkeys(TRICK_COMMANDS[:3], "show_trick"), **SEED_CONTROLS},
+        embeddings=TRICK_EMBEDDINGS,
+    )
+    set_engine(shallow)
+    try:
+        generator(draft_json())
+        fill_pool(seeded)
+        proposal = await mined_proposal(client)
+    finally:
+        set_engine(None)
+
+    assert proposal["match_rate"] == pytest.approx(1.0)
+    assert proposal["generalization"] == pytest.approx(0.6)
+
+
+@pytest.mark.anyio
+async def test_a_proposal_mined_before_the_column_existed_reads_as_unknown(client, seeded):
+    """Legacy rows have no `generalization`; `null` is the answer, not a zero."""
+    seeded.execute(
+        "INSERT INTO skill_proposals (id, skill_json, match_rate, sample_ids, status, created_at)"
+        " VALUES ('old', '{\"id\": \"show_trick\"}', 1.0, '[1]', 'pending', '2026-09-01T00:00:00Z')"
+    )
+    seeded.commit()
+
+    proposals = (await client.get("/api/proposals")).json()
+    assert [row["generalization"] for row in proposals] == [None]
+
+
+def test_an_old_db_gains_the_generalization_column(tmp_path):
+    """The column is a migration, so a `pixel.db` from an earlier run upgrades."""
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE skill_proposals (id TEXT PRIMARY KEY, skill_json TEXT, match_rate REAL,"
+        " sample_ids TEXT, status TEXT, created_at TEXT)"
+    )
+    old.execute(
+        "INSERT INTO skill_proposals (id, skill_json, match_rate, sample_ids, status, created_at)"
+        " VALUES ('old', '{}', 1.0, '[1]', 'pending', '2026-09-01T00:00:00Z')"
+    )
+    old.commit()
+    old.close()
+
+    conn = db.connect(path)
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(skill_proposals)")}
+        assert "generalization" in columns
+        row = conn.execute("SELECT generalization FROM skill_proposals").fetchone()
+        assert row["generalization"] is None
+    finally:
+        conn.close()
 
 
 @pytest.mark.anyio

@@ -50,6 +50,7 @@
       "origin": "mined"
     },
     "match_rate": 1.0,
+    "generalization": 0.6,
     "sample_ids": [41, 44, 47, 52, 58],
     "status": "pending",
     "created_at": "2026-09-23T15:04:11Z"
@@ -105,6 +106,7 @@
       "origin": "mined"
     },
     "match_rate": 0.833,
+    "generalization": 0.75,
     "sample_ids": [12, 17, 19, 23, 29, 33],
     "status": "pending",
     "created_at": "2026-09-23T15:04:11Z"
