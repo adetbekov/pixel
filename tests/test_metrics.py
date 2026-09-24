@@ -20,6 +20,7 @@ FIELDS = {
     "total_commands",
     "gemini_calls_24h",
     "teacher_calls_24h",
+    "clusters_stuck",
 }
 
 

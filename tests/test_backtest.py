@@ -12,6 +12,7 @@ from backend.miner.backtest import (
     min_match_rate,
 )
 from backend.miner.case import Case
+from backend.miner.cluster import min_cluster_size
 from backend.miner.schema import MAX_DESCRIPTION_LEN, SkillDraft
 from backend.state import RobotState
 
@@ -234,21 +235,69 @@ def test_a_built_skill_is_marked_as_mined(candidate):
     assert candidate.questions == {}
 
 
-def test_a_candidate_that_takes_another_cluster_is_not_published(active, candidate, cases):
+def leftover(text: str, case_id: int = 99) -> list[Case]:
+    """A pool row no cluster will claim: its own group is below MINER_MIN_CLUSTER."""
+    return [Case(id=case_id, user_text=text, state=MID_STATE, actions=TEACHER_PLANS[0])]
+
+
+def neighbour(text: str) -> list[Case]:
+    """A cluster big enough to be drafted on this same run, so it claims itself back."""
+    return [
+        Case(id=90 + index, user_text=f"{text} {index}", state=MID_STATE, actions=TEACHER_PLANS[0])
+        for index in range(min_cluster_size())
+    ]
+
+
+def test_a_candidate_that_takes_a_command_nobody_will_claim_is_not_published(
+    active, candidate, cases
+):
     """JEB-1548: `show_trick` pulled "покажи сальто" at 0.78 with every control green."""
-    outsider = Case(id=99, user_text="покажи сальто", state=MID_STATE, actions=TEACHER_PLANS[0])
     report = backtest(
-        engine({"покажи сальто": "show_trick"}), active, candidate, cases, [outsider]
+        engine({"покажи сальто": "show_trick"}),
+        active,
+        candidate,
+        cases,
+        [leftover("покажи сальто")],
     )
     assert report.match_rate == pytest.approx(1.0)
     assert report.regression is None
-    assert report.overreach == '"покажи сальто" (another cluster) -> show_trick @ 0.90'
+    assert report.overreach == '"покажи сальто" (no cluster of its own) -> show_trick @ 0.90'
+    assert not report.publishable
+
+
+def test_a_command_a_mineable_neighbour_will_claim_back_is_not_overreach(
+    active, candidate, cases
+):
+    """JEB-1579, and the deadlock it removes.
+
+    Live, "фокус" took "покажи сальто" @0.78 and "сальто" took "сделай фокус"
+    @0.98, so each refused the other and neither intent was ever learned. A
+    cluster that reaches `MINER_MIN_CLUSTER` is drafted on this same run and
+    copies its own phrases into its own `examples`, so step 0 routes them back to
+    it at 1.0 on acceptance — the claim lasts one run, and it is not worth
+    refusing a skill for ever over.
+    """
+    salto = neighbour("сальто")
+    thief = engine({case.user_text: "show_trick" for case in salto})
+    report = backtest(thief, active, candidate, cases, [salto])
+    assert report.overreach is None
+    assert report.publishable
+    # And it was not merely tolerated, it was never asked: the neighbour costs no
+    # forward pass at all.
+    assert not any("сальто" in prompt for prompt in thief.prompts)
+
+
+def test_a_leftover_beside_a_mineable_neighbour_still_vetoes(active, candidate, cases):
+    """The check keeps its teeth: only the claimable half of the pool is dropped."""
+    salto = neighbour("сальто")
+    greedy = engine({case.user_text: "show_trick" for case in salto} | {"спой песню": "show_trick"})
+    report = backtest(greedy, active, candidate, cases, [salto, leftover("спой песню")])
+    assert report.overreach == '"спой песню" (no cluster of its own) -> show_trick @ 0.90'
     assert not report.publishable
 
 
 def test_the_rest_of_the_pool_is_left_alone(active, candidate, cases):
-    outsider = Case(id=99, user_text="покорми", state=MID_STATE, actions=TEACHER_PLANS[0])
-    report = backtest(engine(), active, candidate, cases, [outsider])
+    report = backtest(engine(), active, candidate, cases, [leftover("покорми")])
     assert report.overreach is None
     assert report.publishable
 
@@ -315,7 +364,7 @@ def test_the_cluster_costs_one_forward_pass_per_case(active, candidate, cases):
 def test_a_candidate_that_lost_on_match_rate_never_pays_for_the_pool_scan(active, candidate):
     """The pool has no LIMIT and does not shrink for a rejected candidate (JEB-1548 review)."""
     outsiders = [
-        Case(id=index, user_text=f"команда {index}", state=MID_STATE, actions=[])
+        [Case(id=index, user_text=f"команда {index}", state=MID_STATE, actions=[])]
         for index in range(40)
     ]
     thin = engine()
@@ -329,9 +378,8 @@ def test_a_candidate_that_lost_on_match_rate_never_pays_for_the_pool_scan(active
 
 def test_a_regression_also_stops_the_pool_scan(active, candidate, cases):
     """match_rate is a clean 1.0 here, so the regression is what does the stopping."""
-    outsiders = [Case(id=99, user_text="покажи сальто", state=MID_STATE, actions=[])]
     greedy = engine({"привет": "show_trick", "покажи сальто": "show_trick"})
-    report = backtest(greedy, active, candidate, cases, outsiders)
+    report = backtest(greedy, active, candidate, cases, [leftover("покажи сальто")])
 
     assert report.match_rate == pytest.approx(1.0)
     assert report.regression is not None
@@ -342,7 +390,5 @@ def test_a_regression_also_stops_the_pool_scan(active, candidate, cases):
 def test_the_controls_cost_one_forward_pass_each_not_two(active, candidate):
     """`pick_skill`, not `route`: they read the skill id and never need the plan."""
     probe = engine()
-    check_overreach(probe, [*active, candidate], candidate, [
-        Case(id=1, user_text="покорми", state=MID_STATE, actions=[])
-    ])
+    check_overreach(probe, [*active, candidate], candidate, [leftover("покорми", case_id=1)])
     assert len(probe.calls) == 1

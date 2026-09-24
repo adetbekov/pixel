@@ -19,18 +19,21 @@ from backend.brain.engine import set_engine
 from backend.brain.skill import load_skills
 from backend.main import app
 from backend.miner import MineResult, mine_once, set_generator
+from backend.miner.attempts import max_attempts
 from backend.miner.generate import TIMEOUT_S, GeminiSkillGenerator
 from backend.teacher.client import MIN_SERVER_DEADLINE_S
 
 from .fakes import FakeEngine, FakeGeminiClient
 from .trick_cluster import (
     LATER_TRICK,
+    SALTO_COMMANDS,
     SEED_CONTROLS,
     TRICK_COMMANDS,
     TRICK_EMBEDDINGS,
     TRICK_ROUTES,
     draft_json,
     fill_pool,
+    salto_json,
 )
 
 PROPOSAL_KEYS = {
@@ -63,6 +66,11 @@ async def client(seeded):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
+
+
+def refusals(conn) -> int:
+    """Case sets in the miner's refusal ledger (JEB-1579)."""
+    return int(conn.execute("SELECT COUNT(*) AS n FROM mining_attempts").fetchone()["n"])
 
 
 async def mined_proposal(client) -> dict:
@@ -623,3 +631,100 @@ async def test_a_command_the_teacher_left_out_kills_an_over_broad_candidate(
     assert (
         seeded.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0").fetchone()["n"] == 6
     )
+
+
+@pytest.mark.anyio
+async def test_two_near_clusters_no_longer_refuse_each_other(
+    client, seeded, miner_engine, generator
+):
+    """JEB-1579: the symmetric deadlock, end to end.
+
+    Each draft reaches one command deep into the other's cluster — live, "фокус"
+    took "покажи сальто" @0.78 and "сальто" took "сделай фокус" @0.98 — and under
+    the old `any`-outsider rule that refused both, on every run, for ever. Both
+    clusters are big enough to be drafted on this same run, so each claims its own
+    phrases back through step 0 the moment it is accepted, and neither claim is a
+    reason to refuse a skill.
+    """
+    generator(draft_json(), salto_json(), grouping=[[0, 1, 2, 3, 4], [5, 6, 7]])
+    fill_pool(seeded, [*TRICK_COMMANDS, *SALTO_COMMANDS])
+    miner_engine.routes = {
+        **TRICK_ROUTES,
+        **dict.fromkeys(SALTO_COMMANDS, "do_salto"),
+        "покажи сальто": "show_trick",
+        "сделай фокус": "do_salto",
+    }
+
+    assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 2}
+    assert {p["skill"]["id"] for p in (await client.get("/api/proposals")).json()} == {
+        "show_trick",
+        "do_salto",
+    }
+
+
+@pytest.mark.anyio
+async def test_a_refused_cluster_stops_costing_a_draft_per_run(
+    client, seeded, miner_engine, generator
+):
+    """JEB-1579's other half: the bill of a cluster that cannot pass.
+
+    `mined=1` is set only on publication, so a refused cluster is regrouped and
+    redrafted on every later run — one `models.generate_content` each time, for a
+    case set nothing about has changed. After `MINER_MAX_ATTEMPTS` refusals it is
+    skipped before the generator is called.
+    """
+    thief = FakeEngine(routes={**TRICK_ROUTES, "покорми": "show_trick"}, embeddings=TRICK_EMBEDDINGS)
+    set_engine(thief)
+    try:
+        fake = generator(draft_json())
+        fill_pool(seeded)
+        for _ in range(5):
+            assert (await client.post("/api/mine")).json()["proposals"] == 0
+
+        assert len(fake.calls) == max_attempts()
+        assert (await client.get("/api/metrics")).json()["clusters_stuck"] == 1
+        # Stuck is not mined: the cases are still there for a later, larger cluster.
+        pooled = seeded.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0")
+        assert pooled.fetchone()["n"] == len(TRICK_COMMANDS)
+    finally:
+        set_engine(None)
+
+
+@pytest.mark.anyio
+async def test_a_new_case_buys_the_stuck_cluster_another_draft(
+    client, seeded, miner_engine, generator
+):
+    """The budget is per case set, so new evidence is what reopens the question —
+    the same rule the user's own rejection is remembered by."""
+    thief = FakeEngine(routes={**TRICK_ROUTES, "покорми": "show_trick"}, embeddings=TRICK_EMBEDDINGS)
+    set_engine(thief)
+    try:
+        fake = generator(draft_json())
+        fill_pool(seeded)
+        for _ in range(max_attempts() + 1):
+            await client.post("/api/mine")
+        spent = len(fake.calls)
+
+        fill_pool(seeded, [LATER_TRICK])
+        await client.post("/api/mine")
+        assert len(fake.calls) == spent + 1
+        assert (await client.get("/api/metrics")).json()["clusters_stuck"] == 1
+    finally:
+        set_engine(None)
+
+
+@pytest.mark.anyio
+async def test_a_published_cluster_leaves_no_stuck_counter_behind(
+    client, seeded, miner_engine, generator
+):
+    """A draft that finally lands clears the ledger instead of leaving a false alarm."""
+    generator(draft_json())
+    fill_pool(seeded)
+
+    miner_engine.routes = {**TRICK_ROUTES, "покорми": "show_trick"}
+    assert (await client.post("/api/mine")).json()["proposals"] == 0
+    assert refusals(seeded) == 1
+
+    miner_engine.routes = TRICK_ROUTES
+    assert (await client.post("/api/mine")).json()["proposals"] == 1
+    assert refusals(seeded) == 0

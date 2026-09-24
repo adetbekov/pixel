@@ -13,9 +13,17 @@ router waits. The one term that scales with the *pool* rather than the cluster
 is the backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
 only reaches it for a candidate no regression has already rejected. Since
 ``match_rate`` became a measure of what production will do (JEB-1562) that is
-nearly every candidate, where it used to be almost none: one pass-1 per unmined
-row, per candidate. The pool has no ``LIMIT`` and does not shrink for a candidate
-that was rejected, so this is the term to watch as the pool grows.
+nearly every candidate, where it used to be almost none — but it no longer scans
+the whole pool: JEB-1579 narrowed its control set to the rows no cluster is big
+enough to claim, and on a pool the miner has work to do in, most rows are in a
+cluster. The pool still has no ``LIMIT`` and still does not shrink for a
+candidate that was rejected, so the leftovers are the term to watch as it grows.
+
+The other thing that does not shrink is the *Gemini* bill of a cluster that
+keeps failing, and that one is now bounded: a case set that has been drafted and
+refused ``MINER_MAX_ATTEMPTS`` times is skipped before ``generator.propose`` and
+counted as stuck (:mod:`backend.miner.attempts`), until a new case joins it and
+makes it a different cluster.
 
 Two triggers, one body: every ``MINER_BATCH``-th new mineable case, and
 ``POST /api/mine``. A second concurrent run is refused rather than queued — it
@@ -40,6 +48,7 @@ from .. import db
 from ..brain.engine import DecisionEngine, get_engine
 from ..brain.skill import Skill, load_skills
 from ..state import iso, utcnow
+from . import attempts
 from .backtest import backtest
 from .case import Case, is_mineable, load_pool, pool_size
 from .cluster import group_texts, min_cluster_size
@@ -118,25 +127,41 @@ def _mine() -> int:
         active = load_skills(conn, only_active=True)
         taken = _taken_ids(conn)
         rejected = _rejected_signatures(conn)
+        attempts.forget_gone(conn, {case.id for case in cases})
+        refused = attempts.load(conn)
 
     if len(cases) < min_cluster_size():
         return 0
 
     groups = group_texts(engine, [case.user_text for case in cases], generator.group)
     created = 0
-    for group in groups:
+    for position, group in enumerate(groups):
         cluster = [cases[index] for index in group]
-        # The rest of the pool is the over-broad control set, free of charge:
-        # real commands this candidate is not for (see backtest, check 3).
-        member = set(group)
-        outsiders = [case for index, case in enumerate(cases) if index not in member]
-        proposal = _propose(engine, generator, cluster, outsiders, active, taken, rejected)
-        if proposal is None:
+        signature = tuple(sorted(case.id for case in cluster))
+        if not _worth_drafting(cluster, signature, rejected, refused):
             continue
-        taken.add(proposal.skill.id)
-        with db.lock:
-            _save(conn, proposal)
-        created += 1
+        # The other clusters are the over-broad control set, free of charge: real
+        # commands this candidate is not for. They stay *grouped* because check 3
+        # only vetoes on the ones no cluster is big enough to claim back — see
+        # `backend.miner.backtest.leftovers` (JEB-1579).
+        outsiders = [
+            [cases[index] for index in other]
+            for number, other in enumerate(groups)
+            if number != position
+        ]
+        attempt = _propose(engine, generator, cluster, outsiders, active, taken, signature)
+        if attempt.proposal is not None:
+            taken.add(attempt.proposal.skill.id)
+            with db.lock:
+                _save(conn, attempt.proposal)
+                attempts.clear(conn, signature)
+            created += 1
+        elif attempt.reason is not None:
+            # A draft was paid for and refused. Counted so the next run can stop
+            # paying for the same one; the write is here rather than in `_propose`
+            # to keep every network call outside `db.lock`.
+            with db.lock:
+                attempts.record(conn, signature, attempt.reason)
     return created
 
 
@@ -152,42 +177,86 @@ class MinedProposal:
     sample_ids: list[int]
 
 
-def _propose(
-    engine: DecisionEngine,
-    generator: SkillGenerator,
-    cluster: list[Case],
-    outsiders: list[Case],
-    active: list[Skill],
-    taken: set[str],
-    rejected: set[tuple[int, ...]],
-) -> MinedProposal | None:
-    """One cluster -> one proposal, or ``None`` and the reason in the log."""
-    if len(cluster) < min_cluster_size():
-        return None
+@dataclass(frozen=True)
+class Attempt:
+    """What one drafted cluster produced, and whether it is worth remembering.
 
-    signature = tuple(sorted(case.id for case in cluster))
+    ``proposal`` is a published draft; ``reason`` is a draft that was generated,
+    backtested and refused, which is what :mod:`backend.miner.attempts` counts;
+    neither is a draft that never arrived, which says nothing about the cluster.
+    """
+
+    proposal: MinedProposal | None = None
+    reason: str | None = None
+
+
+def _worth_drafting(
+    cluster: list[Case],
+    signature: tuple[int, ...],
+    rejected: set[tuple[int, ...]],
+    refused: dict[tuple[int, ...], int],
+) -> bool:
+    """Everything that can be decided about a cluster before paying for a draft.
+
+    Both "no" answers are about the same thing — this exact set of cases has been
+    through the mill already — and both are keyed on the case ids rather than on
+    the cluster, because the grouper is a Gemini call and does not hand back the
+    same grouping twice.
+    """
+    if len(cluster) < min_cluster_size():
+        return False
+
     if signature in rejected:
         # The user already said no to exactly these cases. Re-proposing them on
         # the very next run is how a suggestion panel becomes noise.
         log.info("miner: cluster %s was already rejected", list(signature))
-        return None
+        return False
 
+    spent = refused.get(signature, 0)
+    if spent >= attempts.max_attempts():
+        # Stuck: this exact case set has had its draft budget and no new case has
+        # joined it since, so the only thing another run could change is Gemini's
+        # wording. Skipped *before* `generator.propose`, which is the whole point
+        # — the bill this removes is one generate call per run, for ever.
+        log.info(
+            "miner: cluster %s is stuck — %d drafts refused and no new case since; not redrawing",
+            list(signature),
+            spent,
+        )
+        return False
+    return True
+
+
+def _propose(
+    engine: DecisionEngine,
+    generator: SkillGenerator,
+    cluster: list[Case],
+    outsiders: list[list[Case]],
+    active: list[Skill],
+    taken: set[str],
+    signature: tuple[int, ...],
+) -> Attempt:
+    """One drafted cluster -> one proposal, or the reason it did not become one."""
     skill = generator.propose(cluster, active)
     if skill is None:
-        return None
+        # Not counted against the budget. A draft that never arrived is a verdict
+        # on Gemini — a dead key, an exhausted quota, three malformed answers —
+        # and not on this case set, and a failed call bills no tokens either.
+        # `generator.propose` has its own bounded retry inside the one call.
+        return Attempt()
     if skill.id in taken:
         log.warning("miner: candidate id %r is already in use", skill.id)
-        return None
+        return Attempt(reason=f"candidate id {skill.id!r} is already in use")
 
     report = backtest(engine, active, skill, cluster, outsiders)
     if report.regression is not None:
         log.warning(
             "miner: %r rejected — it breaks an active skill: %s", skill.id, report.regression
         )
-        return None
+        return Attempt(reason=f"breaks an active skill: {report.regression}")
     if report.overreach is not None:
         log.warning("miner: %r rejected — it is drafted too wide: %s", skill.id, report.overreach)
-        return None
+        return Attempt(reason=f"drafted too wide: {report.overreach}")
     if not report.publishable:
         log.info(
             "miner: %r rejected — match_rate %.2f (generalization %.2f, agreement %.2f)"
@@ -198,7 +267,13 @@ def _propose(
             report.agreement,
             report.total,
         )
-        return None
+        return Attempt(
+            reason=(
+                f"match_rate {report.match_rate:.2f} on {report.total} cases"
+                f" (generalization {report.generalization:.2f},"
+                f" agreement {report.agreement:.2f})"
+            )
+        )
 
     # `generalization` well under `match_rate` means the cluster is covered but a
     # *sixth* phrasing will still cost a Gemini call; it is stored below and shown
@@ -214,12 +289,14 @@ def _propose(
         report.agreement,
         report.total,
     )
-    return MinedProposal(
-        id=str(uuid.uuid4()),
-        skill=skill,
-        match_rate=round(report.match_rate, 3),
-        generalization=round(report.generalization, 3),
-        sample_ids=list(signature),
+    return Attempt(
+        proposal=MinedProposal(
+            id=str(uuid.uuid4()),
+            skill=skill,
+            match_rate=round(report.match_rate, 3),
+            generalization=round(report.generalization, 3),
+            sample_ids=list(signature),
+        )
     )
 
 

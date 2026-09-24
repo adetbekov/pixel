@@ -96,8 +96,50 @@ accepted ``show_trick`` ("показать фокус") pulled "покажи с�
 0.78 while every ``examples[0]`` control passed cleanly. The pool has the right
 control set for free — the *other* cases in ``teacher_log``, the ones the
 grouper put in other clusters. They are commands a real user typed that this
-candidate is not for, so a candidate that wins any of them is drafted too wide
+candidate is not for, so a candidate that wins one of them is drafted too wide
 and is not proposed.
+
+Not *any* of them, though, and that distinction is JEB-1579. The control set is
+the other clusters, and a cluster that reaches ``MINER_MIN_CLUSTER`` is drafted
+on this very run: its own phrases go into its own ``examples`` word for word, so
+the moment it is accepted step 0 routes them to it at 1.0 and no head score can
+take them away. A claim on those phrases is therefore temporary by construction
+— it lasts until the neighbour is mined — and treating it as fatal is what made
+two near-synonymous clusters kill each other. Measured live, three clusters ×
+three runs on the ``multilingual`` checkpoint (``scripts/probe_miner_match.py``):
+"фокус" took "покажи сальто" @0.78, "сальто" took "сделай фокус" @0.98, both were
+refused, both stayed in the pool — ``mined=1`` is set only on publication
+(:func:`backend.miner.run._save`) — and the next run redrew the same two drafts
+and refused them again. Six refusals in nine, all of them this, and neither
+intent could ever be learned while the other one existed.
+
+So the control set is the pool **minus every cluster big enough to claim its own
+phrases**: the commands left over, the ones no cluster in this pool is large
+enough to be drafted for. Those are the ones a claim keeps for good, and those
+are the ones that veto. Re-measured the same way, three clusters × three runs
+with three one-off leftovers in the pool: publishable went from 1 of 3 to 7 of 9,
+all six neighbour claims were reported and none vetoed ("фокус" took "покажи
+сальто" @0.78 in all three runs, "сальто" took "сделай фокус" @0.88…0.99), and
+the check kept its teeth — two of the nine were refused for taking "спой песню",
+a leftover nothing will claim, at 0.78 and 0.99.
+
+The trade is deliberate and asymmetric: a candidate accepted over a neighbour's
+phrase mis-routes that phrase for one mining run, against an 8-primitive library
+where every wrong answer is still a jump or a sentence, and the user can 👎 it
+into :mod:`backend.feedback`'s auto-disable — while a candidate refused over it
+is refused for ever and its whole intent stays on Gemini, which is the number
+the project is measured on. It also costs less than it did: a vetoed candidate
+now pays one forward pass per *leftover* row instead of per unmined row.
+
+What stops the two clusters becoming one skill each for one intent — the other
+reading of the same symptom, and the other half of what JEB-1579 asked — is
+nothing here, on purpose. Merging them belongs to the grouper
+(:mod:`backend.miner.cluster`), which is one Gemini call at 0.875 purity; a gate
+that merges on a routing collision would be a second, worse grouper built out of
+head scores, and it would still deadlock on the next pair. Two skills for two
+phrasings of one intent costs one extra option in the router's ``choice`` list
+and is visible to the user on the proposal card; never learning either costs the
+metric.
 
 Which router each check calls follows from what it is asking, and they do not all
 ask the same thing. Check 1 asks what production will answer, so it calls
@@ -119,6 +161,7 @@ from ..brain.engine import DecisionEngine
 from ..brain.router import RouterHit, example_index, normalize, pick_skill, route
 from ..brain.skill import Skill
 from .case import Case
+from .cluster import min_cluster_size
 
 #: Measured on the live checkpoint, three clusters × three runs (JEB-1562,
 #: ``scripts/probe_miner_match.py``): ``match_rate`` came out 1.00 in 9 runs of 9,
@@ -157,8 +200,9 @@ class Backtest:
     #: ``None`` when every active skill still routes to itself; otherwise the
     #: phrase that moved and where it went, so the log says what broke.
     regression: str | None = None
-    #: ``None`` when the candidate left the rest of the pool alone; otherwise the
-    #: outside-cluster command it took and the confidence it took it at.
+    #: ``None`` when the candidate left the pool's leftovers alone; otherwise the
+    #: unclaimable command it took and the confidence it took it at. A claim on a
+    #: *mineable* neighbour's phrase is not this — see the module docstring.
     overreach: str | None = None
 
     @property
@@ -186,19 +230,33 @@ def check_regressions(
     return None
 
 
-def check_overreach(
-    engine: DecisionEngine, trial: list[Skill], candidate: Skill, outsiders: list[Case]
-) -> str | None:
-    """First pool command from *outside* the cluster that the candidate takes.
+def leftovers(outsiders: list[list[Case]]) -> list[Case]:
+    """The pool commands no cluster in it is big enough to claim (JEB-1579).
 
-    The only unbounded loop in this module — the pool has no ``LIMIT`` — so
-    :func:`backtest` calls it last and only when nothing else has already
-    rejected the candidate.
+    ``outsiders`` is the run's *other* clusters, grouped as the grouper left
+    them. A group that reaches ``MINER_MIN_CLUSTER`` is drafted on this same run
+    and its phrases end up in its own ``examples``, so step 0 takes them back on
+    acceptance whatever the head thinks; a group below it is not drafted at all,
+    and a command in it stays wherever the router puts it. Only the second kind
+    is a control.
     """
-    for case in outsiders:
+    minimum = min_cluster_size()
+    return [case for group in outsiders if len(group) < minimum for case in group]
+
+
+def check_overreach(
+    engine: DecisionEngine, trial: list[Skill], candidate: Skill, outsiders: list[list[Case]]
+) -> str | None:
+    """First *unclaimable* pool command the candidate takes, if any.
+
+    The only loop in this module the pool's size decides — and the pool has no
+    ``LIMIT`` — so :func:`backtest` calls it last and only when nothing else has
+    already rejected the candidate.
+    """
+    for case in leftovers(outsiders):
         picked, confidence = pick_skill(engine, trial, case.user_text)
         if picked is not None and picked.id == candidate.id:
-            return f'"{case.user_text}" (another cluster) -> {candidate.id} @ {confidence:.2f}'
+            return f'"{case.user_text}" (no cluster of its own) -> {candidate.id} @ {confidence:.2f}'
     return None
 
 
@@ -207,9 +265,13 @@ def backtest(
     active: list[Skill],
     candidate: Skill,
     cases: list[Case],
-    outsiders: list[Case] | None = None,
+    outsiders: list[list[Case]] | None = None,
 ) -> Backtest:
     """Run the candidate against its own cluster, the library and the rest of the pool.
+
+    ``outsiders`` is the run's other clusters, grouped — not a flat pool — because
+    check 3's control set is decided by how big each of them is
+    (:func:`leftovers`).
 
     The candidate is appended, never inserted: that is where ``load_skills``
     puts a mined skill (``ORDER BY rowid``), so the trial registry has to have
@@ -219,7 +281,7 @@ def backtest(
     ``generalization`` cost one forward pass per cluster case — step 0 answers the
     routing for free and a mined skill has no ``questions``, so pass 2 is free too
     — and check 2 one per active skill; both small and both fixed. Check 3 costs
-    one per *unmined row in the pool*, and the pool does not
+    one per *leftover row in the pool*, and the pool does not
     shrink for a candidate that fails, so a run that rejects everything would pay
     it over and over. A candidate that has already lost on ``match_rate`` or on a
     regression cannot be published whatever check 3 says, so it is not run
@@ -229,9 +291,10 @@ def backtest(
     Since ``match_rate`` became a measure of production rather than of the head
     (JEB-1562) it is no longer what rejects most drafts — a draft that lists its
     cluster covers it — so check 3 now runs for nearly every candidate instead of
-    almost none. That is the bill this change moves, and it is bounded by the pool:
-    one pass-1 per unmined row, on the same run that already paid a Gemini
-    grouping call. It stays last so a regression still stops it.
+    almost none. What keeps that affordable is JEB-1579 narrowing its control set
+    to the pool's leftovers: the mineable neighbours, which are most of the pool
+    whenever the miner has anything to do, are neither scanned nor charged for.
+    It stays last so a regression still stops it.
     """
     trial = [*active, candidate]
     # The phrases step 0 will answer, which costs no forward pass to know. `route`
