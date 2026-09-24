@@ -1,8 +1,8 @@
 """The automatic miner, off the request path.
 
 A mining run is an embed of the whole pool, one Gemini call to group it (~0.9 s
-of network) and a backtest per candidate — seconds, and all of it behind
-``LayaEngine._lock``. Running it inside ``POST /api/chat`` made every
+of network) and a backtest per candidate — seconds, and every forward pass in it
+behind ``LayaEngine._lock``. Running it inside ``POST /api/chat`` made every
 ``MINER_BATCH``-th miss pay for it, and the delay grew with the pool: measured
 on the real checkpoint (JEB-1509) the embed alone is 430 ms at 20 cases and
 2473 ms at 100, against 110 ms for one router ``predict``.
@@ -14,10 +14,17 @@ what :func:`backend.miner.run.mine_once` already refuses with its own lock. A
 trigger that arrives while a run is in flight and one already queued is dropped,
 not buffered: the pool it would read is still there on the next miss.
 
-What this does **not** fix is the engine lock — a backtest running in the
-background still holds it, so a chat arriving mid-run waits for the current
-forward pass. Bounding the pool (``MINER_POOL_WINDOW``, see
-:func:`backend.miner.case.load_pool`) is what bounds that wait.
+What this does **not** remove is the engine lock: a chat arriving mid-run still
+queues behind the backtest's current forward pass. Measured, rather than feared
+(JEB-1599, ``scripts/bench_router_under_mining.py``, live checkpoint, pool 40,
+three runs of n=40): that wait is 245 ms at p50 / 286 ms per pass, taking
+``POST /api/chat`` from p50 396…470 ms / p95 719…889 ms idle to p50 650…827 ms /
+p95 1020…1183 ms while a run is in flight, and time *inside* ``predict`` is
+unchanged (220 ms against 233 ms) — so it is the miner's pass that is waited on,
+not the CPU. Accepted as it stands:
+the wait is one pass because the lock is per pass, ``MINER_POOL_WINDOW`` shortens
+the run and not the wait (pool 20 reads the same band), and the only thing that
+would remove it is a second resident copy of a 322M-parameter checkpoint.
 
 ``POST /api/mine`` does not come through here. It is the manual run and its
 caller wants the proposal count back, so it stays synchronous.

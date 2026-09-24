@@ -7,10 +7,13 @@ manual ``POST /api/mine`` calls this directly, because it wants the count back.
 
 What a run costs, measured on the live checkpoint
 (``scripts/calibrate_miner_sim.py``, section 6): a run is roughly one teacher
-grouping call plus a few forward passes per cluster case and per active skill,
-and it holds ``LayaEngine._lock`` for all of them, so every other request's
-router waits — which is why a run being off the request path is not the whole
-answer, and :func:`backend.miner.case.load_pool` bounds what one run reads.
+grouping call plus a few forward passes per cluster case and per active skill.
+It takes ``LayaEngine._lock`` once **per pass**, never for the series, so a chat
+that arrives mid-run waits for the forward pass in flight and not for the run:
+245 ms at p50 against a run of several seconds, measured on the live checkpoint
+(JEB-1599, ``scripts/bench_router_under_mining.py``). That is also why
+``MINER_POOL_WINDOW`` is not a latency knob — it decides how long a run lasts,
+not what one chat inside it pays.
 
 The one term that scales with the *pool* rather than the cluster is the
 backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
