@@ -19,10 +19,13 @@ name: Live Gemini Contract
 # the two calls are usually refused with `429 RESOURCE_EXHAUSTED` (JEB-1553). The probe
 # reports that as exit 2 — "could not be checked" — never as a contract finding.
 #
-# Note on the schedule, same as required-checks-audit.yml: GitHub starts `schedule:`
-# only from the default branch, which for pixel is `main`. Until this file reaches
-# `main` with a release, the nightly half does not exist and only `workflow_dispatch`
-# is live. "The workflow is in the repository" is not "the nightly runs".
+# Note on the triggers, same as required-checks-audit.yml: GitHub resolves both
+# `schedule:` and `workflow_dispatch` only from the default branch, which for pixel
+# is `main`. Until this file reaches `main` with a release, neither trigger works —
+# the nightly does not exist, and a manual start is refused with
+# `HTTP 404: workflow live-gemini-contract.yml not found on the default branch`
+# even when `--ref` names a branch that has the file (measured, JEB-1553).
+# "The workflow is in the repository" is not "the workflow can run".
 #
 # This job is deliberately NOT a required status check on any branch: it can go red
 # because Google changed something, and that must never be able to block a merge.
