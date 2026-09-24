@@ -68,7 +68,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. |
 | `MINER_SIM` | `0.88` | Cosine that joins two commands into one cluster — the **fallback** grouper only, used when the teacher's grouping call fails. Narrow usable band; see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
-| `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
+| `MINER_MIN_MATCH` | `0.8` | Share of its cluster an accepted skill must take off Gemini to be proposed — measured by routing every case the way `/api/chat` will after acceptance. Calibrated on the live checkpoint; see `scripts/probe_miner_match.py`. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
 | `SKILL_MIN_RATED` | `5` | Ratings required before that rule applies at all. |
 
@@ -171,15 +171,31 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    failing validation, never loosen the validation. A mined skill carries no
    `questions` and branches only on the robot's own state; it is assembled into a real `Skill`, and
    that is where `validate_plan` refuses anything outside the action library.
-3. **Backtest.** Every case of the cluster is re-routed against `active + candidate`, and a match
-   means the router picked the candidate above its threshold. `match_rate` must reach
-   `MINER_MIN_MATCH` (0.8). Whether the candidate also *did what the teacher did* (action names
-   only — the teacher never phrases a reply the same way twice) is reported alongside as
-   `agreement` and does not gate. It used to: on live data that made the bar unreachable, because
-   five phrasings of one command produce several different teacher plans, so the best any single
-   plan could score was the share of the most common one — and the candidate that scored *highest*
-   on a cluster of refusals was the one that reproduced the refusal. Measured in
-   `scripts/probe_miner_match.py` (JEB-1547).
+3. **Backtest.** `match_rate` is **the share of the cluster that stops reaching Gemini once the user
+   accepts this skill**: every case is re-routed through `active + candidate` by exactly the call
+   `/api/chat` will make afterwards — step 0, the exact `examples` lookup, included — and a match
+   means the router landed on the candidate above its threshold. It must reach `MINER_MIN_MATCH`
+   (0.8), and it is the only number of the three that gates. Two others are computed and logged
+   beside it:
+   - `generalization` — the same share from the `choice` **head alone**, with no `examples` to read:
+     what a phrasing nobody has typed yet would get. `match_rate` used to *be* this number
+     (`use_examples=False`), and that made the gate a measurement of a router production never runs:
+     the generator copies the cluster into `examples` word for word, so those phrases route at 1.0
+     through step 0 after acceptance. Live, the "фокус" cluster was refused at 0.60 three runs out of
+     three on two phrases step 0 routes at 1.0, and one cluster read
+     0.60 / 1.00 / 0.80 / 0.40 / 0.80 / 0.40 over six runs because the head scores the `id` and
+     `description` Gemini rewrites every time. Refusing a candidate on it is also backwards: a weak
+     description still takes the listed commands off Gemini, while a refusal leaves all of them on it
+     (JEB-1562).
+   - `agreement` — whether the candidate also *did what the teacher did* (action names only; the
+     teacher never phrases a reply the same way twice). It used to gate too, and on live data that
+     made the bar unreachable: five phrasings of one command produce several different teacher plans,
+     so the best any single plan could score was the share of the most common one — and the candidate
+     that scored *highest* on a cluster of refusals was the one that reproduced the refusal
+     (JEB-1547).
+
+   Both are measured by `scripts/probe_miner_match.py`, which is also what the threshold is
+   calibrated with. What keeps a bad candidate out is steps 4 and 5, and the user.
 4. **Regression check.** A match rate cannot see the damage a new option does to the old ones: stage
    2 measured all 24 orderings of the four starter skills spreading the hit rate over 7/10…9/10, and
    alphabetical order pushing "покорми" under its threshold outright. So one control phrase per
@@ -190,9 +206,16 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    rest of the pool, the cases the grouper put in *other* clusters, is routed too: a candidate that
    wins any of them is drafted too wide and is not proposed. This is the one check whose cost grows
    with the pool, which has no `LIMIT` and does not shrink for a rejected candidate — so it runs
-   last, only for a candidate steps 3 and 4 have already cleared. None of steps 3–5 may use the
-   router's `examples` lookup, since a candidate's `examples` are exactly the cluster under test;
-   steps 4 and 5 only read which skill won, so they take `pick_skill` (pass 1 alone) instead.
+   last, only for a candidate steps 3 and 4 have already cleared. Since step 3 stopped rejecting
+   drafts that cover their own cluster, that is now nearly every candidate rather than almost none:
+   one pass-1 per unmined row. Steps 4 and 5 only read which skill won, so they take `pick_skill`
+   (pass 1 alone, and no `examples` lookup to work around) instead of a full `route`.
+
+   Which of the three does the work, measured live over three clusters × three runs (JEB-1562):
+   step 3 rejected 0 of 9, step 4 rejected 0 of 9, step 5 rejected 6 of 9 — every one of them the
+   two adjacent clusters "покажи фокус" and "покажи сальто" taking each other's phrases at 0.78…0.98.
+   So the over-broad check is now the gate that decides, and it is deterministic where `match_rate`
+   used to be a coin flip.
 6. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
    `POST /api/proposals/{id}/accept` adds the skill, and it takes effect in the same process, since
    `/api/chat` reads the library on every request. `reject` puts the cases back in the pool and

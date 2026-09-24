@@ -1,35 +1,42 @@
 #!/usr/bin/env python3
 """
-probe_miner_match.py — run one cluster through the real teacher, the real skill
-generator and the real backtest, and print why `match_rate` comes out where it
-does.
+probe_miner_match.py — run whole clusters through the real teacher, the real
+skill generator and the real backtest, and print why each of the backtest's
+numbers comes out where it does.
 
 Why this exists (JEB-1547). On live data the miner never published anything: a
 cluster of paraphrases of one command scored 0.25..0.67 against
 `MINER_MIN_MATCH=0.8`, and the draft it scored was a *refusal* — `{set_face,
 say}` plus "я не умею показывать фокусы" — because that is what the teacher had
 answered and `teacher_log` is the miner's only raw material. Lowering the bar
-would have published exactly that skill. This script is what the two fixes were
-measured with, and it is here so the next person touching either number measures
-instead of guessing:
+would have published exactly that skill. This script is what the fixes were
+measured with, and it is here so the next person touching any of these numbers
+measures instead of guessing:
 
   * the teacher improvises out of the library instead of declining, and says so
     in `handled` (`backend/teacher/prompt.py`, `backend/teacher/schema.py`);
-  * `match_rate` counts routing coverage, and the teacher-plan comparison is
-    reported as `agreement` next to it instead of gating
-    (`backend/miner/backtest.py`).
+  * `match_rate` is what production will do with the cluster after acceptance,
+    the `examples` lookup included; the head's own answer is reported as
+    `generalization` and the teacher-plan comparison as `agreement`, and neither
+    gates (`backend/miner/backtest.py`, JEB-1562).
 
-Both numbers are printed for every cluster, so the argument for the split can be
-re-run rather than believed.
+All three are printed for every cluster, per run, so the argument for the split
+can be re-run rather than believed — and so can the threshold: the last block
+prints the share of clusters that publish, which is what `MINER_MIN_MATCH` is
+calibrated against.
 
 Needs `GEMINI_API_KEY`, the Laya weights and therefore a network on first run —
 it is a tool, not a test. CI covers all of this with `FakeEngine` and
 `FakeGeminiClient`; what CI cannot cover is what the live model answers.
 
-    python scripts/probe_miner_match.py
+    python scripts/probe_miner_match.py [runs]
 
-Costs a handful of `gemini-2.5-flash-lite` calls: one teacher call per command
-plus one generate call per cluster.
+`runs` defaults to 1. Every run re-teaches and re-drafts from scratch, because
+that is where the spread lives: Gemini rewrites the draft's `id` and
+`description` each time, and the `choice` head scores exactly those.
+
+Costs a handful of `gemini-2.5-flash-lite` calls per run: one teacher call per
+command plus one generate call per cluster.
 """
 
 from __future__ import annotations
@@ -39,9 +46,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend.brain.router import RouterHit, default_threshold, route
+from backend.brain.router import RouterHit, default_threshold, normalize, pick_skill, route
 from backend.brain.skill import Skill, load_seed_skills
-from backend.miner.backtest import backtest, min_match_rate
+from backend.miner.backtest import Backtest, backtest, min_match_rate
 from backend.miner.case import Case
 from backend.miner.generate import GeminiSkillGenerator
 from backend.state import RobotState
@@ -68,6 +75,16 @@ CLUSTERS: dict[str, list[str]] = {
         "сальто умеешь?",
         "крутани сальто",
         "хочу увидеть сальто",
+    ],
+    # A third intent, and deliberately one the library expresses with `say` and
+    # `set_face` rather than movement: the threshold has to be calibrated on more
+    # than one shape of cluster (JEB-1562).
+    "похвала": [
+        "похвали меня",
+        "скажи что-нибудь приятное",
+        "сделай мне комплимент",
+        "скажи что я молодец",
+        "хочу похвалу",
     ],
 }
 
@@ -120,65 +137,123 @@ def report_teacher_spread(cases: list[Case]) -> None:
     )
 
 
-def report_backtest(engine, active: list[Skill], candidate: Skill, cases: list[Case]) -> None:
+def report_backtest(
+    engine,
+    active: list[Skill],
+    candidate: Skill,
+    cases: list[Case],
+    outsiders: list[Case],
+) -> Backtest:
+    """Print the two routers side by side, then the numbers the backtest reports.
+
+    Two columns per case, because JEB-1562 is the difference between them:
+    `prod` is `route` as `/api/chat` will call it after acceptance — step 0, the
+    exact `examples` lookup, included — and `head` is `pick_skill`, the `choice`
+    head with nothing to look up. The generator is told to copy the cluster into
+    `examples` word for word, so `prod` is normally 1.00 on every line while
+    `head` is whatever the draft's own wording earns this run.
+    """
     print(f"  candidate {candidate.id!r} / {candidate.description!r}")
     for rule in candidate.rules:
         print(f"    when={rule.when or '{}'} -> {[s['action'] for s in rule.actions]}")
 
+    trial = [*active, candidate]
     for case in cases:
-        # `use_examples=False`, exactly as the backtest routes: a candidate's
-        # `examples` *are* the cluster under test, so the router's step-0 lookup
-        # would answer every line below from the draft itself and print 1.00
-        # against a `match_rate` computed from the head (JEB-1548).
-        outcome = route(
-            engine, [*active, candidate], case.user_text, case.state, use_examples=False
-        )
+        outcome = route(engine, trial, case.user_text, case.state)
         picked = outcome.skill_id if isinstance(outcome, RouterHit) else "miss"
-        routed = picked == candidate.id
+        covered = picked == candidate.id
         got = sorted(action_set(outcome.raw_plan)) if isinstance(outcome, RouterHit) else []
-        agrees = routed and set(got) == case.action_names
+        agrees = covered and set(got) == case.action_names
+
+        head, head_confidence = pick_skill(engine, trial, case.user_text)
+        head_id = head.id if head is not None else "miss"
+        drafted = {normalize(example) for example in candidate.examples}
+        listed = "listed" if normalize(case.user_text) in drafted else "-"
         print(
-            f"  {case.user_text!r:26} -> {picked:12} @{outcome.confidence:.2f} "
-            f"routed={routed!s:5} agrees={agrees!s:5} "
+            f"  {case.user_text!r:30} prod={picked:12} @{outcome.confidence:.2f} {listed:6} "
+            f"head={head_id:12} @{head_confidence:.2f} agrees={agrees!s:5} "
             f"candidate={got} teacher={sorted(case.action_names)}"
         )
 
-    report = backtest(engine, active, candidate, cases)
+    report = backtest(engine, active, candidate, cases, outsiders)
     print(
         f"  match_rate {report.match_rate:.2f} ({report.matched}/{report.total}), "
-        f"agreement {report.agreement:.2f}, regression {report.regression}"
+        f"generalization {report.generalization:.2f}, agreement {report.agreement:.2f}"
     )
+    print(f"  regression {report.regression}, overreach {report.overreach}")
     print(
         f"  publishable={report.publishable} "
         f"(MINER_MIN_MATCH={min_match_rate():.2f}, ROUTER_THRESHOLD={default_threshold():.2f})"
     )
+    return report
+
+
+def report_calibration(results: dict[str, list[Backtest | None]]) -> None:
+    """The threshold's own measurement: how often each cluster publishes.
+
+    `MINER_MIN_MATCH` is not a matter of taste — it is the share of publishable
+    clusters it produces on live data, which is what this block prints. A number
+    the good clusters cannot reach stops the learning loop dead (JEB-1547), and a
+    number every draft clears makes checks 4 and 5 the only gates there are.
+    """
+    print(f"\n=== calibration: MINER_MIN_MATCH={min_match_rate():.2f} ===")
+    published = 0
+    total = 0
+    for name, reports in results.items():
+        for label, get in (
+            ("match_rate", lambda r: f"{r.match_rate:.2f}"),
+            ("generalization", lambda r: f"{r.generalization:.2f}"),
+            ("agreement", lambda r: f"{r.agreement:.2f}"),
+            ("publishable", lambda r: str(r.publishable)),
+        ):
+            cells = " ".join(f"{(get(r) if r is not None else 'n/a'):>6}" for r in reports)
+            print(f"  {name:10} {label:14} {cells}")
+        published += sum(1 for r in reports if r is not None and r.publishable)
+        total += len(reports)
+    print(f"  publishable clusters: {published}/{total}")
 
 
 def main() -> None:
     from backend.brain.engine import LayaEngine
 
+    runs = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     engine = LayaEngine()
     active = load_seed_skills()
     teacher = GeminiTeacher()
     generator = GeminiSkillGenerator()
-    print(f"library: {[skill.id for skill in active]}")
+    print(f"library: {[skill.id for skill in active]}, runs: {runs}")
 
     print("\n=== 1. commands the library cannot express ===")
     kept = teach(teacher, active, UNTEACHABLE)
     print(f"  mineable after the `handled` filter: {len(kept)}/{len(UNTEACHABLE)} (want 0)")
 
-    for name, texts in CLUSTERS.items():
-        print(f"\n=== 2. cluster {name!r}: what the teacher answered ===")
-        cases = teach(teacher, active, texts)
-        print(f"  mineable: {len(cases)}/{len(texts)}")
-        report_teacher_spread(cases)
+    results: dict[str, list[Backtest | None]] = {name: [] for name in CLUSTERS}
+    for run in range(1, runs + 1):
+        # Every cluster is taught before any of them is drafted, because each
+        # candidate's over-broad control set is the other clusters — and every run
+        # re-teaches and re-drafts from scratch, since the draft's wording is where
+        # the spread the head reacts to comes from.
+        taught: dict[str, list[Case]] = {}
+        for name, texts in CLUSTERS.items():
+            print(f"\n=== run {run}, cluster {name!r}: what the teacher answered ===")
+            cases = teach(teacher, active, texts)
+            print(f"  mineable: {len(cases)}/{len(texts)}")
+            report_teacher_spread(cases)
+            taught[name] = cases
 
-        print(f"\n=== 3. cluster {name!r}: the draft, case by case ===")
-        candidate = generator.propose(cases, active)
-        if candidate is None:
-            print("  the generator produced nothing — see the log above")
-            continue
-        report_backtest(engine, active, candidate, cases)
+        for name, cases in taught.items():
+            print(f"\n=== run {run}, cluster {name!r}: the draft, case by case ===")
+            candidate = generator.propose(cases, active)
+            if candidate is None:
+                print("  the generator produced nothing — see the log above")
+                results[name].append(None)
+                continue
+            # The other clusters are this candidate's over-broad control set, the
+            # same way the rest of the pool is one in a real run.
+            outsiders = [case for other, group in taught.items() if other != name for case in group]
+            results[name].append(report_backtest(engine, active, candidate, cases, outsiders))
+
+    report_calibration(results)
 
 
 if __name__ == "__main__":
