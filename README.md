@@ -65,7 +65,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `LAYA_DEVICE` | `cpu` | Where the local model runs. |
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
 | `ROUTER_THRESHOLD` | `0.66` | Confidence a skill needs to win the router. Below it, the command is a miss. Calibrated on the live checkpoint — see `scripts/calibrate_router.py`. |
-| `MINER_BATCH` | `5` | Mine on every N-th unmined case. |
+| `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. |
 | `MINER_SIM` | `0.88` | Cosine that joins two commands into one cluster — the **fallback** grouper only, used when the teacher's grouping call fails. Narrow usable band; see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
@@ -105,12 +105,26 @@ always, because "share of commands handled without Gemini" is the metric the who
 measured on. `latency_ms` on a teacher reply covers the router miss as well as the Gemini call —
 it is what the user actually waited.
 
-Gemini writes no code. It returns a `{reply, actions}` plan, and that plan passes two independent
-checks: the response schema (`backend/teacher/schema.py`) for the shape, and `validate_plan`
-(`backend/actions.py`) for membership of the action library. The second is the one that matters —
-a schema cannot stop `{"action": "hack_nasa"}` in a string field. A plan that is invalid, empty or
-carries a blank `reply` is retried once with the reason, and a second failure answers with a fixed
-fallback plan; a timeout or an API error does the same. The user never sees a traceback.
+Gemini writes no code. It returns a `{reply, handled, actions}` plan, and that plan passes two
+independent checks: the response schema (`backend/teacher/schema.py`) for the shape, and
+`validate_plan` (`backend/actions.py`) for membership of the action library. The second is the one
+that matters — a schema cannot stop `{"action": "hack_nasa"}` in a string field. A plan that is
+invalid or carries a blank `reply` is retried once with the reason, and a second failure answers
+with a fixed fallback plan; a timeout or an API error does the same. The user never sees a
+traceback.
+
+**The teacher improvises; it does not decline.** A pet with eight primitives can *act out* far more
+than it can do literally, and the prompt now says so: "покажи фокус" is a spin, a jump and a happy
+face. Before that rule, four of five phrasings of that command came back as "я не умею показывать
+фокусы" — and since `teacher_log` is the miner's only raw material, stage 4 dutifully learned a
+skill that answers "я не умею" for ever, from Laya, with no route left back to the teacher
+(JEB-1547, measured by `scripts/probe_miner_match.py`).
+
+Some commands really are outside the library — the weather, a pizza, a translation. The teacher
+declines those and says so in `handled`, which goes into `teacher_log` and keeps the miner off
+them. A refusal has nothing to do and only something to say, so an empty `actions` is accepted
+there and the reply becomes the `say` step; an empty plan that claims `handled` is a contradiction
+and is retried.
 
 Two clocks bound the wait: 8 s per call (`TIMEOUT_S`) and 12 s across both attempts
 (`TOTAL_DEADLINE_S`), the retry getting whatever is left. The SDK surface the teacher calls is
@@ -118,9 +132,12 @@ pinned (`google-genai>=2.25,<3`) and asserted against the installed package by
 `test_the_sdk_still_has_the_surface_we_call` — a renamed argument would otherwise reach production
 as a fallback plan and a log line.
 
-Every teacher call writes a row to `teacher_log` — state, original command, router confidence, the
-raw model response and the validated plan. That table is the only input stage 4's skill miner has,
-so fallbacks are logged too. `raw_response` is never returned over the API.
+Every teacher call writes a row to `teacher_log` — state, original command, router confidence,
+`handled`, the raw model response and the validated plan. That table is the only input stage 4's
+skill miner has, so fallbacks and refusals are logged too: nothing is dropped here, and "the user
+keeps asking for the weather" is worth reading even though no skill can come of it. Which rows are
+*mineable* is decided one layer up, in `backend/miner/case.py` — a failed call and a declined
+answer are both kept and neither is mined. `raw_response` is never returned over the API.
 
 Without `GEMINI_API_KEY` the app still starts: the teacher is off, a miss answers with a polite
 stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` overrides the model
@@ -130,7 +147,7 @@ stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` ov
 
 Gemini answering a command is not learning; it costs money every single time. Learning is the moment
 a *pattern* in those answers becomes a skill and the command stops reaching Gemini at all. That is
-`backend/miner/`, and it runs on every `MINER_BATCH`-th unmined case (default 5) or on
+`backend/miner/`, and it runs when the `MINER_BATCH`-th *mineable* case arrives (default 5) or on
 `POST /api/mine`:
 
 1. **Cluster.** One Gemini `group` call over the whole pool — one per *run*, not per cluster.
@@ -155,9 +172,14 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    `questions` and branches only on the robot's own state; it is assembled into a real `Skill`, and
    that is where `validate_plan` refuses anything outside the action library.
 3. **Backtest.** Every case of the cluster is re-routed against `active + candidate`, and a match
-   means the router picked the candidate *and* did what the teacher did (action names only — the
-   teacher never phrases a reply the same way twice). `match_rate` must reach `MINER_MIN_MATCH`
-   (0.8).
+   means the router picked the candidate above its threshold. `match_rate` must reach
+   `MINER_MIN_MATCH` (0.8). Whether the candidate also *did what the teacher did* (action names
+   only — the teacher never phrases a reply the same way twice) is reported alongside as
+   `agreement` and does not gate. It used to: on live data that made the bar unreachable, because
+   five phrasings of one command produce several different teacher plans, so the best any single
+   plan could score was the share of the most common one — and the candidate that scored *highest*
+   on a cluster of refusals was the one that reproduced the refusal. Measured in
+   `scripts/probe_miner_match.py` (JEB-1547).
 4. **Regression check.** A match rate cannot see the damage a new option does to the old ones: stage
    2 measured all 24 orderings of the four starter skills spreading the hit rate over 7/10…9/10, and
    alphabetical order pushing "покорми" under its threshold outright. So one control phrase per

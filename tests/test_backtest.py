@@ -63,22 +63,37 @@ def test_a_candidate_that_covers_its_cluster_is_publishable(active, candidate, c
     report = backtest(engine(), active, candidate, cases)
     assert report.matched == 5
     assert report.match_rate == pytest.approx(1.0)
+    assert report.agreement == pytest.approx(1.0)
     assert report.regression is None
     assert report.publishable
 
 
-def test_a_different_plan_is_not_a_match(active, candidate, cases):
-    """The router reaches the candidate, but a tired robot does something else."""
+def test_a_different_plan_is_agreement_not_coverage(active, candidate, cases):
+    """The router reaches the candidate, but a tired robot does something else.
+
+    This is the split JEB-1547 turns on. Coverage is about routing, so it stays
+    at 1.0; agreement drops to 0.0 and does not veto the proposal. Gating on the
+    old combined number is what made the miner unpublishable on live data: the
+    teacher improvises a slightly different plan every time, and nothing in this
+    measure has a notion of "close".
+    """
     tired = [Case(case.id, case.user_text, TIRED, case.actions) for case in cases]
     report = backtest(engine(), active, candidate, tired)
-    assert report.matched == 0
-    assert not report.publishable
+    assert report.match_rate == pytest.approx(1.0)
+    assert report.agreement == pytest.approx(0.0)
+    assert report.publishable
 
 
-def test_wording_differences_do_not_break_a_match(active, candidate, cases):
+def test_a_candidate_the_router_misses_agrees_with_nothing(active, candidate, cases):
+    """Agreement is counted over routed cases only — an unrouted case cannot agree."""
+    report = backtest(FakeEngine("unknown"), active, candidate, cases)
+    assert report.agreement == pytest.approx(0.0)
+
+
+def test_wording_differences_do_not_break_agreement(active, candidate, cases):
     """Every teacher reply is phrased differently; only the primitives count."""
     assert len({json.dumps(case.actions, ensure_ascii=False) for case in cases}) == len(cases)
-    assert backtest(engine(), active, candidate, cases).match_rate == pytest.approx(1.0)
+    assert backtest(engine(), active, candidate, cases).agreement == pytest.approx(1.0)
 
 
 def test_a_candidate_the_router_never_picks_scores_zero(active, candidate, cases):

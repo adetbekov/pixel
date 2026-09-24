@@ -113,6 +113,7 @@ async def test_accepting_routes_the_command_to_the_new_skill_without_a_restart(
         json.dumps(
             {
                 "reply": "Тада!",
+                "handled": True,
                 "actions": [
                     {"action": "spin"},
                     {"action": "set_face", "face": "happy"},
@@ -437,7 +438,12 @@ async def test_mining_runs_itself_every_batch_th_case(
     """No button pressed: the fifth miss triggers the run that proposes."""
     monkeypatch.setenv("MINER_BATCH", "5")
     generator(draft_json())
-    teacher(json.dumps({"reply": "Тада!", "actions": [{"action": "spin"}]}, ensure_ascii=False))
+    teacher(
+        json.dumps(
+            {"reply": "Тада!", "handled": True, "actions": [{"action": "spin"}]},
+            ensure_ascii=False,
+        )
+    )
 
     fill_pool(seeded, TRICK_COMMANDS[:4])
     assert (await client.get("/api/proposals")).json() == []
@@ -445,6 +451,38 @@ async def test_mining_runs_itself_every_batch_th_case(
     # The fifth case arrives the way a real one does — through /api/chat.
     await client.post("/api/chat", json={"text": TRICK_COMMANDS[4]})
     assert len((await client.get("/api/proposals")).json()) == 1
+
+
+@pytest.mark.anyio
+async def test_a_refusal_does_not_re_trigger_a_parked_pool(
+    client, seeded, miner_engine, generator, teacher, monkeypatch
+):
+    """The pool sits on a multiple of MINER_BATCH and a refusal arrives.
+
+    `mined = 1` is set only when a proposal is saved, so a cluster that fails its
+    backtest stays in the pool for good — and a refusal does not move the pool at
+    all. On a pool parked at exactly MINER_BATCH, a trigger that read the level
+    instead of the arrival would fire on *every* later "какая погода": one
+    synchronous `generator.propose` round trip per declined message, inside a
+    request the user is waiting on (JEB-1547 review).
+    """
+    monkeypatch.setenv("MINER_BATCH", "5")
+    fake = generator(draft_json())
+    teacher(
+        json.dumps(
+            {"reply": "Я не умею предсказывать погоду", "handled": False, "actions": []},
+            ensure_ascii=False,
+        )
+    )
+
+    fill_pool(seeded, TRICK_COMMANDS)
+    assert fake.calls == [], "nothing has run the miner yet"
+
+    for text in ("какая погода", "закажи пиццу", "который час"):
+        await client.post("/api/chat", json={"text": text})
+
+    assert fake.calls == [], "a refusal must not pay for a mining run"
+    assert (await client.get("/api/proposals")).json() == []
 
 
 @pytest.mark.anyio

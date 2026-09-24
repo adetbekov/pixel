@@ -354,7 +354,7 @@ def post_chat(payload: ChatIn) -> dict:
     )
 
     with db.lock:
-        log_case(
+        case_id = log_case(
             conn,
             interaction_id=reply["interaction_id"],
             user_text=payload.text,
@@ -364,12 +364,16 @@ def post_chat(payload: ChatIn) -> dict:
             raw_response=result.raw_response,
             actions=reply["actions"],
             error=result.error,
+            handled=result.handled,
         )
-        due = mining_due(conn)
+        # The row this request just wrote, not the pool level: a level stays
+        # true while the pool stands still, and the pool stands still on every
+        # refusal. See `mining_due`.
+        due = mining_due(conn, case_id)
 
-    # Every MINER_BATCH-th miss, the miner runs before this response returns.
-    # It is seconds on a pool this size, and the user who just taught Pixel
-    # something is the one most likely to be looking at the skills panel.
+    # Every MINER_BATCH-th mineable miss, the miner runs before this response
+    # returns. It is seconds on a pool this size, and the user who just taught
+    # Pixel something is the one most likely to be looking at the skills panel.
     if due:
         mine_once()
     return reply

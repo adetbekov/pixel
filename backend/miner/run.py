@@ -15,7 +15,7 @@ only reaches it for a candidate that would otherwise be published — which, whi
 a draft keeps failing on ``match_rate``, is none of them. Keep it that way: the
 pool has no ``LIMIT`` and does not shrink for a candidate that was rejected.
 
-Two triggers, one body: every ``MINER_BATCH``-th new unmined case, and
+Two triggers, one body: every ``MINER_BATCH``-th new mineable case, and
 ``POST /api/mine``. A second concurrent run is refused rather than queued — it
 would re-read the same pool and race the first one to the same proposals.
 
@@ -39,7 +39,7 @@ from ..brain.engine import DecisionEngine, get_engine
 from ..brain.skill import Skill, load_skills
 from ..state import iso, utcnow
 from .backtest import backtest
-from .case import Case, load_pool, pool_size
+from .case import Case, is_mineable, load_pool, pool_size
 from .cluster import group_texts, min_cluster_size
 from .generate import SkillGenerator, get_generator
 
@@ -60,13 +60,29 @@ def batch_size() -> int:
     return int(os.environ.get("MINER_BATCH", DEFAULT_BATCH))
 
 
-def mining_due(conn: sqlite3.Connection) -> bool:
-    """True on every ``MINER_BATCH``-th unmined case.
+def mining_due(conn: sqlite3.Connection, case_id: int) -> bool:
+    """True when the case that just arrived is the ``MINER_BATCH``-th mineable one.
+
+    ``case_id`` is the ``teacher_log`` row this request wrote, and asking about
+    it first is what makes the remainder below safe. The remainder alone is a
+    *level*, not an event: it stays true for as long as the pool stays put, and
+    the pool stays put on everything the miner cannot use. A failed call and a
+    declined answer are kept in ``teacher_log`` and never enter the pool
+    (:func:`backend.miner.case._parse`), and ``mined = 1`` is set only in
+    :func:`_save`, so a cluster that fails its backtest stays unmined for good —
+    exactly the "фокус" cluster at ``match_rate`` 0.60 that JEB-1547 measured.
+    Park the pool on a multiple of ``MINER_BATCH`` that way and every later
+    "какая погода" would re-fire the trigger, putting a synchronous ``group_texts``
+    plus one ``generator.propose`` round trip inside a ``POST /api/chat`` the user
+    is waiting on — an unbounded Gemini bill, one call per declined message.
+    Gating on the arrival turns it back into an edge: no new mineable case, no run.
 
     Counted, not accumulated: a run that mines nothing leaves the pool where it
-    was, so the next case brings the count to the following multiple and the
-    trigger fires again instead of going quiet forever.
+    was, so the next mineable case brings the count to the following multiple and
+    the trigger fires again instead of going quiet forever.
     """
+    if not is_mineable(conn, case_id):
+        return False
     size = pool_size(conn)
     return size > 0 and size % batch_size() == 0
 
@@ -168,13 +184,21 @@ def _propose(
         return None
     if not report.publishable:
         log.info(
-            "miner: %r rejected — match_rate %.2f on %d cases",
+            "miner: %r rejected — match_rate %.2f (agreement %.2f) on %d cases",
             skill.id,
             report.match_rate,
+            report.agreement,
             report.total,
         )
         return None
 
+    log.info(
+        "miner: %r proposed — match_rate %.2f (agreement %.2f) on %d cases",
+        skill.id,
+        report.match_rate,
+        report.agreement,
+        report.total,
+    )
     return MinedProposal(
         id=str(uuid.uuid4()),
         skill=skill,
