@@ -17,10 +17,10 @@ from backend.brain.engine import set_engine
 from backend.brain.skill import load_skills
 from backend.main import app
 from backend.miner import MineResult, mine_once, set_generator
-from backend.miner.generate import TIMEOUT_S
+from backend.miner.generate import TIMEOUT_S, GeminiSkillGenerator
 from backend.teacher.client import MIN_SERVER_DEADLINE_S
 
-from .fakes import FakeEngine
+from .fakes import FakeEngine, FakeGeminiClient
 from .trick_cluster import (
     LATER_TRICK,
     TRICK_COMMANDS,
@@ -365,6 +365,69 @@ def test_the_sdk_still_has_the_surface_the_miner_calls():
     headers = {"X-Server-Timeout": "30"}
     populate_server_timeout_header(headers, 30.0)
     assert headers["X-Server-Timeout"] == "30"
+
+
+@pytest.mark.anyio
+async def test_a_fenced_draft_is_not_parsed(client, seeded, miner_engine, generator, caplog):
+    """The fences stay a failure here too, deliberately.
+
+    ` ```json ` around an otherwise valid draft is what `interactions.create`
+    returned on `models/gemini-2.5-flash-lite`, and it is the *whole* visible
+    symptom of the wrong call shape on this path: offline there is no timeout
+    and no error page, only a cluster that quietly goes back in the pool and a
+    `/api/proposals` that stays empty forever. So a fenced answer must still be
+    retried and still end without a proposal — stripping the fence in `_parse`
+    would hide a regression back onto `interactions.create` instead of failing
+    on it, which is why this test exists rather than a lenient parser.
+
+    The mirror of `tests/test_teacher.py::test_a_fenced_response_is_not_parsed`.
+    """
+    fake = generator(f"```json\n{draft_json()}\n```")
+    fill_pool(seeded)
+
+    with caplog.at_level("WARNING", logger="backend.miner.generate"):
+        assert (await client.post("/api/mine")).json()["proposals"] == 0
+    assert (await client.get("/api/proposals")).json() == []
+
+    assert len(fake.calls) == 2, "a fenced draft is retried like any other bad response"
+    assert "did not match the schema" in caplog.text
+
+
+def test_the_fallback_grouping_goes_out_the_same_way():
+    """`group()` shares `_call`, so it shared the defect — and hides it better.
+
+    The fallback grouping only runs when the local Laya vectors are unavailable,
+    so a broken call shape here shows up as nothing at all: `group` swallows the
+    parse error and returns `[]`, which reads as "no clusters" rather than as a
+    failure. Pin both halves — the shape that goes out, and that a bare-JSON
+    answer comes back parsed.
+    """
+    fake = FakeGeminiClient(json.dumps({"groups": [[0, 1], [2]]}))
+    generator = GeminiSkillGenerator(client=fake, model="fake-model")
+
+    assert generator.group(["покажи фокус", "сделай фокус", "станцуй"]) == [[0, 1], [2]]
+
+    call = fake.calls[0]
+    assert call["model"] == "fake-model"
+    assert call["config"]["response_mime_type"] == "application/json"
+    assert "groups" in call["config"]["response_schema"]["properties"]
+    assert "покажи фокус" in call["contents"]
+
+
+def test_a_fenced_grouping_is_not_parsed():
+    """And the fence is a failure on this path too — an empty, silent one."""
+    fake = FakeGeminiClient('```json\n{"groups": [[0, 1]]}\n```')
+    generator = GeminiSkillGenerator(client=fake, model="fake-model")
+
+    assert generator.group(["покажи фокус", "сделай фокус"]) == []
+
+
+@pytest.mark.anyio
+async def test_the_same_draft_unfenced_is_proposed(client, seeded, miner_engine, generator):
+    """The control for the test above: the fence is the only thing wrong."""
+    generator(draft_json())
+    fill_pool(seeded)
+    assert (await client.post("/api/mine")).json()["proposals"] == 1
 
 
 @pytest.mark.anyio

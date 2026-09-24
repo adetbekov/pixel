@@ -254,6 +254,13 @@ docker compose -p pixel up -d --force-recreate     # or: redeploy the `pixel` st
 PRs target `dev`; `main` is the release branch. CI runs lint + tests, the frontend lint and an
 `image build` gate on every PR, and emits `check_suite`, which is the review hand-off gate.
 
+The `frontend lint` job also runs a **contrast gate**: it serves `frontend/` on a local port, opens
+`index.html?mock=1` in headless Chromium under both `prefers-color-scheme` values and measures every
+text node from the *computed* styles — alpha fills composited layer by layer, ancestor `opacity`
+multiplied down the branch — failing on anything below WCAG AA (4.5:1, or 3:1 for large text). It
+needs no backend: `frontend/mocks/` already contains a disabled skill and a rated interaction, so the
+states that regressed in JEB-1521 are on screen. Run it locally with `npm run contrast`.
+
 `image build` covers both halves of the deployment — `Dockerfile` **and** `docker-compose.yml`.
 
 It starts with the compose file, because that check costs under a second and needs no image:
@@ -274,3 +281,19 @@ editable-install gate: JEB-1530 measured an image built with plain `pip install 
 three paths, because `WORKDIR /app` plus uvicorn's default `--app-dir ""` make `/app/backend`
 shadow the site-packages copy either way. Nothing is pushed to a registry — the image is a gate,
 not a deploy.
+
+One gate runs **outside** the PR: `Live Gemini Contract`, nightly at 03:17 UTC and on
+`workflow_dispatch`. Everything above runs against `tests/fakes.py::FakeGeminiClient`, which returns
+bare JSON whatever it is asked — so the teacher and miner paths stay green on fixtures while the
+live path is dead. That is not hypothetical: `interactions.create` + `response_format` does not hold
+structured output on `models/gemini-2.5-flash-lite` (the answer comes back in a ```` ```json ````
+fence), and both halves of the project shipped that call and had to be moved to
+`models.generate_content` + `response_schema`, both times found by hand on a live stand.
+
+So the nightly calls `GeminiTeacher._call` and `GeminiSkillGenerator._call` for real, once each, and
+parses the answers with `TeacherPlan` / `SkillDraft` — no fence-stripping, because the strict parser
+is what makes the break visible. Two `flash-lite` calls a day, on the order of $0.001. It needs the
+`GEMINI_API_KEY` repository secret, which is why it never runs on a PR: a fork PR cannot have it,
+and a green CI must not depend on a key. It is not a required check on any branch — it can go red
+because Google changed something, and that must never block a merge. A failing nightly opens (or
+comments on) an issue labelled `live-gemini-contract`.

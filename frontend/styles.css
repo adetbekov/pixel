@@ -23,6 +23,13 @@
   --warn:      #e3b341;
   --bad:       #ef5f5f;
 
+  /* Чернила для текста на подкрашенной плашке (badge). Заливка плашки — те же
+     --ok/--accent/--bad с альфой, но сам цвет заливки как текст даёт 1.8–2.6:1
+     на светлой теме, поэтому текст берёт отдельный, затемнённый токен. */
+  --ink-ok:     #35c67a;
+  --ink-accent: #57b3ff;
+  --ink-bad:    #ff9a9a;
+
   --r-panel: 18px;
   --r-input: 12px;
 }
@@ -42,6 +49,10 @@
     --shell-2:   #9aa8bd;
     --visor:     #1d2735;
     --face:      #7fe3ff;
+
+    --ink-ok:     #12673a;
+    --ink-accent: #14559f;
+    --ink-bad:    #a11d16;
   }
 }
 
@@ -264,7 +275,12 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
 }
 .btn:hover:not(:disabled) { border-color: var(--accent); }
 .btn:active:not(:disabled) { transform: translateY(1px) scale(.985); }
-.btn:disabled { opacity: .45; cursor: not-allowed; }
+/* Гашение цветом, а не прозрачностью — гейт контраста считает все узлы, включая
+   заблокированные кнопки, и opacity .45 утягивала надпись ниже AA. */
+.btn:disabled {
+  background: var(--surface); color: var(--text-dim); border-color: var(--line);
+  cursor: not-allowed;
+}
 .btn-primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
 .btn:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
@@ -294,8 +310,8 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
   letter-spacing: .02em;
   background: var(--surface-2); border: 1px solid var(--line); color: var(--text-dim);
 }
-.badge-laya   { background: rgb(53 198 122 / .16); border-color: rgb(53 198 122 / .5); color: var(--ok); }
-.badge-gemini { background: rgb(87 179 255 / .16); border-color: rgb(87 179 255 / .5); color: var(--accent); }
+.badge-laya   { background: rgb(53 198 122 / .16); border-color: rgb(53 198 122 / .5); color: var(--ink-ok); }
+.badge-gemini { background: rgb(87 179 255 / .16); border-color: rgb(87 179 255 / .5); color: var(--ink-accent); }
 .badge-button { background: var(--surface-2); border-color: var(--line); color: var(--text-dim); }
 
 .vote { display: flex; gap: 4px; margin-left: auto; }
@@ -304,8 +320,11 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
   background: transparent; border: 1px solid var(--line); color: var(--text-dim); cursor: pointer;
 }
 .vote button:hover:not(:disabled) { border-color: var(--accent); }
-.vote button:disabled { cursor: default; opacity: .5; }
-.vote button.picked { opacity: 1; border-color: var(--accent); color: var(--text); }
+/* Не выбранная оценка после голоса гасится рамкой, а не прозрачностью: opacity
+   утягивала её текст до 2.08:1, а эмодзи 👍/👎 — единственное, что отличает
+   кнопки друг от друга. */
+.vote button:disabled { cursor: default; border-color: transparent; }
+.vote button.picked { border-color: var(--accent); color: var(--text); }
 
 .composer { display: flex; gap: 10px; }
 .composer input {
@@ -382,11 +401,13 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
 /* ─── Библиотека навыков ────────────────────────────────────────────────── */
 
 .badge-seed  { background: var(--surface); border-color: var(--line); color: var(--text-dim); }
-.badge-mined { background: rgb(87 179 255 / .16); border-color: rgb(87 179 255 / .5); color: var(--accent); }
-.badge-off   { background: rgb(239 95 95 / .14); border-color: rgb(239 95 95 / .45); color: var(--bad); }
+.badge-mined { background: rgb(87 179 255 / .16); border-color: rgb(87 179 255 / .5); color: var(--ink-accent); }
+.badge-off   { background: rgb(239 95 95 / .14); border-color: rgb(239 95 95 / .45); color: var(--ink-bad); }
 
-/* Отключённый навык остаётся читаемым, но явно уходит на второй план. */
-.skill.is-off { opacity: .55; border-style: dashed; }
+/* Отключённый навык уходит на второй план пунктиром и фоном панели, но не
+   прозрачностью: opacity гасила и статус «отключён» (1.70:1), и причину
+   отключения (2.18:1) — ровно то, что пользователь должен здесь прочитать. */
+.skill.is-off { border-style: dashed; background: var(--surface); }
 
 /* ─── Карточка предложения ──────────────────────────────────────────────── */
 
