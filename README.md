@@ -166,9 +166,12 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
 5. **Over-broad check.** Neither of those looks at commands no skill claims yet — measured live, an
    accepted `show_trick` pulled "покажи сальто" to itself at 0.78 with every control green. So the
    rest of the pool, the cases the grouper put in *other* clusters, is routed too: a candidate that
-   wins any of them is drafted too wide and is not proposed. Steps 3–5 all bypass the router's
-   `examples` lookup, since a candidate's `examples` are exactly the cluster under test.
-5. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
+   wins any of them is drafted too wide and is not proposed. This is the one check whose cost grows
+   with the pool, which has no `LIMIT` and does not shrink for a rejected candidate — so it runs
+   last, only for a candidate steps 3 and 4 have already cleared. None of steps 3–5 may use the
+   router's `examples` lookup, since a candidate's `examples` are exactly the cluster under test;
+   steps 4 and 5 only read which skill won, so they take `pick_skill` (pass 1 alone) instead.
+6. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
    `POST /api/proposals/{id}/accept` adds the skill, and it takes effect in the same process, since
    `/api/chat` reads the library on every request. `reject` puts the cases back in the pool and
    remembers the case set, so the same cluster is not offered again.

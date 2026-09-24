@@ -5,7 +5,12 @@ import json
 import pytest
 
 from backend.brain.skill import Skill, load_seed_skills
-from backend.miner.backtest import backtest, check_regressions, min_match_rate
+from backend.miner.backtest import (
+    backtest,
+    check_overreach,
+    check_regressions,
+    min_match_rate,
+)
 from backend.miner.case import Case
 from backend.miner.schema import MAX_DESCRIPTION_LEN, SkillDraft
 from backend.state import RobotState
@@ -38,6 +43,14 @@ def cases():
     return [
         Case(id=index + 1, user_text=command, state=MID_STATE, actions=TEACHER_PLANS[index])
         for index, command in enumerate(TRICK_COMMANDS)
+    ]
+
+
+def cases_that_miss() -> list[Case]:
+    """A cluster the candidate cannot cover: the router sends these elsewhere."""
+    return [
+        Case(id=index + 1, user_text=f"покорми {index}", state=MID_STATE, actions=TEACHER_PLANS[0])
+        for index in range(5)
     ]
 
 
@@ -224,3 +237,39 @@ def test_the_backtest_never_routes_through_the_examples_lookup(active, candidate
     blind = FakeEngine("unknown", 0.99)
     report = backtest(blind, active, candidate, cases)
     assert report.matched == 0
+
+
+def test_a_candidate_that_lost_on_match_rate_never_pays_for_the_pool_scan(active, candidate):
+    """The pool has no LIMIT and does not shrink for a rejected candidate (JEB-1548 review)."""
+    outsiders = [
+        Case(id=index, user_text=f"команда {index}", state=MID_STATE, actions=[])
+        for index in range(40)
+    ]
+    thin = engine()
+    report = backtest(thin, active, candidate, cases_that_miss(), outsiders)
+
+    assert report.match_rate < min_match_rate()
+    assert report.overreach is None
+    assert not report.publishable
+    assert not any("команда" in prompt for prompt in thin.prompts)
+
+
+def test_a_regression_also_stops_the_pool_scan(active, candidate, cases):
+    """match_rate is a clean 1.0 here, so the regression is what does the stopping."""
+    outsiders = [Case(id=99, user_text="покажи сальто", state=MID_STATE, actions=[])]
+    greedy = engine({"привет": "show_trick", "покажи сальто": "show_trick"})
+    report = backtest(greedy, active, candidate, cases, outsiders)
+
+    assert report.match_rate == pytest.approx(1.0)
+    assert report.regression is not None
+    assert report.overreach is None
+    assert not any("сальто" in prompt for prompt in greedy.prompts)
+
+
+def test_the_controls_cost_one_forward_pass_each_not_two(active, candidate):
+    """`pick_skill`, not `route`: they read the skill id and never need the plan."""
+    probe = engine()
+    check_overreach(probe, [*active, candidate], candidate, [
+        Case(id=1, user_text="покорми", state=MID_STATE, actions=[])
+    ])
+    assert len(probe.calls) == 1

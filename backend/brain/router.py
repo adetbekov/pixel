@@ -111,6 +111,40 @@ def build_criteria(skills: list[Skill]) -> dict[str, str]:
     return criteria
 
 
+def pick_skill(
+    engine: DecisionEngine, skills: list[Skill], text: str
+) -> tuple[Skill | None, float]:
+    """Pass 1 alone: which skill wins and how sure, with no plan built.
+
+    Separate from :func:`route` because a caller that only wants to know *which*
+    skill a phrase reaches should not pay pass 2 for it. The miner's two control
+    checks are exactly that caller, and each of theirs is one forward pass here
+    against two in a full ``route`` (JEB-1548 review). It is also why they cannot
+    be answered by the ``examples`` lookup: this entry point does not have one.
+    """
+    if not skills:
+        return None, 0.0
+
+    # Pass 1 deliberately sees the command alone: the robot's mood does not
+    # decide *which* skill was asked for, and feeding it in measurably drags the
+    # choice towards `sleep` (see backend/brain/verbalize.py).
+    picked = engine.choice(
+        command_only(text), ROUTER_QUESTION, ROUTER_INSTRUCTIONS, build_criteria(skills)
+    )
+    if not isinstance(picked, ChoiceResult):
+        return None, 0.0
+
+    # `unknown` is not a skill, and neither is a label the engine invented.
+    skill = {one.id: one for one in skills}.get(picked.label)
+    if skill is None:
+        return None, picked.confidence
+
+    threshold = skill.threshold if skill.threshold is not None else default_threshold()
+    if picked.confidence < threshold:
+        return None, picked.confidence
+    return skill, picked.confidence
+
+
 def route(
     engine: DecisionEngine,
     skills: list[Skill],
@@ -126,23 +160,8 @@ def route(
     confidence = 1.0
 
     if skill is None:
-        # Pass 1 deliberately sees the command alone: the robot's mood does not
-        # decide *which* skill was asked for, and feeding it in measurably drags
-        # the choice towards `sleep` (see backend/brain/verbalize.py).
-        picked = engine.choice(
-            command_only(text), ROUTER_QUESTION, ROUTER_INSTRUCTIONS, build_criteria(skills)
-        )
-        if not isinstance(picked, ChoiceResult):
-            return RouterMiss(0.0)
-        confidence = picked.confidence
-
-        # `unknown` is not a skill, and neither is a label the engine invented.
-        skill = {one.id: one for one in skills}.get(picked.label)
+        skill, confidence = pick_skill(engine, skills, text)
         if skill is None:
-            return RouterMiss(confidence)
-
-        threshold = skill.threshold if skill.threshold is not None else default_threshold()
-        if confidence < threshold:
             return RouterMiss(confidence)
 
     # Pass 2 is where the state matters, so the skill's own questions get it.

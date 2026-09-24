@@ -34,10 +34,15 @@ grouper put in other clusters. They are commands a real user typed that this
 candidate is not for, so a candidate that wins any of them is drafted too wide
 and is not proposed.
 
-All three route with ``use_examples=False``. The router's exact-``examples``
-lookup would answer checks 1 and 3 from the candidate's own draft rather than
-from the head, scoring every candidate 1.0 on its cluster and proving nothing;
-here the question is only ever what the ``choice`` head does.
+None of the three may go through the router's exact-``examples`` lookup: a
+candidate's ``examples`` *are* the cluster under test, so the lookup would answer
+checks 1 and 3 from its own draft and score every candidate 1.0. Check 1 needs
+the plan the router builds, so it calls ``route(..., use_examples=False)``.
+Checks 2 and 3 only ever read *which skill* won, so they call
+:func:`backend.brain.router.pick_skill` — pass 1 on its own, half the forward
+passes, and no lookup to switch off.
+
+They run cheapest-first, and check 3 runs last: see :func:`backtest`.
 """
 
 from __future__ import annotations
@@ -46,16 +51,11 @@ import os
 from dataclasses import dataclass
 
 from ..brain.engine import DecisionEngine
-from ..brain.router import RouterHit, RouterOutcome, route
+from ..brain.router import RouterHit, RouterOutcome, pick_skill, route
 from ..brain.skill import Skill
-from ..state import RobotState
 from .case import Case
 
 DEFAULT_MIN_MATCH = 0.8
-
-#: Controls check *which skill* was picked, and pass 1 of the router sees the
-#: command alone — so the state here only has to be unremarkable.
-CONTROL_STATE = RobotState(mood=50.0, energy=50.0, fullness=50.0, face="curious")
 
 
 def min_match_rate() -> float:
@@ -91,23 +91,27 @@ def check_regressions(
         if not skill.examples:
             continue
         phrase = skill.examples[0]
-        outcome = route(engine, trial, phrase, CONTROL_STATE, use_examples=False)
-        if isinstance(outcome, RouterHit) and outcome.skill_id == skill.id:
+        picked, confidence = pick_skill(engine, trial, phrase)
+        if picked is not None and picked.id == skill.id:
             continue
-        went = outcome.skill_id if isinstance(outcome, RouterHit) else "miss"
-        return f'"{phrase}" ({skill.id}) -> {went} @ {outcome.confidence:.2f}'
+        went = picked.id if picked is not None else "miss"
+        return f'"{phrase}" ({skill.id}) -> {went} @ {confidence:.2f}'
     return None
 
 
 def check_overreach(
     engine: DecisionEngine, trial: list[Skill], candidate: Skill, outsiders: list[Case]
 ) -> str | None:
-    """First pool command from *outside* the cluster that the candidate takes."""
+    """First pool command from *outside* the cluster that the candidate takes.
+
+    The only unbounded loop in this module — the pool has no ``LIMIT`` — so
+    :func:`backtest` calls it last and only when nothing else has already
+    rejected the candidate.
+    """
     for case in outsiders:
-        outcome = route(engine, trial, case.user_text, CONTROL_STATE, use_examples=False)
-        if isinstance(outcome, RouterHit) and outcome.skill_id == candidate.id:
-            went = f"{candidate.id} @ {outcome.confidence:.2f}"
-            return f'"{case.user_text}" (another cluster) -> {went}'
+        picked, confidence = pick_skill(engine, trial, case.user_text)
+        if picked is not None and picked.id == candidate.id:
+            return f'"{case.user_text}" (another cluster) -> {candidate.id} @ {confidence:.2f}'
     return None
 
 
@@ -123,6 +127,15 @@ def backtest(
     The candidate is appended, never inserted: that is where ``load_skills``
     puts a mined skill (``ORDER BY rowid``), so the trial registry has to have
     the same option order the live one will have after acceptance.
+
+    **Cheapest check first, and the unbounded one last.** Checks 1 and 2 cost one
+    forward pass per cluster case and per active skill — both small and both
+    fixed. Check 3 costs one per *unmined row in the pool*, and the pool does not
+    shrink for a candidate that fails, so a run that rejects everything would pay
+    it over and over. A candidate that has already lost on ``match_rate`` or on a
+    regression cannot be published whatever check 3 says, so it is not run
+    (JEB-1548 review): ``overreach`` stays ``None``, which reads the same as "it
+    took nothing" and is why ``publishable`` still has to test all three.
     """
     trial = [*active, candidate]
 
@@ -134,12 +147,18 @@ def backtest(
         )
     )
     rate = matched / len(cases) if cases else 0.0
+    regression = check_regressions(engine, trial, active)
+
+    overreach = None
+    if regression is None and rate >= min_match_rate():
+        overreach = check_overreach(engine, trial, candidate, outsiders or [])
+
     return Backtest(
         match_rate=rate,
         matched=matched,
         total=len(cases),
-        regression=check_regressions(engine, trial, active),
-        overreach=check_overreach(engine, trial, candidate, outsiders or []),
+        regression=regression,
+        overreach=overreach,
     )
 
 
