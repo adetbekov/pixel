@@ -18,7 +18,7 @@ from backend import db
 from backend.brain.engine import set_engine
 from backend.brain.skill import load_skills
 from backend.main import app
-from backend.miner import MineResult, mine_once, set_generator
+from backend.miner import MineResult, mine_once, set_generator, wait_idle
 from backend.miner.attempts import max_attempts
 from backend.miner.generate import TIMEOUT_S, GeminiSkillGenerator
 from backend.teacher.client import MIN_SERVER_DEADLINE_S
@@ -532,6 +532,11 @@ async def test_mining_runs_itself_every_batch_th_case(
 
     # The fifth case arrives the way a real one does — through /api/chat.
     await client.post("/api/chat", json={"text": TRICK_COMMANDS[4]})
+    # The run itself happens on the miner worker, so the answer came back before
+    # the proposal did. Waiting for the thread is what a user does by looking at
+    # the panel a moment later; `tests/test_miner_worker.py` is where the fact
+    # that the answer did not wait is pinned.
+    assert wait_idle(5)
     assert len((await client.get("/api/proposals")).json()) == 1
 
 

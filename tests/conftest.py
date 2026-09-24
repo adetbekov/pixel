@@ -3,7 +3,7 @@ import pytest
 from backend import db
 from backend.brain.engine import set_engine
 from backend.brain.skill import seed_db
-from backend.miner import set_generator
+from backend.miner import set_generator, stop_worker
 from backend.miner.generate import GeminiSkillGenerator
 from backend.teacher import GeminiTeacher, set_teacher
 
@@ -15,6 +15,9 @@ def conn(tmp_path):
     """A fresh database per test — never the developer's ./pixel.db."""
     connection = db.init(str(tmp_path / "pixel.db"))
     yield connection
+    # Before the close, not after: `/api/chat` hands the automatic mining run to
+    # a background thread, and a run still in flight reads this very connection.
+    stop_worker()
     db.close()
 
 

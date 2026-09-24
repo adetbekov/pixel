@@ -14,7 +14,7 @@ from . import db
 from .api import router
 from .brain.engine import LayaEngine, set_engine
 from .brain.skill import seed_db
-from .miner import build_generator, set_generator
+from .miner import build_generator, set_generator, stop_worker
 from .teacher import build_teacher, set_teacher
 
 FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
@@ -49,6 +49,10 @@ async def lifespan(app: FastAPI):
     set_generator(build_generator())
 
     yield
+    # First, because a run in flight still reads the database and the engine.
+    # It is a daemon thread, so a run that outlasts the timeout loses its work
+    # and nothing else — its cases are still `mined=0` on the next start.
+    stop_worker()
     set_generator(None)
     set_teacher(None)
     set_engine(None)
