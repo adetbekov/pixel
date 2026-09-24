@@ -695,7 +695,14 @@ async def test_a_new_case_buys_the_stuck_cluster_another_draft(
     client, seeded, miner_engine, generator
 ):
     """The budget is per case set, so new evidence is what reopens the question —
-    the same rule the user's own rejection is remembered by."""
+    the same rule the user's own rejection is remembered by.
+
+    And the superseded case set is retired with it (JEB-1579 review): it is still
+    a subset of the pool, so nothing else would ever drop it, and `clusters_stuck`
+    would keep counting a cluster that no longer exists — one stale row per case a
+    growing cluster ever gained, until the panel's "stuck now" quietly became
+    "stuck ever".
+    """
     thief = FakeEngine(routes={**TRICK_ROUTES, "покорми": "show_trick"}, embeddings=TRICK_EMBEDDINGS)
     set_engine(thief)
     try:
@@ -704,13 +711,86 @@ async def test_a_new_case_buys_the_stuck_cluster_another_draft(
         for _ in range(max_attempts() + 1):
             await client.post("/api/mine")
         spent = len(fake.calls)
+        assert (await client.get("/api/metrics")).json()["clusters_stuck"] == 1
 
         fill_pool(seeded, [LATER_TRICK])
         await client.post("/api/mine")
         assert len(fake.calls) == spent + 1
-        assert (await client.get("/api/metrics")).json()["clusters_stuck"] == 1
+        # One ledger row, for the six-case cluster, with one refusal against it.
+        assert refusals(seeded) == 1
+        row = seeded.execute("SELECT signature, attempts FROM mining_attempts").fetchone()
+        assert json.loads(row["signature"]) == [1, 2, 3, 4, 5, 6]
+        assert row["attempts"] == 1
+        assert (await client.get("/api/metrics")).json()["clusters_stuck"] == 0
     finally:
         set_engine(None)
+
+
+#: сальто first, фокус second. The second group's indices are out of range while
+#: only сальто is in the pool, and `_validate_groups` drops them — so one
+#: `grouping` value serves both halves of the tests below.
+SALTO_THEN_TRICK = [[0, 1, 2], [3, 4, 5, 6, 7]]
+
+
+@pytest.mark.anyio
+async def test_a_stuck_neighbour_is_a_control_the_candidate_may_not_take(
+    client, seeded, miner_engine, generator
+):
+    """JEB-1579 review, blocker 1: `stuck` is permanent until a new case arrives.
+
+    A stuck cluster is skipped before the generator, so its phrases never reach
+    anyone's `examples` and step 0 will never take them back — which makes it a
+    control, not a neighbour about to claim itself back. Reading cluster size
+    alone called it claimable and let the candidate keep its command for good:
+    JEB-1548, re-opened for exactly the clusters already known to be unlearnable.
+    """
+    fake = generator(
+        *([salto_json()] * max_attempts()), draft_json(), grouping=SALTO_THEN_TRICK
+    )
+
+    # The сальто cluster alone, and its draft breaks `feed` — refused every run
+    # until its draft budget is gone.
+    fill_pool(seeded, SALTO_COMMANDS)
+    miner_engine.routes = {
+        **TRICK_ROUTES,
+        **dict.fromkeys(SALTO_COMMANDS, "do_salto"),
+        "покорми": "do_salto",
+    }
+    for _ in range(max_attempts()):
+        assert (await client.post("/api/mine")).json()["proposals"] == 0
+    assert (await client.get("/api/metrics")).json()["clusters_stuck"] == 1
+
+    # Now the фокус cluster arrives and its draft reaches one command into the
+    # stuck neighbour. Nothing is ever going to take that command back.
+    fill_pool(seeded, TRICK_COMMANDS)
+    miner_engine.routes = {**TRICK_ROUTES, "покажи сальто": "show_trick"}
+    assert (await client.post("/api/mine")).json()["proposals"] == 0
+    assert (await client.get("/api/proposals")).json() == []
+    # The stuck neighbour cost no draft of its own — only фокус was paid for.
+    assert len(fake.calls) == max_attempts() + 1
+
+
+@pytest.mark.anyio
+async def test_a_user_rejected_neighbour_is_a_control_too(
+    client, seeded, miner_engine, generator
+):
+    """The other term of `_worth_drafting`: a rejected case set never comes back.
+
+    `reject` returns the cases to the pool at `mined=0` and remembers the set
+    (`_rejected_signatures`), so that cluster is skipped for good and nothing will
+    ever list its phrases either.
+    """
+    generator(salto_json(), draft_json(), grouping=SALTO_THEN_TRICK)
+
+    fill_pool(seeded, SALTO_COMMANDS)
+    miner_engine.routes = {**TRICK_ROUTES, **dict.fromkeys(SALTO_COMMANDS, "do_salto")}
+    proposal = await mined_proposal(client)
+    assert (await client.post(f"/api/proposals/{proposal['id']}/reject")).status_code == 200
+
+    fill_pool(seeded, TRICK_COMMANDS)
+    miner_engine.routes = {**TRICK_ROUTES, "покажи сальто": "show_trick"}
+    assert (await client.post("/api/mine")).json()["proposals"] == 0
+    assert (await client.get("/api/proposals")).json() == []
 
 
 @pytest.mark.anyio
@@ -728,3 +808,23 @@ async def test_a_published_cluster_leaves_no_stuck_counter_behind(
     miner_engine.routes = TRICK_ROUTES
     assert (await client.post("/api/mine")).json()["proposals"] == 1
     assert refusals(seeded) == 0
+
+
+def test_the_draft_budget_is_configurable_but_never_zero(monkeypatch):
+    """JEB-1579 review: `0` would read as "out of budget" for every cluster on its
+    first run, switching mining off entirely and saying so only at INFO."""
+    assert max_attempts() == 3
+    monkeypatch.setenv("MINER_MAX_ATTEMPTS", "5")
+    assert max_attempts() == 5
+    monkeypatch.setenv("MINER_MAX_ATTEMPTS", "0")
+    assert max_attempts() == 1
+
+
+@pytest.mark.anyio
+async def test_a_budget_of_one_still_drafts_once(client, seeded, miner_engine, generator, monkeypatch):
+    monkeypatch.setenv("MINER_MAX_ATTEMPTS", "0")
+    fake = generator(draft_json())
+    fill_pool(seeded)
+
+    assert (await client.post("/api/mine")).json()["proposals"] == 1
+    assert len(fake.calls) == 1

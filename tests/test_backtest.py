@@ -12,7 +12,6 @@ from backend.miner.backtest import (
     min_match_rate,
 )
 from backend.miner.case import Case
-from backend.miner.cluster import min_cluster_size
 from backend.miner.schema import MAX_DESCRIPTION_LEN, SkillDraft
 from backend.state import RobotState
 
@@ -235,16 +234,16 @@ def test_a_built_skill_is_marked_as_mined(candidate):
     assert candidate.questions == {}
 
 
-def leftover(text: str, case_id: int = 99) -> list[Case]:
-    """A pool row no cluster will claim: its own group is below MINER_MIN_CLUSTER."""
-    return [Case(id=case_id, user_text=text, state=MID_STATE, actions=TEACHER_PLANS[0])]
+def unclaimed(*texts: str) -> list[Case]:
+    """Check 3's control set: pool commands nothing is going to claim.
 
-
-def neighbour(text: str) -> list[Case]:
-    """A cluster big enough to be drafted on this same run, so it claims itself back."""
+    Which pool rows those are is `backend.miner.run._worth_drafting`'s answer and
+    is tested at that level (`tests/test_proposals_api.py`) — the backtest takes
+    the list as given.
+    """
     return [
-        Case(id=90 + index, user_text=f"{text} {index}", state=MID_STATE, actions=TEACHER_PLANS[0])
-        for index in range(min_cluster_size())
+        Case(id=90 + index, user_text=text, state=MID_STATE, actions=TEACHER_PLANS[0])
+        for index, text in enumerate(texts)
     ]
 
 
@@ -257,47 +256,37 @@ def test_a_candidate_that_takes_a_command_nobody_will_claim_is_not_published(
         active,
         candidate,
         cases,
-        [leftover("покажи сальто")],
+        unclaimed("покажи сальто"),
     )
     assert report.match_rate == pytest.approx(1.0)
     assert report.regression is None
-    assert report.overreach == '"покажи сальто" (no cluster of its own) -> show_trick @ 0.90'
+    assert report.overreach == '"покажи сальто" (nothing will claim it) -> show_trick @ 0.90'
     assert not report.publishable
 
 
-def test_a_command_a_mineable_neighbour_will_claim_back_is_not_overreach(
-    active, candidate, cases
-):
-    """JEB-1579, and the deadlock it removes.
+def test_the_control_set_is_taken_as_given_and_not_re_filtered(active, candidate, cases):
+    """JEB-1579 review: the caller decides what belongs here, and nothing else does.
 
-    Live, "фокус" took "покажи сальто" @0.78 and "сальто" took "сделай фокус"
-    @0.98, so each refused the other and neither intent was ever learned. A
-    cluster that reaches `MINER_MIN_CLUSTER` is drafted on this same run and
-    copies its own phrases into its own `examples`, so step 0 routes them back to
-    it at 1.0 on acceptance — the claim lasts one run, and it is not worth
-    refusing a skill for ever over.
+    The check used to re-derive the control set from `len(group)`, which is a
+    second, weaker copy of `_worth_drafting` — and the two disagreed on exactly
+    the clusters already known to be unlearnable. Whatever shape the caller's
+    commands arrive in, every one of them is asked about, and nothing outside the
+    list costs a forward pass.
     """
-    salto = neighbour("сальто")
-    thief = engine({case.user_text: "show_trick" for case in salto})
-    report = backtest(thief, active, candidate, cases, [salto])
-    assert report.overreach is None
-    assert report.publishable
-    # And it was not merely tolerated, it was never asked: the neighbour costs no
-    # forward pass at all.
-    assert not any("сальто" in prompt for prompt in thief.prompts)
+    controls = unclaimed("спой песню", "расскажи анекдот", "посчитай до десяти")
+    probe = engine({"расскажи анекдот": "show_trick"})
+    report = backtest(probe, active, candidate, cases, controls)
 
-
-def test_a_leftover_beside_a_mineable_neighbour_still_vetoes(active, candidate, cases):
-    """The check keeps its teeth: only the claimable half of the pool is dropped."""
-    salto = neighbour("сальто")
-    greedy = engine({case.user_text: "show_trick" for case in salto} | {"спой песню": "show_trick"})
-    report = backtest(greedy, active, candidate, cases, [salto, leftover("спой песню")])
-    assert report.overreach == '"спой песню" (no cluster of its own) -> show_trick @ 0.90'
-    assert not report.publishable
+    assert report.overreach == '"расскажи анекдот" (nothing will claim it) -> show_trick @ 0.90'
+    # Stopped at the offender, asked about every control before it, and never
+    # reached outside the list.
+    asked = [prompt for prompt in probe.prompts if "песню" in prompt or "анекдот" in prompt]
+    assert len(asked) == 2
+    assert not any("посчитай" in prompt for prompt in probe.prompts)
 
 
 def test_the_rest_of_the_pool_is_left_alone(active, candidate, cases):
-    report = backtest(engine(), active, candidate, cases, [leftover("покорми")])
+    report = backtest(engine(), active, candidate, cases, unclaimed("покорми"))
     assert report.overreach is None
     assert report.publishable
 
@@ -364,7 +353,7 @@ def test_the_cluster_costs_one_forward_pass_per_case(active, candidate, cases):
 def test_a_candidate_that_lost_on_match_rate_never_pays_for_the_pool_scan(active, candidate):
     """The pool has no LIMIT and does not shrink for a rejected candidate (JEB-1548 review)."""
     outsiders = [
-        [Case(id=index, user_text=f"команда {index}", state=MID_STATE, actions=[])]
+        Case(id=index, user_text=f"команда {index}", state=MID_STATE, actions=[])
         for index in range(40)
     ]
     thin = engine()
@@ -379,7 +368,7 @@ def test_a_candidate_that_lost_on_match_rate_never_pays_for_the_pool_scan(active
 def test_a_regression_also_stops_the_pool_scan(active, candidate, cases):
     """match_rate is a clean 1.0 here, so the regression is what does the stopping."""
     greedy = engine({"привет": "show_trick", "покажи сальто": "show_trick"})
-    report = backtest(greedy, active, candidate, cases, [leftover("покажи сальто")])
+    report = backtest(greedy, active, candidate, cases, unclaimed("покажи сальто"))
 
     assert report.match_rate == pytest.approx(1.0)
     assert report.regression is not None
@@ -390,5 +379,5 @@ def test_a_regression_also_stops_the_pool_scan(active, candidate, cases):
 def test_the_controls_cost_one_forward_pass_each_not_two(active, candidate):
     """`pick_skill`, not `route`: they read the skill id and never need the plan."""
     probe = engine()
-    check_overreach(probe, [*active, candidate], candidate, [leftover("покорми", case_id=1)])
+    check_overreach(probe, [*active, candidate], candidate, unclaimed("покорми"))
     assert len(probe.calls) == 1

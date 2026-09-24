@@ -15,24 +15,34 @@ cluster: the grouper is a Gemini call and re-groups the same commands slightly
 differently run to run, but the ``teacher_log`` ids are stable, and the ids are
 what decides whether there is anything new to learn from. A new case joining the
 cluster is a new signature with a fresh budget, which is exactly the event that
-makes another draft worth paying for.
+makes another draft worth paying for — and it retires the old signature, which
+:func:`forget` is where that happens.
 
 ``MINER_MAX_ATTEMPTS`` (default 3) is what the budget is, and redraws are worth
 paying for because the draft's wording is the thing that varies between two runs
 over an identical case set — JEB-1562 measured that spread on the live
 checkpoint, 0.40 / 0.80 / 0.40 / 1.00 / 0.80 / 0.60 for one cluster over six
-runs. Three is measured rather than picked: on the live probe the "сальто"
-cluster was refused twice for taking "спой песню" (@0.99, then @0.78) and
-published on the third draft, so a budget of 3 was exactly enough for it and 1
-would have lost it. It is a floor on patience, not a proof — a cluster that needs
-a fourth wording waits for a new case instead, which is the cheaper way to buy
-one. Past the budget the cluster is *stuck*: it is skipped
+runs. Three is measured rather than picked: across the live probe's passes the
+"сальто" cluster was refused for taking "спой песню" on two drafts out of three
+(@0.99 and @0.78) and on one out of three (@0.98), and the draft that published
+was never the first — so a budget of 3 got it through where 1 would have lost
+it. It is a floor on patience, not a proof: a cluster that needs a fourth wording
+waits for a new case instead, which is the cheaper way to buy one. Past the
+budget the cluster is *stuck*: it is skipped
 before the generator is called, it costs nothing per run, and it is counted in
 ``GET /api/metrics`` as ``clusters_stuck`` so "this one is not ripening, it is
 failing" is something you can see without opening the database.
 
 Nothing here ever removes a case from the pool. A stuck cluster is still routed,
 still logged, still grouped; the only thing withheld is the paid draft.
+
+**A stuck cluster is not a dormant one, and check 3 has to treat it as such.**
+Its phrases never reach anyone's ``examples``, so nothing will ever claim them
+back through step 0 — which makes them exactly the commands
+:func:`backend.miner.backtest.check_overreach` must control against. That
+follows from being skipped, not from being small, and is why the control set is
+built from :func:`backend.miner.run._worth_drafting` rather than from cluster
+size (JEB-1579 review).
 """
 
 from __future__ import annotations
@@ -51,7 +61,15 @@ Signature = tuple[int, ...]
 
 
 def max_attempts() -> int:
-    return int(os.environ.get("MINER_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS))
+    """At least one, whatever the environment says.
+
+    ``MINER_MAX_ATTEMPTS=0`` would make ``spent >= max_attempts()`` true for every
+    cluster on its first run, so mining would switch itself off entirely and say
+    so only at ``INFO`` — a whole subsystem disabled by a value that reads like
+    "no retries" (JEB-1579 review). The floor makes the worst setting mean "draft
+    once, never redraw", which is what that value is trying to say.
+    """
+    return max(1, int(os.environ.get("MINER_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)))
 
 
 def _key(signature: Signature) -> str:
@@ -87,20 +105,31 @@ def clear(conn: sqlite3.Connection, signature: Signature) -> None:
     conn.commit()
 
 
-def forget_gone(conn: sqlite3.Connection, pool_ids: set[int]) -> None:
-    """Drop the counters whose cases have left the pool.
+def forget(conn: sqlite3.Connection, pool_ids: set[int], live: list[Signature]) -> None:
+    """Drop the counters that can no longer describe a cluster.
 
-    A signature only ever recurs while every one of its cases is still unmined:
-    publication and acceptance set ``mined=1`` and the grouper can never hand
-    that id back. So a row that is no longer a subset of the pool is dead weight,
-    and dropping it also means an accepted-then-rejected cluster (whose cases go
-    back to ``mined=0``) starts from a clean budget rather than from whatever the
-    old draft spent.
+    Two ways a row dies, and ``clusters_stuck`` is only honest if both are swept.
+
+    **Its cases left the pool.** A signature can only recur while every one of
+    its cases is still unmined — publication and acceptance set ``mined=1`` and
+    the grouper can never hand that id back. Dropping the row also means an
+    accepted-then-rejected cluster (whose cases go back to ``mined=0``) starts
+    from a clean budget rather than from whatever the old draft spent.
+
+    **A larger cluster grew past it.** ``live`` is this run's grouping, and a row
+    that is a *proper* subset of one of those signatures describes a cluster that
+    no longer exists: the new case that arrived is exactly what bought the budget
+    back, so the old set can never be grouped again. Without this the stuck
+    counter kept the superseded signature — it is still a subset of the pool —
+    and every intermediate case set a growing cluster passed through accumulated,
+    turning "how many clusters are stuck now" into "how many ever were"
+    (JEB-1579 review). Equality is kept on purpose: the same case set regrouped
+    is the same cluster, and its budget is meant to survive.
     """
     doomed = [
         row["signature"]
         for row in conn.execute("SELECT signature FROM mining_attempts")
-        if not _still_pooled(row["signature"], pool_ids)
+        if _is_dead(row["signature"], pool_ids, live)
     ]
     if not doomed:
         return
@@ -108,16 +137,24 @@ def forget_gone(conn: sqlite3.Connection, pool_ids: set[int]) -> None:
     conn.commit()
 
 
-def _still_pooled(signature: str, pool_ids: set[int]) -> bool:
+def _is_dead(signature: str, pool_ids: set[int], live: list[Signature]) -> bool:
     try:
-        return set(json.loads(signature)) <= pool_ids
+        ids = set(json.loads(signature))
     except (TypeError, ValueError):
         # Unreadable signature: it can never match a cluster again, so it is gone.
-        return False
+        return True
+    if not ids <= pool_ids:
+        return True
+    return any(ids < set(group) for group in live)
 
 
 def stuck_count(conn: sqlite3.Connection) -> int:
-    """Case sets that have spent their whole draft budget — the metric."""
+    """Case sets that have spent their whole draft budget — the metric.
+
+    Accurate only because :func:`forget` runs first on every mining run: the row
+    count answers "how many clusters are stuck" exactly when every row still
+    describes a cluster that could be grouped today.
+    """
     return int(
         conn.execute(
             "SELECT COUNT(*) AS n FROM mining_attempts WHERE attempts >= ?", (max_attempts(),)

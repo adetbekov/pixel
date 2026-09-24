@@ -69,7 +69,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `MINER_SIM` | `0.88` | Cosine that joins two commands into one cluster — the **fallback** grouper only, used when the teacher's grouping call fails. Narrow usable band; see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster an accepted skill must take off Gemini to be proposed — measured by routing every case the way `/api/chat` will after acceptance. Calibrated on the live checkpoint; see `scripts/probe_miner_match.py`. |
-| `MINER_MAX_ATTEMPTS` | `3` | Drafts one *identical* set of cases gets before the miner stops redrawing it and counts it as stuck. A new case in the cluster resets the budget. |
+| `MINER_MAX_ATTEMPTS` | `3` | Drafts one *identical* set of cases gets before the miner stops redrawing it and counts it as stuck. A new case in the cluster resets the budget. Floored at 1 — `0` would switch mining off entirely. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
 | `SKILL_MIN_RATED` | `5` | Ratings required before that rule applies at all. |
 
@@ -215,18 +215,27 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    last because it is the one whose cost grows with the pool — which has no `LIMIT` and does not
    shrink for a rejected candidate.
 
-   **Which commands count is the whole check** (JEB-1579). Not the whole pool: a cluster that reaches
-   `MINER_MIN_CLUSTER` is drafted on this same run and copies its own phrases into its own
-   `examples`, so step 0 hands them straight back the moment it is accepted. A claim on those lasts
-   one mining run. A claim on a command that is in *no* cluster large enough to be drafted lasts for
-   ever — so the control set is the pool minus every mineable cluster, and only the leftovers veto.
+   **Which commands count is the whole check** (JEB-1579). Not the whole pool: a cluster that gets a
+   draft on this run copies its own phrases into its own `examples`, so step 0 hands them straight
+   back the moment it is accepted, and a claim on those lasts one mining run. A claim on a command
+   no cluster is going to list lasts for ever — so the control set is the pool minus every cluster
+   being drafted, and only what is left over vetoes.
+
+   "Will anything claim this?" is therefore exactly "will this cluster be drafted?", and the miner
+   answers it in one place (`backend/miner/run.py::_worth_drafting`) for both purposes. Size is only
+   its first term: a case set the user has already rejected never comes back, and one that has spent
+   its draft budget (below) waits for a case that may never arrive — both stay `mined=0` for good, so
+   both are controls. Deciding it a second time from `len(group)` alone let a candidate permanently
+   take a command from exactly the clusters already known to be unlearnable.
 
    The old rule was "wins **any** outsider", and on two near-synonymous intents it was a symmetric
    dead end. Measured live, three clusters × three runs: step 3 rejected 0 of 9, step 4 rejected
    0 of 9, step 5 rejected 6 of 9 — every one of them "фокус" taking "покажи сальто" @0.78 and
    "сальто" taking "сделай фокус" @0.98. Each refused the other, both stayed in the pool (`mined=1`
    is set only on publication), the next run redrew the same two drafts and refused them again, and
-   neither intent could ever be learned. The trade the narrower rule makes is deliberate: one
+   neither intent could ever be learned. Same probe after the fix: **8 of 9 publishable**, all six
+   neighbour claims reported and none vetoing, and one refusal left — a draft that reached for "спой
+   песню" @0.98, a leftover nothing will claim. The trade the narrower rule makes is deliberate: one
    mis-routed phrase for one run, against an 8-primitive library where every wrong answer is still a
    jump or a sentence and the user can 👎 it — versus an intent that stays on Gemini for ever, which
    is the number the project is measured on. The fix is here and not in the grouper on purpose:
@@ -244,7 +253,9 @@ miner stops redrawing it and the cluster is counted as stuck: skipped before the
 called, reported as `clusters_stuck` in `GET /api/metrics`, and shown in the learning panel when it
 is non-zero. The budget is keyed on the `teacher_log` ids, so a new case joining the cluster is a new
 case set and buys another draft — the same rule a user's rejection is remembered by
-(`backend/miner/attempts.py`).
+(`backend/miner/attempts.py`) — and the superseded case set is retired with it, or `clusters_stuck`
+would drift from "how many clusters are stuck" to "how many ever were". A stuck cluster is also a
+control for step 5, for the same reason a user-rejected one is: nothing is going to list its phrases.
 
 A mined `description` is a hard 60 characters and a candidate over it is rejected, not trimmed: the
 description *is* the router's option label, and stage 2 measured long ones dropping routing from 6/6

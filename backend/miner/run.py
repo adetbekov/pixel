@@ -14,16 +14,21 @@ is the backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
 only reaches it for a candidate no regression has already rejected. Since
 ``match_rate`` became a measure of what production will do (JEB-1562) that is
 nearly every candidate, where it used to be almost none — but it no longer scans
-the whole pool: JEB-1579 narrowed its control set to the rows no cluster is big
-enough to claim, and on a pool the miner has work to do in, most rows are in a
-cluster. The pool still has no ``LIMIT`` and still does not shrink for a
-candidate that was rejected, so the leftovers are the term to watch as it grows.
+the whole pool: JEB-1579 narrowed its control set to the rows nothing is going to
+claim, and on a pool the miner has work to do in, most rows belong to a cluster
+that is being drafted right now. The pool still has no ``LIMIT`` and still does
+not shrink for a candidate that was rejected, so those unclaimed rows are the
+term to watch as it grows.
+
+Which rows those are is :func:`_worth_drafting`, and there is deliberately no
+second opinion about it: a cluster gets a draft, or nothing will ever list its
+phrases. Both halves of the answer are computed once per run, before the loop.
 
 The other thing that does not shrink is the *Gemini* bill of a cluster that
 keeps failing, and that one is now bounded: a case set that has been drafted and
 refused ``MINER_MAX_ATTEMPTS`` times is skipped before ``generator.propose`` and
-counted as stuck (:mod:`backend.miner.attempts`), until a new case joins it and
-makes it a different cluster.
+counted as stuck (:mod:`backend.miner.attempts`), until a new case joins it —
+which makes it a different cluster and retires the old signature.
 
 Two triggers, one body: every ``MINER_BATCH``-th new mineable case, and
 ``POST /api/mine``. A second concurrent run is refused rather than queued — it
@@ -127,28 +132,49 @@ def _mine() -> int:
         active = load_skills(conn, only_active=True)
         taken = _taken_ids(conn)
         rejected = _rejected_signatures(conn)
-        attempts.forget_gone(conn, {case.id for case in cases})
-        refused = attempts.load(conn)
 
     if len(cases) < min_cluster_size():
         return 0
 
     groups = group_texts(engine, [case.user_text for case in cases], generator.group)
+    clusters = [[cases[index] for index in group] for group in groups]
+    signatures = [tuple(sorted(case.id for case in cluster)) for cluster in clusters]
+
+    # The ledger is pruned against *this run's* grouping, not just against the
+    # pool, so a signature a larger cluster has grown past stops being counted as
+    # stuck (JEB-1579 review). Read after the prune, so `refused` is what the
+    # ledger says now.
+    with db.lock:
+        attempts.forget(conn, {case.id for case in cases}, signatures)
+        refused = attempts.load(conn)
+
+    # Whether a cluster gets a draft this run is also the answer to "will anything
+    # ever claim its phrases", so it is computed once, up front, and the same list
+    # decides both what is proposed and what check 3 controls against. Two
+    # predicates for one question is what JEB-1579's review found: `leftovers`
+    # used to re-derive this from `len(group)` alone and disagreed on the clusters
+    # already known to be unlearnable.
+    draftable = [
+        _worth_drafting(cluster, signature, rejected, refused)
+        for cluster, signature in zip(clusters, signatures, strict=True)
+    ]
+
     created = 0
-    for position, group in enumerate(groups):
-        cluster = [cases[index] for index in group]
-        signature = tuple(sorted(case.id for case in cluster))
-        if not _worth_drafting(cluster, signature, rejected, refused):
+    for position, cluster in enumerate(clusters):
+        if not draftable[position]:
             continue
-        # The other clusters are the over-broad control set, free of charge: real
-        # commands this candidate is not for. They stay *grouped* because check 3
-        # only vetoes on the ones no cluster is big enough to claim back — see
-        # `backend.miner.backtest.leftovers` (JEB-1579).
+        # Check 3's control set, free of charge: the pool commands no cluster is
+        # going to claim. A cluster that *is* being drafted lists its own phrases
+        # in its own `examples`, so step 0 takes them back on acceptance and a
+        # claim on them lasts one run; one that is not drafted — too small, user-
+        # rejected, or out of draft budget — keeps `mined=0` for good.
         outsiders = [
-            [cases[index] for index in other]
-            for number, other in enumerate(groups)
-            if number != position
+            case
+            for number, other in enumerate(clusters)
+            if number != position and not draftable[number]
+            for case in other
         ]
+        signature = signatures[position]
         attempt = _propose(engine, generator, cluster, outsiders, active, taken, signature)
         if attempt.proposal is not None:
             taken.add(attempt.proposal.skill.id)
@@ -198,10 +224,20 @@ def _worth_drafting(
 ) -> bool:
     """Everything that can be decided about a cluster before paying for a draft.
 
-    Both "no" answers are about the same thing — this exact set of cases has been
-    through the mill already — and both are keyed on the case ids rather than on
-    the cluster, because the grouper is a Gemini call and does not hand back the
-    same grouping twice.
+    The two "no" answers below are about the same thing — this exact set of cases
+    has been through the mill already — and both are keyed on the case ids rather
+    than on the cluster, because the grouper is a Gemini call and does not hand
+    back the same grouping twice.
+
+    **This is also check 3's control-set predicate, and deliberately the only
+    copy of it** (JEB-1579 review). ``False`` here means the cluster gets no draft
+    this run, which means its phrases reach no ``examples``, which means a
+    candidate that wins one of them keeps it: exactly the permanent claim
+    :func:`backend.miner.backtest.check_overreach` exists to refuse. Size is only
+    the first term — a user-rejected case set never comes back
+    (:func:`_rejected_signatures`) and a stuck one waits for a case that may never
+    arrive, so reading size alone called both of them claimable and re-opened
+    JEB-1548 for the two kinds of cluster already known to be unlearnable.
     """
     if len(cluster) < min_cluster_size():
         return False

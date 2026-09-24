@@ -37,8 +37,9 @@ that is where the spread lives: Gemini rewrites the draft's `id` and
 
 The three clusters are deliberately two near-synonymous intents plus one that is
 not, and the pool carries three one-off `LEFTOVERS` besides, because check 3
-treats the two halves differently: a claim on a mineable neighbour's phrase is
-temporary and not a veto, a claim on a leftover is permanent and is (JEB-1579).
+treats the two halves differently: a claim on a phrase belonging to a cluster
+that is also being drafted is temporary and not a veto, a claim on a leftover
+nothing will ever list is permanent and is (JEB-1579).
 
 Costs a handful of `gemini-2.5-flash-lite` calls per run: one teacher call per
 command plus one generate call per cluster.
@@ -55,7 +56,6 @@ from backend.brain.router import RouterHit, default_threshold, normalize, pick_s
 from backend.brain.skill import Skill, load_seed_skills
 from backend.miner.backtest import Backtest, backtest, min_match_rate
 from backend.miner.case import Case
-from backend.miner.cluster import min_cluster_size
 from backend.miner.generate import GeminiSkillGenerator
 from backend.state import RobotState
 from backend.teacher.client import GeminiTeacher
@@ -95,11 +95,12 @@ CLUSTERS: dict[str, list[str]] = {
 }
 
 #: One-off commands the teacher *can* express, each a different intent, none of
-#: them repeated. In a real pool these are the rows the grouper leaves in
-#: sub-`MINER_MIN_CLUSTER` groups, so nothing will ever claim them back — which
-#: is exactly what makes them the over-broad control set (JEB-1579). A draft that
-#: wins one of these keeps it for good; a draft that wins a *neighbouring
-#: cluster's* phrase only keeps it until that cluster is mined.
+#: them repeated. In a real pool these are the rows no cluster gets a draft for —
+#: too small here, but `backend.miner.run._worth_drafting` says the same of a
+#: user-rejected and of a stuck case set — so nothing will ever list them in its
+#: `examples`, which is exactly what makes them the over-broad control set
+#: (JEB-1579). A draft that wins one of these keeps it for good; a draft that
+#: wins a phrase from a cluster being drafted alongside it keeps it one run.
 LEFTOVERS: list[str] = [
     "спой песню",
     "расскажи анекдот",
@@ -160,7 +161,8 @@ def report_backtest(
     active: list[Skill],
     candidate: Skill,
     cases: list[Case],
-    outsiders: list[list[Case]],
+    unclaimed: list[Case],
+    neighbours: list[Case],
 ) -> Backtest:
     """Print the two routers side by side, then the numbers the backtest reports.
 
@@ -193,19 +195,13 @@ def report_backtest(
             f"candidate={got} teacher={sorted(case.action_names)}"
         )
 
-    report = backtest(engine, active, candidate, cases, outsiders)
+    report = backtest(engine, active, candidate, cases, unclaimed)
     print(
         f"  match_rate {report.match_rate:.2f} ({report.matched}/{report.total}), "
         f"generalization {report.generalization:.2f}, agreement {report.agreement:.2f}"
     )
-    # What the candidate took from the *mineable* neighbours: no longer a veto
-    # (JEB-1579), and printed because it is the thing the veto used to be.
-    neighbours = [
-        case
-        for group in outsiders
-        if len(group) >= min_cluster_size()
-        for case in group
-    ]
+    # What the candidate took from the clusters being drafted alongside it: no
+    # longer a veto (JEB-1579), and printed because it is what the veto used to be.
     claimed = [
         (case.user_text, confidence)
         for case, (picked, confidence) in (
@@ -214,7 +210,7 @@ def report_backtest(
         if picked is not None and picked.id == candidate.id
     ]
     for text, confidence in claimed:
-        print(f"  claims {text!r} from a mineable neighbour @{confidence:.2f} — not a veto")
+        print(f"  claims {text!r} from a cluster being drafted too @{confidence:.2f} — not a veto")
     print(f"  regression {report.regression}, overreach {report.overreach}")
     print(
         f"  publishable={report.publishable} "
@@ -287,12 +283,21 @@ def main() -> None:
                 print("  the generator produced nothing — see the log above")
                 results[name].append(None)
                 continue
-            # The rest of the pool, grouped as a real run's grouper would leave
-            # it: the other clusters, plus the leftovers one per group, because
-            # check 3 vetoes on group size (JEB-1579, `backtest.leftovers`).
-            outsiders = [group for other, group in taught.items() if other not in (name, "leftovers")]
-            outsiders += [[case] for case in taught["leftovers"]]
-            results[name].append(report_backtest(engine, active, candidate, cases, outsiders))
+            # The control set a real run would build: every pool command that no
+            # cluster is going to claim. Here that is the leftovers — the other
+            # two clusters are drafted on this same pass, exactly as
+            # `backend.miner.run._worth_drafting` decides (JEB-1579).
+            neighbours = [
+                case
+                for other, group in taught.items()
+                if other not in (name, "leftovers")
+                for case in group
+            ]
+            results[name].append(
+                report_backtest(
+                    engine, active, candidate, cases, taught["leftovers"], neighbours
+                )
+            )
 
     report_calibration(results)
 
