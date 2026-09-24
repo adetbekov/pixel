@@ -84,7 +84,7 @@ async def test_unknown_button_is_rejected(client):
 @pytest.mark.anyio
 async def test_chat_runs_a_skill(client, seeded, engine):
     engine.pick, engine.confidence = "greet", 0.93
-    body = (await client.post("/api/chat", json={"text": "привет"})).json()
+    body = (await client.post("/api/chat", json={"text": "приветствую"})).json()
     assert_reply(body, "laya")
     assert body["skill_id"] == "greet"
     assert body["confidence"] == pytest.approx(0.93)
@@ -143,12 +143,12 @@ async def test_chat_accepts_text_at_the_limit(client, seeded, engine):
 @pytest.mark.anyio
 async def test_chat_trims_surrounding_whitespace(client, seeded, engine, conn):
     engine.pick, engine.confidence = "greet", 0.93
-    response = await client.post("/api/chat", json={"text": "  привет  "})
+    response = await client.post("/api/chat", json={"text": "  приветствую  "})
 
     assert response.status_code == 200
-    assert engine.prompts == ['Команда пользователя: "привет"']
+    assert engine.prompts == ['Команда пользователя: "приветствую"']
     stored = conn.execute("SELECT user_text FROM interactions ORDER BY id DESC LIMIT 1")
-    assert stored.fetchone()["user_text"] == "привет"
+    assert stored.fetchone()["user_text"] == "приветствую"
 
 
 @pytest.mark.anyio

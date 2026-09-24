@@ -64,9 +64,9 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `LAYA_MODEL` | `multilingual` | Laya subfolder. The English root checkpoint answers Cyrillic confidently and wrongly. |
 | `LAYA_DEVICE` | `cpu` | Where the local model runs. |
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
-| `ROUTER_THRESHOLD` | `0.6` | Confidence a skill needs to win the router. Below it, the command is a miss. |
+| `ROUTER_THRESHOLD` | `0.66` | Confidence a skill needs to win the router. Below it, the command is a miss. Calibrated on the live checkpoint — see `scripts/calibrate_router.py`. |
 | `MINER_BATCH` | `5` | Mine on every N-th unmined case. |
-| `MINER_SIM` | `0.88` | Cosine similarity that joins two commands into one cluster. Narrow usable band — see `backend/miner/cluster.py`. |
+| `MINER_SIM` | `0.88` | Cosine that joins two commands into one cluster — the **fallback** grouper only, used when the teacher's grouping call fails. Narrow usable band; see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
@@ -76,11 +76,19 @@ then runs on Laya alone. Defaults are in `.env.example`.
 
 `POST /api/chat` costs at most two forward passes of one local model:
 
+0. **Have we been told this exact phrase?** A command that matches one of a skill's `examples`
+   (ignoring case, `ё` and punctuation) routes straight to that skill at confidence 1.0, with no
+   forward pass at all. Measured on the live checkpoint, the head put `хай` — greet's own example —
+   at 0.22, so without this step a skill could miss the very phrases it claims.
 1. **Which skill?** One `choice` question over every active skill plus a mandatory `unknown`
-   option. Below the skill's threshold (`ROUTER_THRESHOLD`, default `0.6`), or on `unknown`, the
+   option. Below the skill's threshold (`ROUTER_THRESHOLD`, default `0.66`), or on `unknown`, the
    router reports a miss and hands it to the teacher.
 2. **How should it behave?** All of the chosen skill's questions in a single batched call. A skill
    with no questions skips this pass.
+
+`ROUTER_THRESHOLD` is a property of the *option set*, not of any one skill: the same probe phrase
+moves by up to 0.38 between the 4-skill starter library and the 5-skill one the miner produces. Run
+`scripts/calibrate_router.py` after changing the checkpoint or the library rather than guessing.
 
 A skill is JSON, never code: it combines the fixed action library (`backend/actions.py`) through
 `when -> actions` rules, first match wins. A skill naming an action outside the library is refused
@@ -125,14 +133,21 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
 `backend/miner/`, and it runs on every `MINER_BATCH`-th unmined case (default 5) or on
 `POST /api/mine`:
 
-1. **Cluster.** Sentence vectors come from the Laya checkpoint already in memory
-   (`DecisionEngine.embed`) — local, free, and still no `import laya` outside `engine.py`.
-   Single-link agglomerative clustering on cosine >= `MINER_SIM` (0.88), which is connected
-   components of the similarity graph, in numpy. The default is measured against the real
-   checkpoint: these vectors are anisotropic, so the band that separates "same request" from
-   "different request" sits high and is narrow. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
-   pool and ripen. Without embeddings the commands are grouped by one Gemini call instead — a
-   degraded path, not the default one.
+1. **Cluster.** One Gemini `group` call over the whole pool — one per *run*, not per cluster.
+   Clusters under `MINER_MIN_CLUSTER` (3) stay in the pool and ripen. The local Laya vectors
+   (`DecisionEngine.embed`, single-link on cosine >= `MINER_SIM`) are the fallback for when that
+   call fails, and they are the fallback because they were measured against it on the same pools:
+
+   | grouper | purity | recall | clusters/run |
+   | --- | --- | --- | --- |
+   | Laya cosine @ 0.88 | 1.000 | 0.322 | 0.79 |
+   | one Gemini `group` call | 0.875 | 0.808 | 2.00 |
+
+   The cosine is pure only because it is nearly a duplicate detector — these vectors are
+   anisotropic, and their same-intent and different-intent ranges overlap outright (on the worked
+   example the closest same-intent pair sits at 0.76 and an unrelated pair at 0.85), so no
+   threshold, linkage or normalisation separates them. An impure cluster still has to survive the
+   backtest; a cluster that is never found is a skill that is never learned.
 2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-2.5-flash-lite`,
    $0.30 / $2.50 per 1M) per cluster. Offline, nobody waiting, and what comes back is a schema that
    will route thousands of later commands; raise the model through the env var if drafts start
@@ -148,7 +163,15 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    alphabetical order pushing "покорми" under its threshold outright. So one control phrase per
    active skill (`examples[0]`, so the set grows with the library) is routed through the same trial
    registry, and one phrase leaving its own skill kills the proposal.
-5. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
+5. **Over-broad check.** Neither of those looks at commands no skill claims yet — measured live, an
+   accepted `show_trick` pulled "покажи сальто" to itself at 0.78 with every control green. So the
+   rest of the pool, the cases the grouper put in *other* clusters, is routed too: a candidate that
+   wins any of them is drafted too wide and is not proposed. This is the one check whose cost grows
+   with the pool, which has no `LIMIT` and does not shrink for a rejected candidate — so it runs
+   last, only for a candidate steps 3 and 4 have already cleared. None of steps 3–5 may use the
+   router's `examples` lookup, since a candidate's `examples` are exactly the cluster under test;
+   steps 4 and 5 only read which skill won, so they take `pick_skill` (pass 1 alone) instead.
+6. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
    `POST /api/proposals/{id}/accept` adds the skill, and it takes effect in the same process, since
    `/api/chat` reads the library on every request. `reject` puts the cases back in the pool and
    remembers the case set, so the same cluster is not offered again.

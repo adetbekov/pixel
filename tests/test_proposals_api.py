@@ -393,21 +393,21 @@ async def test_a_fenced_draft_is_not_parsed(client, seeded, miner_engine, genera
     assert "did not match the schema" in caplog.text
 
 
-def test_the_fallback_grouping_goes_out_the_same_way():
+def test_the_grouping_call_goes_out_the_same_way():
     """`group()` shares `_call`, so it shared the defect — and hides it better.
 
-    The fallback grouping only runs when the local Laya vectors are unavailable,
-    so a broken call shape here shows up as nothing at all: `group` swallows the
-    parse error and returns `[]`, which reads as "no clusters" rather than as a
-    failure. Pin both halves — the shape that goes out, and that a bare-JSON
-    answer comes back parsed.
+    Grouping is the miner's first call and its failures are silent: `group`
+    swallows the parse error and returns `[]`, which reads as "no clusters"
+    rather than as a failure, and the run then falls back to the local vectors.
+    Pin both halves — the shape that goes out, and that a bare-JSON answer comes
+    back parsed.
     """
-    fake = FakeGeminiClient(json.dumps({"groups": [[0, 1], [2]]}))
+    fake = FakeGeminiClient(grouping=[[0, 1], [2]])
     generator = GeminiSkillGenerator(client=fake, model="fake-model")
 
     assert generator.group(["покажи фокус", "сделай фокус", "станцуй"]) == [[0, 1], [2]]
 
-    call = fake.calls[0]
+    call = fake.grouping_calls[0]
     assert call["model"] == "fake-model"
     assert call["config"]["response_mime_type"] == "application/json"
     assert "groups" in call["config"]["response_schema"]["properties"]
@@ -416,7 +416,7 @@ def test_the_fallback_grouping_goes_out_the_same_way():
 
 def test_a_fenced_grouping_is_not_parsed():
     """And the fence is a failure on this path too — an empty, silent one."""
-    fake = FakeGeminiClient('```json\n{"groups": [[0, 1]]}\n```')
+    fake = FakeGeminiClient(grouping='```json\n{"groups": [[0, 1]]}\n```')
     generator = GeminiSkillGenerator(client=fake, model="fake-model")
 
     assert generator.group(["покажи фокус", "сделай фокус"]) == []
@@ -479,3 +479,35 @@ async def test_a_concurrent_run_is_refused_not_queued(client, seeded, miner_engi
 
     assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
     assert seen == [MineResult(started=False, proposals=0)]
+
+
+@pytest.mark.anyio
+async def test_the_run_asks_the_teacher_to_group_before_anything_else(
+    client, seeded, miner_engine, generator
+):
+    """JEB-1548: one grouping call per run, and the vectors are not consulted."""
+    fake = generator(draft_json(), grouping=[[0, 1, 2, 3, 4]])
+    fill_pool(seeded)
+
+    proposal = await mined_proposal(client)
+    assert len(fake.grouping_calls) == 1
+    assert TRICK_COMMANDS[0] in fake.grouping_calls[0]["contents"]
+    assert miner_engine.embedded == []
+    assert len(proposal["sample_ids"]) == 5
+
+
+@pytest.mark.anyio
+async def test_a_command_the_teacher_left_out_kills_an_over_broad_candidate(
+    client, seeded, miner_engine, generator
+):
+    """The rest of the pool is the control set no `examples[0]` check can be."""
+    generator(draft_json(), grouping=[[0, 1, 2, 3, 4], [5]])
+    fill_pool(seeded, [*TRICK_COMMANDS, "покажи сальто"])
+    miner_engine.routes = {**TRICK_ROUTES, "покажи сальто": "show_trick"}
+
+    assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+    assert (await client.get("/api/proposals")).json() == []
+    # Rejected, not mined: the cases stay in the pool for a narrower draft later.
+    assert (
+        seeded.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0").fetchone()["n"] == 6
+    )

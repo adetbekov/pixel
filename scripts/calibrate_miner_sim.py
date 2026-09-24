@@ -33,10 +33,20 @@ Four sections, in the order the argument is made:
      which is the case the miner exists for.
   4. **Latency.** `mine_once()` runs inline in `POST /api/chat`, and the pool it
      embeds only shrinks for cases that became a proposal — so this grows.
+  5. **The teacher, scored the same way.** One Gemini `group` call per pool,
+     over the same simulated histories, on the same purity/recall scale. This is
+     the section that demoted the cosine to a fallback (JEB-1548) — it needs
+     GEMINI_API_KEY and is skipped without one.
+  6. **What a whole run costs the request.** One real `mine_once()` against a
+     throwaway database, timed at several pool sizes, with the backtest's
+     over-broad check gated (as shipped) and forced. `mine_once()` runs inline
+     in `POST /api/chat` under `LayaEngine._lock`, and that check is the one term
+     that scales with the pool rather than the cluster. Also needs a key.
 """
 
 from __future__ import annotations
 
+import os
 import statistics
 import sys
 import time
@@ -47,6 +57,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from backend.miner.backtest import DEFAULT_MIN_MATCH
 from backend.miner.cluster import DEFAULT_MIN_CLUSTER, components, cosine_matrix
 
 BATCH = 5
@@ -254,6 +265,123 @@ def report_latency(engine) -> None:
     print("   both hold LayaEngine._lock, so an embed also stalls every other request's router")
 
 
+def report_teacher(vectors: np.ndarray, labels: list[str], trials: int = 12) -> None:
+    """The same score for the grouper that does not need vectors at all.
+
+    Far fewer trials than the sweep: each one is a live call, not arithmetic over
+    a matrix already in memory. The pool sizes are the ones a real run sees.
+    """
+    from backend.miner.generate import build_generator
+
+    print(f"\n=== 5. one Gemini grouping call, {trials} pools ===")
+    generator = build_generator()
+    if generator is None:
+        print("  skipped: no GEMINI_API_KEY")
+        return
+
+    texts, _ = corpus()
+    rng = np.random.default_rng(7)
+    tally: Counter = Counter()
+    for _ in range(trials):
+        order = rng.permutation(len(labels))
+        index = order[: int(rng.choice([10, 15, 20, 25]))]
+        pool = [labels[i] for i in index]
+        counts = Counter(pool)
+        present = {
+            name
+            for name, count in counts.items()
+            if not name.startswith("noise:") and count >= DEFAULT_MIN_CLUSTER
+        }
+        tally["runs"] += 1
+        tally["present"] += len(present)
+        for group in generator.group([texts[i] for i in index]):
+            if len(group) < DEFAULT_MIN_CLUSTER:
+                continue
+            names = {pool[i] for i in group}
+            tally["groups"] += 1
+            if len(names) == 1:
+                tally["pure"] += 1
+                tally["found"] += int(names.pop() in present)
+
+    purity = tally["pure"] / tally["groups"] if tally["groups"] else 0.0
+    recall = tally["found"] / tally["present"] if tally["present"] else 0.0
+    print("   purity  recall  calls/run")
+    print(f"   {purity:.3f}   {recall:.3f}   {tally['groups'] / tally['runs']:.2f}")
+    print("  compare against section 2 at the MINER_SIM in use: the cosine buys purity")
+    print("  with recall, and a cluster it never finds is a skill never learned")
+
+
+def timed_run(engine, pool: int, forced: bool) -> tuple[float, int]:
+    """One real `mine_once()` over a throwaway pool. Returns seconds and proposals.
+
+    `forced=True` reproduces the pre-review ordering — the over-broad check run
+    for every candidate — by lowering `MINER_MIN_MATCH` to 0 so nothing is
+    rejected before it. That is the only difference; everything else is the
+    shipped path, database writes included.
+    """
+    import tempfile
+
+    from backend import db
+    from backend.brain.engine import set_engine
+    from backend.miner.run import mine_once
+    from backend.state import RobotState
+    from backend.teacher.log import log_case
+
+    texts = [phrase for group in INTENTS.values() for phrase in group] + NOISE
+    plan = [{"action": "spin", "args": {}}, {"action": "say", "args": {"text": "Тада!"}}]
+    state = RobotState(mood=60.0, energy=60.0, fullness=60.0, face="curious")
+
+    previous = os.environ.get("MINER_MIN_MATCH")
+    with tempfile.TemporaryDirectory() as directory:
+        conn = db.init(str(Path(directory) / "probe.db"))
+        for index in range(pool):
+            log_case(
+                conn,
+                interaction_id=index + 1,
+                user_text=texts[index % len(texts)],
+                state=state,
+                confidence=0.4,
+                raw_response="{}",
+                actions=plan,
+            )
+        conn.commit()
+        set_engine(engine)
+        os.environ["MINER_MIN_MATCH"] = "0" if forced else str(DEFAULT_MIN_MATCH)
+        try:
+            start = time.perf_counter()
+            result = mine_once()
+            elapsed = time.perf_counter() - start
+        finally:
+            if previous is None:
+                os.environ.pop("MINER_MIN_MATCH", None)
+            else:
+                os.environ["MINER_MIN_MATCH"] = previous
+            set_engine(None)
+            db.close()
+    return elapsed, result.proposals
+
+
+def report_run_cost(engine, sizes: tuple[int, ...] = (10, 20, 40)) -> None:
+    from backend.miner.generate import build_generator, set_generator
+
+    print("\n=== 6. one mine_once(), inline in POST /api/chat ===")
+    generator = build_generator()
+    if generator is None:
+        print("  skipped: no GEMINI_API_KEY")
+        return
+
+    set_generator(generator)
+    try:
+        print("   pool   gated (shipped)   forced (every candidate scans the pool)")
+        for size in sizes:
+            gated, _ = timed_run(engine, size, forced=False)
+            forced, _ = timed_run(engine, size, forced=True)
+            print(f"   {size:>4}   {gated:>9.1f} s     {forced:>9.1f} s")
+    finally:
+        set_generator(None)
+    print("  the gap is the over-broad check, and it is what a rejected draft used to cost")
+
+
 def main() -> None:
     from backend.brain.engine import LayaEngine
 
@@ -269,6 +397,8 @@ def main() -> None:
     report_sweep(vectors, labels)
     report_centering(vectors, labels)
     report_latency(engine)
+    report_teacher(vectors, labels)
+    report_run_cost(engine)
 
 
 if __name__ == "__main__":

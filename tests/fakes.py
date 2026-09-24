@@ -8,6 +8,7 @@ Both now call ``models.generate_content``, so one scripted surface serves both.
 """
 
 import hashlib
+import json
 import struct
 from dataclasses import dataclass
 from typing import Any
@@ -99,13 +100,42 @@ class FakeScript:
     A scripted entry is either the raw text the model would return, or an
     exception instance to raise instead (a timeout, a 500). The last entry is
     reused if the caller asks more times than the script has answers.
+
+    Grouping calls are kept out of that sequence entirely, in ``grouping_calls``.
+    A mining run now opens with one (the teacher is the primary grouper — see
+    ``backend/miner/cluster.py``), and counting it would shift every positional
+    script in the suite by one and make "the first call" mean something else.
+    ``grouping`` is what it answers with: a list of groups is wrapped in the
+    response shape, a raw string goes out verbatim so a test can pin what an
+    unparsable answer does, an exception instance is raised, and ``None`` means
+    "the teacher grouped nothing", which is what sends a test down the
+    local-vector fallback.
     """
 
-    def __init__(self, script: list[Any]) -> None:
+    def __init__(
+        self,
+        script: list[Any],
+        grouping: list[list[int]] | str | BaseException | None = None,
+    ) -> None:
         self.script = script
+        self.grouping = grouping
         self.calls: list[dict[str, Any]] = []
+        self.grouping_calls: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _is_grouping(kwargs: dict[str, Any]) -> bool:
+        schema = (kwargs.get("config") or {}).get("response_schema") or {}
+        return "groups" in (schema.get("properties") or {})
 
     def answer(self, kwargs: dict[str, Any]) -> str:
+        if self._is_grouping(kwargs):
+            self.grouping_calls.append(kwargs)
+            if isinstance(self.grouping, BaseException):
+                raise self.grouping
+            if isinstance(self.grouping, str):
+                return self.grouping
+            return json.dumps({"groups": self.grouping or []})
+
         self.calls.append(kwargs)
         answer = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
         if isinstance(answer, BaseException):
@@ -124,9 +154,13 @@ class FakeModels:
 
 
 class FakeGeminiClient:
-    def __init__(self, *script: Any) -> None:
-        self._script = FakeScript(list(script))
+    def __init__(self, *script: Any, grouping: list[list[int]] | None = None) -> None:
+        self._script = FakeScript(list(script), grouping)
         self.models = FakeModels(self._script)
+
+    @property
+    def grouping_calls(self) -> list[dict[str, Any]]:
+        return self._script.grouping_calls
 
     @property
     def calls(self) -> list[dict[str, Any]]:

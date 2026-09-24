@@ -1,9 +1,19 @@
 """One mining run, start to finish.
 
-Synchronous inside the request that triggers it — the pool is tens of rows and
-one run is seconds. That is a prototype decision, not an architectural one,
-which is why the whole run is :func:`mine_once` and nothing else: moving it to a
-background worker is a change of caller, not of this module.
+Synchronous inside the request that triggers it, and that is a prototype
+decision, not an architectural one — which is why the whole run is
+:func:`mine_once` and nothing else: moving it to a background worker is a change
+of caller, not of this module.
+
+What it costs the request it runs inside, measured on the live checkpoint
+(``scripts/calibrate_miner_sim.py``, section 6): a run is roughly one teacher
+grouping call plus a few forward passes per cluster case and per active skill,
+and it holds ``LayaEngine._lock`` for all of them, so every other request's
+router waits. The one term that scales with the *pool* rather than the cluster
+is the backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
+only reaches it for a candidate that would otherwise be published — which, while
+a draft keeps failing on ``match_rate``, is none of them. Keep it that way: the
+pool has no ``LIMIT`` and does not shrink for a candidate that was rejected.
 
 Two triggers, one body: every ``MINER_BATCH``-th new unmined case, and
 ``POST /api/mine``. A second concurrent run is refused rather than queued — it
@@ -98,7 +108,11 @@ def _mine() -> int:
     created = 0
     for group in groups:
         cluster = [cases[index] for index in group]
-        proposal = _propose(engine, generator, cluster, active, taken, rejected)
+        # The rest of the pool is the over-broad control set, free of charge:
+        # real commands this candidate is not for (see backtest, check 3).
+        member = set(group)
+        outsiders = [case for index, case in enumerate(cases) if index not in member]
+        proposal = _propose(engine, generator, cluster, outsiders, active, taken, rejected)
         if proposal is None:
             continue
         taken.add(proposal.skill.id)
@@ -120,6 +134,7 @@ def _propose(
     engine: DecisionEngine,
     generator: SkillGenerator,
     cluster: list[Case],
+    outsiders: list[Case],
     active: list[Skill],
     taken: set[str],
     rejected: set[tuple[int, ...]],
@@ -142,11 +157,14 @@ def _propose(
         log.warning("miner: candidate id %r is already in use", skill.id)
         return None
 
-    report = backtest(engine, active, skill, cluster)
+    report = backtest(engine, active, skill, cluster, outsiders)
     if report.regression is not None:
         log.warning(
             "miner: %r rejected — it breaks an active skill: %s", skill.id, report.regression
         )
+        return None
+    if report.overreach is not None:
+        log.warning("miner: %r rejected — it is drafted too wide: %s", skill.id, report.overreach)
         return None
     if not report.publishable:
         log.info(

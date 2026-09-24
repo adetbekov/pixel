@@ -61,8 +61,8 @@ def generator():
     right, and a hand-rolled fake generator would skip all of them.
     """
 
-    def install(*script) -> FakeGeminiClient:
-        fake = FakeGeminiClient(*script)
+    def install(*script, grouping=None) -> FakeGeminiClient:
+        fake = FakeGeminiClient(*script, grouping=grouping)
         set_generator(GeminiSkillGenerator(client=fake, model="fake-model"))
         return fake
 
