@@ -40,13 +40,30 @@ TEACHER_PLANS = [
 #: Nothing extreme, so the candidate's fallback rule is the one that fires.
 MID_STATE = RobotState(mood=60.0, energy=60.0, fullness=60.0, face="curious")
 
+#: The cluster next door: a different intent the library expresses with the same
+#: primitives, which is the pair JEB-1579 is about. Live, the "фокус" draft took
+#: "покажи сальто" and the "сальто" draft took "сделай фокус", and each refused
+#: the other for ever.
+SALTO_COMMANDS = [
+    "сделай сальто",
+    "покажи сальто",
+    "крутани сальто",
+]
+
 #: One direction plus a nudge per command: every pair sits at cos >= 0.97, well
 #: clear of MINER_SIM (0.88), and an unscripted command stays far away — below
 #: 0.19 through `hash_vector`. Same width as `hash_vector`, so the two can
-#: appear in one batch.
+#: appear in one batch. The two clusters point down orthogonal axes, so the
+#: grouper separates them however close their *commands* read.
 TRICK_EMBEDDINGS = {
-    text: [1.0, 0.05 * index, *([0.0] * (EMBED_DIM - 2))]
-    for index, text in enumerate([*TRICK_COMMANDS, LATER_TRICK])
+    **{
+        text: [1.0, 0.05 * index, *([0.0] * (EMBED_DIM - 2))]
+        for index, text in enumerate([*TRICK_COMMANDS, LATER_TRICK])
+    },
+    **{
+        text: [0.0, 0.0, 1.0, 0.05 * index, *([0.0] * (EMBED_DIM - 4))]
+        for index, text in enumerate(SALTO_COMMANDS)
+    },
 }
 
 #: Control phrases: `examples[0]` of each starter skill, which is exactly the set
@@ -85,8 +102,31 @@ TRICK_DRAFT: dict[str, Any] = {
 }
 
 
+SALTO_DRAFT: dict[str, Any] = {
+    "id": "do_salto",
+    "name": "Сальто",
+    "description": "сделать сальто",
+    "examples": SALTO_COMMANDS,
+    "rules": [
+        {
+            "when_state": "",
+            "when_band": "",
+            "actions": [
+                {"action": "jump"},
+                {"action": "spin"},
+                {"action": "say", "text": "Оп! Сальто."},
+            ],
+        }
+    ],
+}
+
+
 def draft_json(**overrides: Any) -> str:
     return json.dumps({**TRICK_DRAFT, **overrides}, ensure_ascii=False)
+
+
+def salto_json(**overrides: Any) -> str:
+    return json.dumps({**SALTO_DRAFT, **overrides}, ensure_ascii=False)
 
 
 def fill_pool(

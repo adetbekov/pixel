@@ -182,6 +182,11 @@ class Metrics(BaseModel):
     laya_share_24h: float = 0.0
     gemini_calls_24h: int = 0
     skills_disabled: int = 0
+    #: Case sets the miner has stopped redrawing after `MINER_MAX_ATTEMPTS`
+    #: refused drafts (JEB-1579). It is the one number here that is about
+    #: learning failing rather than learning working, so the panel only shows it
+    #: when it is non-zero.
+    clusters_stuck: int = 0
 
 
 def _log_interaction(

@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS skill_proposals (
     status TEXT,
     created_at TEXT
 );
+
+-- One row per set of cases the miner has drafted and the backtest has refused,
+-- so the same refusal stops costing a Gemini draft on every run and a cluster
+-- that is failing is distinguishable from one that is still ripening. The
+-- ledger is `backend/miner/attempts.py`; `signature` is the cluster's sorted
+-- `teacher_log` ids, the same shape as `skill_proposals.sample_ids`.
+CREATE TABLE IF NOT EXISTS mining_attempts (
+    signature TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_reason TEXT,
+    last_at TEXT
+);
 """
 
 #: Columns added after the schema above was frozen, as ``table -> column -> type``.

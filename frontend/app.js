@@ -238,6 +238,11 @@ function renderMetrics(metrics) {
   /* Отключённые показываем, только когда они есть: пустая карточка «0» просто
      занимала бы место в панели. */
   if (disabled) cards.push(metricCard('Отключено навыков', String(disabled)));
+  /* То же и для застрявших кластеров: ноль — нормальное состояние, а не новость.
+     Ненулевое значение означает, что майнер перестал перерисовывать один и тот
+     же набор случаев — раньше это было видно только в логе (JEB-1579). */
+  const stuck = Number(metrics.clusters_stuck) || 0;
+  if (stuck) cards.push(metricCard('Застрявших кластеров', String(stuck)));
   metricsEl.replaceChildren(...cards);
 }
 

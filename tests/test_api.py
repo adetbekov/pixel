@@ -240,6 +240,7 @@ async def test_metrics(client):
         "total_commands",
         "gemini_calls_24h",
         "teacher_calls_24h",
+        "clusters_stuck",
     }
     # A button click is not a command: it has neither a router nor a teacher, so
     # counting it would inflate the headline share with clicks (see

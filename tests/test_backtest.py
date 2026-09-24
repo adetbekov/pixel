@@ -234,21 +234,59 @@ def test_a_built_skill_is_marked_as_mined(candidate):
     assert candidate.questions == {}
 
 
-def test_a_candidate_that_takes_another_cluster_is_not_published(active, candidate, cases):
+def unclaimed(*texts: str) -> list[Case]:
+    """Check 3's control set: pool commands nothing is going to claim.
+
+    Which pool rows those are is `backend.miner.run._worth_drafting`'s answer and
+    is tested at that level (`tests/test_proposals_api.py`) — the backtest takes
+    the list as given.
+    """
+    return [
+        Case(id=90 + index, user_text=text, state=MID_STATE, actions=TEACHER_PLANS[0])
+        for index, text in enumerate(texts)
+    ]
+
+
+def test_a_candidate_that_takes_a_command_nobody_will_claim_is_not_published(
+    active, candidate, cases
+):
     """JEB-1548: `show_trick` pulled "покажи сальто" at 0.78 with every control green."""
-    outsider = Case(id=99, user_text="покажи сальто", state=MID_STATE, actions=TEACHER_PLANS[0])
     report = backtest(
-        engine({"покажи сальто": "show_trick"}), active, candidate, cases, [outsider]
+        engine({"покажи сальто": "show_trick"}),
+        active,
+        candidate,
+        cases,
+        unclaimed("покажи сальто"),
     )
     assert report.match_rate == pytest.approx(1.0)
     assert report.regression is None
-    assert report.overreach == '"покажи сальто" (another cluster) -> show_trick @ 0.90'
+    assert report.overreach == '"покажи сальто" (nothing will claim it) -> show_trick @ 0.90'
     assert not report.publishable
 
 
+def test_the_control_set_is_taken_as_given_and_not_re_filtered(active, candidate, cases):
+    """JEB-1579 review: the caller decides what belongs here, and nothing else does.
+
+    The check used to re-derive the control set from `len(group)`, which is a
+    second, weaker copy of `_worth_drafting` — and the two disagreed on exactly
+    the clusters already known to be unlearnable. Whatever shape the caller's
+    commands arrive in, every one of them is asked about, and nothing outside the
+    list costs a forward pass.
+    """
+    controls = unclaimed("спой песню", "расскажи анекдот", "посчитай до десяти")
+    probe = engine({"расскажи анекдот": "show_trick"})
+    report = backtest(probe, active, candidate, cases, controls)
+
+    assert report.overreach == '"расскажи анекдот" (nothing will claim it) -> show_trick @ 0.90'
+    # Stopped at the offender, asked about every control before it, and never
+    # reached outside the list.
+    asked = [prompt for prompt in probe.prompts if "песню" in prompt or "анекдот" in prompt]
+    assert len(asked) == 2
+    assert not any("посчитай" in prompt for prompt in probe.prompts)
+
+
 def test_the_rest_of_the_pool_is_left_alone(active, candidate, cases):
-    outsider = Case(id=99, user_text="покорми", state=MID_STATE, actions=TEACHER_PLANS[0])
-    report = backtest(engine(), active, candidate, cases, [outsider])
+    report = backtest(engine(), active, candidate, cases, unclaimed("покорми"))
     assert report.overreach is None
     assert report.publishable
 
@@ -329,9 +367,8 @@ def test_a_candidate_that_lost_on_match_rate_never_pays_for_the_pool_scan(active
 
 def test_a_regression_also_stops_the_pool_scan(active, candidate, cases):
     """match_rate is a clean 1.0 here, so the regression is what does the stopping."""
-    outsiders = [Case(id=99, user_text="покажи сальто", state=MID_STATE, actions=[])]
     greedy = engine({"привет": "show_trick", "покажи сальто": "show_trick"})
-    report = backtest(greedy, active, candidate, cases, outsiders)
+    report = backtest(greedy, active, candidate, cases, unclaimed("покажи сальто"))
 
     assert report.match_rate == pytest.approx(1.0)
     assert report.regression is not None
@@ -342,7 +379,5 @@ def test_a_regression_also_stops_the_pool_scan(active, candidate, cases):
 def test_the_controls_cost_one_forward_pass_each_not_two(active, candidate):
     """`pick_skill`, not `route`: they read the skill id and never need the plan."""
     probe = engine()
-    check_overreach(probe, [*active, candidate], candidate, [
-        Case(id=1, user_text="покорми", state=MID_STATE, actions=[])
-    ])
+    check_overreach(probe, [*active, candidate], candidate, unclaimed("покорми"))
     assert len(probe.calls) == 1
