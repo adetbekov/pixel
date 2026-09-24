@@ -91,8 +91,10 @@ def test_every_asserted_context_is_a_real_job_name_in_the_file_it_names(branch):
     filename would make adding a third gate fail here instead of where it
     belongs.
     """
-    for context, workflow_file in arc.REQUIRED_CONTEXTS[branch].items():
-        path = _WORKFLOWS / workflow_file
+    for context, producer in arc.REQUIRED_CONTEXTS[branch].items():
+        if producer is arc.EXTERNAL_STATUS:
+            continue  # no workflow file, hence no job name — see the test below
+        path = _WORKFLOWS / producer
         assert path.exists(), f"{context!r} names a workflow that is not in the repo"
         names, _unresolved = arc.job_display_names(arc.parse_workflow(path.read_text()))
         assert context in names
@@ -107,9 +109,11 @@ def test_every_asserted_context_is_reachable_for_the_branch_it_is_asserted_on(br
     `on: pull_request: branches: [main]`, so requiring it on `dev` would leave
     every PR into `dev` blocked on a context nothing reports.
     """
-    for context, workflow_file in arc.REQUIRED_CONTEXTS[branch].items():
-        doc = arc.parse_workflow((_WORKFLOWS / workflow_file).read_text())
-        assert arc.reachability_findings(context, workflow_file, doc, doc, branch) == []
+    for context, producer in arc.REQUIRED_CONTEXTS[branch].items():
+        if producer is arc.EXTERNAL_STATUS:
+            continue  # nothing to reach — no workflow declares it
+        doc = arc.parse_workflow((_WORKFLOWS / producer).read_text())
+        assert arc.reachability_findings(context, producer, doc, doc, branch) == []
 
 
 @pytest.mark.parametrize("branch", ["dev", "main"])
@@ -188,6 +192,94 @@ def test_context_required_on_github_but_absent_from_the_map_is_a_finding(workflo
     assert len(findings) == 1
     assert "'image build'" in findings[0]
     assert "is not asserted here" in findings[0]
+
+
+# --- non-workflow producers (JEB-1596) ---------------------------------------
+
+EXTERNAL_MAP = {**MAP, "gates recorded": arc.EXTERNAL_STATUS}
+
+
+def test_dev_asserts_the_bot_posted_gates_recorded():
+    """`dev` requires it, so the audit must monitor it — not skip it (JEB-1596).
+
+    Before this entry existed the context was required on `dev` and absent from
+    the map, so assertion 3 was red on every PR touching `.github/workflows/**`
+    *and* nothing would have noticed the lock being un-armed by a single
+    PATCH .../required_status_checks (JEB-1571).
+    """
+    assert arc.REQUIRED_CONTEXTS["dev"]["gates recorded"] is arc.EXTERNAL_STATUS
+
+
+@pytest.mark.parametrize("branch", ["dev", "main"])
+def test_external_status_is_never_used_for_a_workflow_job(branch):
+    """The escape hatch must not widen to contexts a workflow really produces.
+
+    EXTERNAL_STATUS buys exemption from assertions 2 and 4. Using it for a
+    context that IS a job `name:` would retire the rename detection that is
+    assertion 2's entire purpose, and it would do so silently. Every workflow in
+    the repo is searched, not just the one an entry names — the point is that no
+    file anywhere produces the context.
+    """
+    job_names: set[str] = set()
+    for path in _WORKFLOWS.glob("*.yml"):
+        names, unresolved = arc.job_display_names(arc.parse_workflow(path.read_text()))
+        job_names |= names | unresolved
+    for context, producer in arc.REQUIRED_CONTEXTS[branch].items():
+        if producer is arc.EXTERNAL_STATUS:
+            assert context not in job_names, (
+                f"{context!r} is mapped to EXTERNAL_STATUS but a workflow job is named "
+                f"after it — map it to that workflow file so renames stay asserted"
+            )
+
+
+def test_external_status_context_is_green_when_required(workflows, monkeypatch):
+    monkeypatch.setattr(arc, "REQUIRED_CONTEXTS", {"dev": dict(EXTERNAL_MAP)})
+    assert _check(workflows, ["lint + tests", "frontend lint", "gates recorded"]) == []
+
+
+def test_external_status_context_dropped_from_protection_is_a_finding(workflows, monkeypatch):
+    """The reason the entry exists: un-arming the lock has to be a finding."""
+    monkeypatch.setattr(arc, "REQUIRED_CONTEXTS", {"dev": dict(EXTERNAL_MAP)})
+    findings = _check(workflows, ["lint + tests", "frontend lint"])
+    assert len(findings) == 1
+    assert "'gates recorded'" in findings[0]
+    assert "missing from dev's protection" in findings[0]
+    # ...and it must not be described as coming from a workflow file.
+    assert ".github/workflows/" not in findings[0]
+
+
+def test_external_status_never_resolves_a_workflow_file(monkeypatch, tmp_path):
+    """An empty workflows dir is not evidence against an EXTERNAL_STATUS context.
+
+    A plain map entry naming a file that does not exist would fail assertion 2
+    ("workflow ... is gone") instead — trading one red check for another.
+    """
+    empty = tmp_path / "workflows"
+    empty.mkdir()
+    monkeypatch.setattr(arc, "REQUIRED_CONTEXTS", {"dev": {"gates recorded": arc.EXTERNAL_STATUS}})
+    notes: list[str] = []
+    undetermined: list[str] = []
+    findings = arc.check(
+        ["gates recorded"],
+        True,
+        empty,
+        notes,
+        base_workflows={},
+        branch="dev",
+        undetermined=undetermined,
+    )
+    assert (findings, notes, undetermined) == ([], [], [])
+
+
+def test_external_status_producers_are_not_fetched_as_workflow_files():
+    """`sorted()` over a mixed set would raise; the sentinel is filtered out."""
+    assert arc.workflow_producers(EXTERNAL_MAP) == {"ci.yml"}
+
+
+def test_external_status_is_not_a_string():
+    """Its own type, so it can never be pasted into a path or a filename check."""
+    assert not isinstance(arc.EXTERNAL_STATUS, str)
+    assert repr(arc.EXTERNAL_STATUS) == "EXTERNAL_STATUS"
 
 
 # --- assertion 4: trigger reachability ---------------------------------------
