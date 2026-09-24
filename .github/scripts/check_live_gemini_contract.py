@@ -81,10 +81,22 @@ SDK_ENTRY_POINTS = (
 )
 
 #: HTTP status the API uses for "you are out of quota". The project this key
-#: belongs to is on the free tier, where `models/gemini-2.5-flash-lite` allows
-#: 20 `generateContent` requests a DAY and the live stand spends from the same
-#: twenty (JEB-1553) — so an exhausted day is the expected steady state, not an
-#: anomaly. Retrying does not help: the window is daily, measured.
+#: belongs to is on the free tier, where the 20-`generateContent`-a-day allowance
+#: is counted per (project, model) — so this run spends from TWO buckets, one per
+#: probe, and either can be the one that refuses:
+#:
+#: * `models/gemini-2.5-flash-lite` — the teacher's bucket (JEB-1553). The live
+#:   stand's `/api/chat` misses spend from the same twenty, so this one is
+#:   routinely empty by nightfall.
+#: * `models/gemini-3.5-flash` — the miner's bucket since JEB-1606, which moved
+#:   the miner off the teacher's model precisely to stop the two competing.
+#:   `miner_probe()` builds `GeminiSkillGenerator()` with no model argument, so it
+#:   follows `generate.DEFAULT_MODEL` and moved with it. Worth stating plainly:
+#:   this nightly therefore takes 1 of those 20 out of the bucket JEB-1606 freed
+#:   for the miner, which spends ~3 per mining pass.
+#:
+#: An exhausted day is the expected steady state on either bucket, not an anomaly.
+#: Retrying does not help: the window is daily, measured.
 QUOTA_HTTP_CODE = 429
 
 #: The `status` field that comes with it, checked alongside the code because the
