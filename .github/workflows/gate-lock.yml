@@ -20,12 +20,18 @@ name: Gate lock
 # `enforce_admins: true` included. The race window is therefore closed at its
 # source: there is no instant at which the PR is mergeable but un-gated.
 #
-# The receipt is posted by the `Gate Receipt Publisher` autopilot once it has
-# verified, in Multica, that the head carries a canonical TechLead verdict and a
-# matching `qa_gate_<REPO>_<PRNUM>` / `qa_gate_sha_<REPO>_<PRNUM>` pair. CI
-# cannot read Multica itself — the `multica` CLI has no token-minting command, so
-# the only credential that exists is the workspace owner's full-access token and
-# this repo is public (JEB-1571). Hence the receipt indirection.
+# The receipt is posted by the `PR Auto-Merge Bot`, immediately before its
+# `gh pr merge` call — at the point where it already re-reads the
+# `qa_gate_<REPO>_<PRNUM>` / `qa_gate_sha_<REPO>_<PRNUM>` pair and the canonical
+# TechLead verdict. It is deliberately NOT a second autopilot re-deriving "which
+# approvals are enough": that rule is canonical in the merge bot, and a copy of
+# it would drift.
+#
+# Why an indirection at all, rather than having CI read Multica directly: the
+# `multica` CLI has no token-minting command, so the only Multica credential that
+# exists is the workspace owner's full-access token — and this repo is public
+# (JEB-1571). Planting that token in a public repo's secret store is not a call
+# CI infrastructure gets to make.
 
 # `pull_request_target` only, on purpose — same reasoning as guard-main-head.yml
 # (JEB-1368). GitHub reads `pull_request` from the PR head and
@@ -83,8 +89,7 @@ jobs:
 
           MARKER="<!-- multica-gate-receipt sha=${HEAD_SHA} -->"
           echo "Waiting for a gate receipt carrying: ${MARKER}"
-          echo "Poster: the 'Gate Receipt Publisher' autopilot, after it verifies"
-          echo "the TechLead verdict + qa_gate pair for this head in Multica."
+          echo "Poster: the PR Auto-Merge Bot, immediately before it merges."
 
           DEADLINE=$(( $(date +%s) + 44 * 60 ))
           while :; do
