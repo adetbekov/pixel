@@ -1,24 +1,28 @@
 """One mining run, start to finish.
 
-Synchronous inside the request that triggers it, and that is a prototype
-decision, not an architectural one — which is why the whole run is
-:func:`mine_once` and nothing else: moving it to a background worker is a change
-of caller, not of this module.
+The whole run is :func:`mine_once` and nothing else, so *who* calls it is the
+only thing that decides whether anyone waits for it. The automatic trigger does
+not: it goes through :mod:`backend.miner.worker`, off the request path. The
+manual ``POST /api/mine`` calls this directly, because it wants the count back.
 
-What it costs the request it runs inside, measured on the live checkpoint
+What a run costs, measured on the live checkpoint
 (``scripts/calibrate_miner_sim.py``, section 6): a run is roughly one teacher
 grouping call plus a few forward passes per cluster case and per active skill,
 and it holds ``LayaEngine._lock`` for all of them, so every other request's
-router waits. The one term that scales with the *pool* rather than the cluster
-is the backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
+router waits — which is why a run being off the request path is not the whole
+answer, and :func:`backend.miner.case.load_pool` bounds what one run reads.
+
+The one term that scales with the *pool* rather than the cluster is the
+backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
 only reaches it for a candidate no regression has already rejected. Since
 ``match_rate`` became a measure of what production will do (JEB-1562) that is
 nearly every candidate, where it used to be almost none — but it no longer scans
 the whole pool: JEB-1579 narrowed its control set to the rows nothing is going to
 claim, and on a pool the miner has work to do in, most rows belong to a cluster
-that is being drafted right now. The pool still has no ``LIMIT`` and still does
-not shrink for a candidate that was rejected, so those unclaimed rows are the
-term to watch as it grows.
+that is being drafted right now. The pool still does not shrink for a candidate
+that was rejected — what bounds it is ``MINER_POOL_WINDOW``: a run drafts from
+the newest N mineable cases, so the unclaimed rows an older pool keeps
+accumulating no longer make every run slower than the last.
 
 Which rows those are is :func:`_worth_drafting`, and there is deliberately no
 second opinion about it: a cluster gets a draft, or nothing will ever list its
@@ -55,7 +59,7 @@ from ..brain.skill import Skill, load_skills
 from ..state import iso, utcnow
 from . import attempts
 from .backtest import backtest
-from .case import Case, is_mineable, load_pool, pool_size
+from .case import Case, is_mineable, load_pool, pool_ids, pool_size
 from .cluster import group_texts, min_cluster_size
 from .generate import SkillGenerator, get_generator
 
@@ -129,6 +133,10 @@ def _mine() -> int:
     conn = db.get_conn()
     with db.lock:
         cases = load_pool(conn)
+        # The ledger is keyed by case ids and swept against the pool, not against
+        # the window this run drafts from: a case the window left behind is still
+        # unmined, and its cluster's spent budget has to survive with it.
+        mineable = pool_ids(conn)
         active = load_skills(conn, only_active=True)
         taken = _taken_ids(conn)
         rejected = _rejected_signatures(conn)
@@ -145,7 +153,7 @@ def _mine() -> int:
     # stuck (JEB-1579 review). Read after the prune, so `refused` is what the
     # ledger says now.
     with db.lock:
-        attempts.forget(conn, {case.id for case in cases}, signatures)
+        attempts.forget(conn, mineable, signatures)
         refused = attempts.load(conn)
 
     # Whether a cluster gets a draft this run is also the answer to "will anything

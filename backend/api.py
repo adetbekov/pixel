@@ -21,7 +21,7 @@ from .brain.engine import get_engine
 from .brain.router import RouterHit, route
 from .brain.skill import load_skills, parse_skill
 from .metrics import collect as collect_metrics
-from .miner import mine_once, mining_due
+from .miner import mine_once, mining_due, request_mine
 from .state import apply_actions, iso, read_state, utcnow
 from .teacher import get_teacher, log_case
 
@@ -382,11 +382,14 @@ def post_chat(payload: ChatIn) -> dict:
         # refusal. See `mining_due`.
         due = mining_due(conn, case_id)
 
-    # Every MINER_BATCH-th mineable miss, the miner runs before this response
-    # returns. It is seconds on a pool this size, and the user who just taught
-    # Pixel something is the one most likely to be looking at the skills panel.
+    # Every MINER_BATCH-th mineable miss asks for a mining run — and does not
+    # wait for it. A run is one Gemini grouping call, a draft per cluster and a
+    # backtest behind the engine lock: seconds, and they used to be added to
+    # this response. The worker owns them now (`backend/miner/worker.py`); the
+    # proposal shows up in the skills panel a few seconds after the answer
+    # instead of before it.
     if due:
-        mine_once()
+        request_mine()
     return reply
 
 
@@ -583,7 +586,12 @@ def reject_proposal(proposal_id: str) -> dict:
 
 @router.post("/mine", response_model=MineOut)
 def post_mine() -> dict:
-    """Mine now. An empty pool, or no API key, is `0` proposals — not an error."""
+    """Mine now. An empty pool, or no API key, is `0` proposals — not an error.
+
+    Synchronous on purpose, unlike the automatic trigger in `/api/chat`: this is
+    the manual run and its caller asked for the count, so it gets the count. A
+    run the worker is already doing answers `started: false` rather than queuing.
+    """
     result = mine_once()
     return {"started": result.started, "proposals": result.proposals}
 

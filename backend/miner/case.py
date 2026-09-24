@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,10 @@ from typing import Any
 from ..state import START_ENERGY, START_FACE, START_FULLNESS, START_MOOD, RobotState
 
 log = logging.getLogger(__name__)
+
+#: The newest N unmined cases one run may look at. 40 is eight `MINER_BATCH`
+#: triggers of memory and about a second of embed on the real checkpoint.
+DEFAULT_POOL_WINDOW = 40
 
 
 @dataclass(frozen=True)
@@ -86,12 +91,48 @@ def _parse(row: sqlite3.Row) -> Case | None:
     return Case(id=int(row["id"]), user_text=text, state=_state(payload), actions=actions)
 
 
-def load_pool(conn: sqlite3.Connection) -> list[Case]:
-    """Every case still waiting to be mined, oldest first."""
-    rows = conn.execute(
-        "SELECT id, state_json, actions_json FROM teacher_log WHERE mined = 0 ORDER BY id"
-    ).fetchall()
-    return [case for case in (_parse(row) for row in rows) if case is not None]
+def pool_window() -> int:
+    """How many of the newest mineable cases one run drafts from."""
+    return max(1, int(os.environ.get("MINER_POOL_WINDOW", DEFAULT_POOL_WINDOW)))
+
+
+def load_pool(conn: sqlite3.Connection, *, bounded: bool = True) -> list[Case]:
+    """The cases waiting to be mined, oldest first — the newest window of them.
+
+    The window is what stops a run getting slower forever. ``mined = 1`` is set
+    only on a case that was published (``backend/miner/run.py``), so a cluster
+    the backtest refused, and every one-off miss, stays in the pool for good —
+    and a run reads the whole pool twice, once to group it and once as the
+    backtest's control set. The grouping alone is 430 ms of embed at 20 cases
+    and 2473 ms at 100 on the fallback path, against 110 ms for one router pass
+    (measured on the real checkpoint, JEB-1509). Unbounded, every run holds
+    ``LayaEngine._lock`` longer than the last one, and running it on a
+    background thread hides that rather than fixing it.
+
+    A case that falls out of the window is not deleted and not marked mined — it
+    is simply too old to still be the pattern worth a skill. Mining it later is
+    one new phrasing away, since that puts it back inside the window.
+    ``MINER_POOL_WINDOW`` overrides the bound; ``bounded=False`` asks for the
+    whole pool, which only :func:`pool_size` wants.
+    """
+    sql = "SELECT id, state_json, actions_json FROM teacher_log WHERE mined = 0 ORDER BY id DESC"
+    rows = (
+        conn.execute(f"{sql} LIMIT ?", (pool_window(),)).fetchall()
+        if bounded
+        else conn.execute(sql).fetchall()
+    )
+    return [case for case in (_parse(row) for row in reversed(rows)) if case is not None]
+
+
+def pool_ids(conn: sqlite3.Connection) -> set[int]:
+    """Every mineable case id, window or no window.
+
+    What the attempts ledger is swept against (:func:`backend.miner.attempts.forget`):
+    a signature dies when its cases *left the pool*, and a case that is merely
+    outside this run's window has not left it — it is still unmined, and one new
+    phrasing puts it back in range with whatever budget it had spent.
+    """
+    return {case.id for case in load_pool(conn, bounded=False)}
 
 
 def is_mineable(conn: sqlite3.Connection, case_id: int) -> bool:
@@ -122,5 +163,10 @@ def pool_size(conn: sqlite3.Connection) -> int:
 
     The cost is parsing tens of rows per teacher call instead of a ``COUNT``. The
     mining run this decides reads and parses the same rows anyway.
+
+    Counted over the **whole** pool, not the window a run drafts from: the
+    trigger is ``size % MINER_BATCH == 0``, and a size pinned at the window would
+    satisfy that on every single arrival once the pool grew past it — a run per
+    miss, which is the opposite of what the window is for.
     """
-    return len(load_pool(conn))
+    return len(load_pool(conn, bounded=False))

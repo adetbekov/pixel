@@ -65,7 +65,8 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `LAYA_DEVICE` | `cpu` | Where the local model runs. |
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
 | `ROUTER_THRESHOLD` | `0.66` | Confidence a skill needs to win the router. Below it, the command is a miss. Calibrated on the live checkpoint — see `scripts/calibrate_router.py`. |
-| `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. |
+| `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. The run itself is a background thread. |
+| `MINER_POOL_WINDOW` | `40` | Newest mineable cases one run drafts from. Bounds a run's cost, which otherwise grows with the pool. |
 | `MINER_SIM` | `0.88` | Cosine that joins two commands into one cluster — the **fallback** grouper only, used when the teacher's grouping call fails. Narrow usable band; see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster an accepted skill must take off Gemini to be proposed — measured by routing every case the way `/api/chat` will after acceptance. Calibrated on the live checkpoint; see `scripts/probe_miner_match.py`. |
@@ -149,7 +150,26 @@ stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` ov
 Gemini answering a command is not learning; it costs money every single time. Learning is the moment
 a *pattern* in those answers becomes a skill and the command stops reaching Gemini at all. That is
 `backend/miner/`, and it runs when the `MINER_BATCH`-th *mineable* case arrives (default 5) or on
-`POST /api/mine`:
+`POST /api/mine`.
+
+**Nobody waits for it.** The automatic trigger hands the run to a background worker — one daemon
+thread behind a one-slot queue (`backend/miner/worker.py`) — so `POST /api/chat` answers and the
+proposal turns up in the skills panel a few seconds later. It used to run inside the response, which
+made every 5th mineable miss pay for the Gemini grouping call (~0.9 s of network), a draft per
+cluster and a backtest, all behind `LayaEngine._lock`. A trigger arriving while a run is in flight
+and one is already queued is dropped, not buffered: it would re-read the same pool and race the
+first run to the same proposals, and the next mineable case triggers again anyway.
+`POST /api/mine` still runs synchronously — it is the manual run and its caller asked for the count.
+
+One run drafts from the newest `MINER_POOL_WINDOW` cases (default 40), not from the whole pool. A
+case leaves the pool only by being published, so a refused cluster and every one-off miss stay in it
+for good, and every unbounded run would then group and embed more than the last one — the embed
+alone is 430 ms at 20 cases and 2473 ms at 100, against 110 ms for one router pass. A background
+thread hides that growth rather than removing it: the run still holds the engine lock every other
+chat's router pass needs. Cases outside the window are not deleted and not marked mined, and the
+trigger still counts the whole pool.
+
+The pipeline itself, once per run:
 
 1. **Cluster.** One Gemini `group` call over the whole pool — one per *run*, not per cluster.
    Clusters under `MINER_MIN_CLUSTER` (3) stay in the pool and ripen. The local Laya vectors
