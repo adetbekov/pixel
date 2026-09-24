@@ -160,6 +160,9 @@ class Proposal(BaseModel):
 
 class Metrics(BaseModel):
     laya_share: float
+    #: Average latency per path over the **last 24h**, like every other windowed
+    #: field here — a lifetime average keeps showing a fixed timeout bug for
+    #: weeks after the fix (JEB-1574). `0.0` when the window holds no such call.
     avg_latency_laya_ms: float
     avg_latency_gemini_ms: float
     skills_active: int
