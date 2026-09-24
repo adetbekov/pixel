@@ -100,12 +100,18 @@ class TeacherResult:
     names library actions. ``raw_response`` is the model's untouched text and
     goes straight into ``teacher_log`` for the miner; it is never returned over
     the API. ``error`` is set exactly when the plan is the fallback.
+
+    ``handled`` is the teacher's own verdict on whether it did the thing or
+    declined (see :class:`backend.teacher.schema.TeacherPlan`). It changes
+    nothing the user sees — a declined answer is still a plan and still a reply —
+    and everything for the miner, which must not learn a refusal.
     """
 
     raw_plan: list[dict[str, Any]]
     reply: str
     raw_response: str
     error: str | None = None
+    handled: bool = True
 
 
 def _fallback(reason: str, raw_response: str = "") -> TeacherResult:
@@ -114,6 +120,10 @@ def _fallback(reason: str, raw_response: str = "") -> TeacherResult:
         reply=FALLBACK_REPLY,
         raw_response=raw_response,
         error=reason,
+        # The fallback *is* a refusal, and the loudest one there is. `error`
+        # already keeps it out of the mining pool; saying so twice costs nothing
+        # and means the two flags can never disagree about the same row.
+        handled=False,
     )
 
 
@@ -271,11 +281,26 @@ def _parse(raw: str) -> tuple[TeacherResult | None, str]:
     if len(actions) != len(proposed):
         named = [step["action"] for step in proposed]
         return None, f"plan named an action outside the library: {named}"
-    if not actions:
+    # An empty plan is a contradiction when the teacher says it handled the
+    # command — it promised to do something and then did nothing, so retry.
+    #
+    # When it declines, an empty plan is the honest answer: there is nothing in
+    # the library to do, only something to say, and `_with_reply` below turns the
+    # reply into the `say` step that carries it. Measured live on 2026-09-24
+    # (JEB-1547): asked for the weather, for a pizza and for a translation,
+    # `models/gemini-2.5-flash-lite` declines with `actions: []` every time, and
+    # rejecting that cost the user two round trips and replaced a good refusal
+    # ("Я не умею предсказывать погоду, но могу потанцевать") with FALLBACK_REPLY.
+    if not actions and plan.handled:
         return None, "plan was empty"
 
     raw_plan = _with_reply([a.to_dict() for a in actions], plan.reply)
-    return TeacherResult(raw_plan=raw_plan, reply=plan.reply, raw_response=raw), ""
+    return (
+        TeacherResult(
+            raw_plan=raw_plan, reply=plan.reply, raw_response=raw, handled=plan.handled
+        ),
+        "",
+    )
 
 
 def build_teacher() -> Teacher | None:

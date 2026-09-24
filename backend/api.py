@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -152,6 +153,12 @@ class Proposal(BaseModel):
     id: str
     skill: dict[str, Any]
     match_rate: float
+    #: What the `choice` head alone would do with the cluster — i.e. what a phrasing
+    #: nobody has typed yet gets. `match_rate` reads 1.00 on nearly every live draft
+    #: (the generator copies the cluster into `examples`), so this is the number on
+    #: the card that carries information. `None` for a proposal mined before the
+    #: column existed; the card then shows only `match_rate` (JEB-1581).
+    generalization: float | None = None
     sample_ids: list[int]
     status: str
     created_at: str
@@ -175,6 +182,11 @@ class Metrics(BaseModel):
     laya_share_24h: float = 0.0
     gemini_calls_24h: int = 0
     skills_disabled: int = 0
+    #: Case sets the miner has stopped redrawing after `MINER_MAX_ATTEMPTS`
+    #: refused drafts (JEB-1579). It is the one number here that is about
+    #: learning failing rather than learning working, so the panel only shows it
+    #: when it is non-zero.
+    clusters_stuck: int = 0
 
 
 def _log_interaction(
@@ -224,16 +236,21 @@ def execute_plan(
     skill_id: str | None = None,
     confidence: float | None = None,
     fallback_reply: str = "Готово!",
+    now: datetime | None = None,
 ) -> dict:
     """The single execution path: validate, apply, log, and shape a ``Reply``.
 
     Stages 2-4 route the router's and the teacher's plans through here too, so
     the frozen response shape is built in exactly one place.
+
+    ``now`` is the instant the request was received. Handlers that looked at the
+    state before building their plan pass theirs in, so one HTTP request advances
+    ``last_tick_at`` exactly once — see JEB-1569.
     """
     conn = db.get_conn()
     with db.lock:
         actions = validate_plan(raw_plan)
-        state = apply_actions(conn, actions)
+        state = apply_actions(conn, actions, now)
         latency_ms = int((time.perf_counter() - started) * 1000)
         reply = _reply_text(actions, fallback_reply)
         interaction_id = _log_interaction(
@@ -268,9 +285,10 @@ def get_state() -> dict:
 @router.post("/action", response_model=Reply)
 def post_action(payload: ActionIn) -> dict:
     started = time.perf_counter()
+    now = utcnow()
     conn = db.get_conn()
     with db.lock:
-        state = read_state(conn)
+        state = read_state(conn, now)
 
     raw_plan = BUTTON_PLANS[payload.name]
     if payload.name == "play" and state.energy < LOW_ENERGY_FOR_PLAY:
@@ -281,6 +299,7 @@ def post_action(payload: ActionIn) -> dict:
         raw_plan=raw_plan,
         engine="button",
         started=started,
+        now=now,
     )
 
 
@@ -294,6 +313,7 @@ def post_chat(payload: ChatIn) -> dict:
     covers the miss the user waited through as well as the Gemini call.
     """
     started = time.perf_counter()
+    now = utcnow()
     try:
         engine = get_engine()
     except RuntimeError as exc:
@@ -304,7 +324,7 @@ def post_chat(payload: ChatIn) -> dict:
     # has to be finished and released before the router runs — exactly the order
     # `post_action` uses. The engine's own lock is never nested with this one.
     with db.lock:
-        state = read_state(conn)
+        state = read_state(conn, now)
         skills = load_skills(conn, only_active=True)
 
     outcome = route(engine, skills, payload.text, state)
@@ -316,6 +336,7 @@ def post_chat(payload: ChatIn) -> dict:
             started=started,
             skill_id=outcome.skill_id,
             confidence=outcome.confidence,
+            now=now,
         )
 
     teacher = get_teacher()
@@ -327,6 +348,7 @@ def post_chat(payload: ChatIn) -> dict:
             engine="laya",
             started=started,
             confidence=outcome.confidence,
+            now=now,
         )
 
     # Deliberately outside every lock: `db.lock` is not reentrant and this is a
@@ -339,10 +361,11 @@ def post_chat(payload: ChatIn) -> dict:
         started=started,
         confidence=outcome.confidence,
         fallback_reply=result.reply,
+        now=now,
     )
 
     with db.lock:
-        log_case(
+        case_id = log_case(
             conn,
             interaction_id=reply["interaction_id"],
             user_text=payload.text,
@@ -352,12 +375,16 @@ def post_chat(payload: ChatIn) -> dict:
             raw_response=result.raw_response,
             actions=reply["actions"],
             error=result.error,
+            handled=result.handled,
         )
-        due = mining_due(conn)
+        # The row this request just wrote, not the pool level: a level stays
+        # true while the pool stands still, and the pool stands still on every
+        # refusal. See `mining_due`.
+        due = mining_due(conn, case_id)
 
-    # Every MINER_BATCH-th miss, the miner runs before this response returns.
-    # It is seconds on a pool this size, and the user who just taught Pixel
-    # something is the one most likely to be looking at the skills panel.
+    # Every MINER_BATCH-th mineable miss, the miner runs before this response
+    # returns. It is seconds on a pool this size, and the user who just taught
+    # Pixel something is the one most likely to be looking at the skills panel.
     if due:
         mine_once()
     return reply
@@ -464,7 +491,7 @@ def get_proposals() -> list[dict]:
     conn = db.get_conn()
     with db.lock:
         rows = conn.execute(
-            "SELECT id, skill_json, match_rate, sample_ids, status, created_at"
+            "SELECT id, skill_json, match_rate, generalization, sample_ids, status, created_at"
             " FROM skill_proposals WHERE status = 'pending' ORDER BY created_at, rowid"
         ).fetchall()
     return [
@@ -472,6 +499,7 @@ def get_proposals() -> list[dict]:
             "id": row["id"],
             "skill": json.loads(row["skill_json"]),
             "match_rate": row["match_rate"],
+            "generalization": row["generalization"],
             "sample_ids": json.loads(row["sample_ids"]),
             "status": row["status"],
             "created_at": row["created_at"],

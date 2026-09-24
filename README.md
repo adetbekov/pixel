@@ -64,11 +64,12 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `LAYA_MODEL` | `multilingual` | Laya subfolder. The English root checkpoint answers Cyrillic confidently and wrongly. |
 | `LAYA_DEVICE` | `cpu` | Where the local model runs. |
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
-| `ROUTER_THRESHOLD` | `0.6` | Confidence a skill needs to win the router. Below it, the command is a miss. |
-| `MINER_BATCH` | `5` | Mine on every N-th unmined case. |
-| `MINER_SIM` | `0.88` | Cosine similarity that joins two commands into one cluster. Narrow usable band — see `backend/miner/cluster.py`. |
+| `ROUTER_THRESHOLD` | `0.66` | Confidence a skill needs to win the router. Below it, the command is a miss. Calibrated on the live checkpoint — see `scripts/calibrate_router.py`. |
+| `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. |
+| `MINER_SIM` | `0.88` | Cosine that joins two commands into one cluster — the **fallback** grouper only, used when the teacher's grouping call fails. Narrow usable band; see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
-| `MINER_MIN_MATCH` | `0.8` | Share of its cluster a candidate must reproduce to be proposed. |
+| `MINER_MIN_MATCH` | `0.8` | Share of its cluster an accepted skill must take off Gemini to be proposed — measured by routing every case the way `/api/chat` will after acceptance. Calibrated on the live checkpoint; see `scripts/probe_miner_match.py`. |
+| `MINER_MAX_ATTEMPTS` | `3` | Drafts one *identical* set of cases gets before the miner stops redrawing it and counts it as stuck. A new case in the cluster resets the budget. Floored at 1 — `0` would switch mining off entirely. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
 | `SKILL_MIN_RATED` | `5` | Ratings required before that rule applies at all. |
 
@@ -76,11 +77,19 @@ then runs on Laya alone. Defaults are in `.env.example`.
 
 `POST /api/chat` costs at most two forward passes of one local model:
 
+0. **Have we been told this exact phrase?** A command that matches one of a skill's `examples`
+   (ignoring case, `ё` and punctuation) routes straight to that skill at confidence 1.0, with no
+   forward pass at all. Measured on the live checkpoint, the head put `хай` — greet's own example —
+   at 0.22, so without this step a skill could miss the very phrases it claims.
 1. **Which skill?** One `choice` question over every active skill plus a mandatory `unknown`
-   option. Below the skill's threshold (`ROUTER_THRESHOLD`, default `0.6`), or on `unknown`, the
+   option. Below the skill's threshold (`ROUTER_THRESHOLD`, default `0.66`), or on `unknown`, the
    router reports a miss and hands it to the teacher.
 2. **How should it behave?** All of the chosen skill's questions in a single batched call. A skill
    with no questions skips this pass.
+
+`ROUTER_THRESHOLD` is a property of the *option set*, not of any one skill: the same probe phrase
+moves by up to 0.38 between the 4-skill starter library and the 5-skill one the miner produces. Run
+`scripts/calibrate_router.py` after changing the checkpoint or the library rather than guessing.
 
 A skill is JSON, never code: it combines the fixed action library (`backend/actions.py`) through
 `when -> actions` rules, first match wins. A skill naming an action outside the library is refused
@@ -97,12 +106,26 @@ always, because "share of commands handled without Gemini" is the metric the who
 measured on. `latency_ms` on a teacher reply covers the router miss as well as the Gemini call —
 it is what the user actually waited.
 
-Gemini writes no code. It returns a `{reply, actions}` plan, and that plan passes two independent
-checks: the response schema (`backend/teacher/schema.py`) for the shape, and `validate_plan`
-(`backend/actions.py`) for membership of the action library. The second is the one that matters —
-a schema cannot stop `{"action": "hack_nasa"}` in a string field. A plan that is invalid, empty or
-carries a blank `reply` is retried once with the reason, and a second failure answers with a fixed
-fallback plan; a timeout or an API error does the same. The user never sees a traceback.
+Gemini writes no code. It returns a `{reply, handled, actions}` plan, and that plan passes two
+independent checks: the response schema (`backend/teacher/schema.py`) for the shape, and
+`validate_plan` (`backend/actions.py`) for membership of the action library. The second is the one
+that matters — a schema cannot stop `{"action": "hack_nasa"}` in a string field. A plan that is
+invalid or carries a blank `reply` is retried once with the reason, and a second failure answers
+with a fixed fallback plan; a timeout or an API error does the same. The user never sees a
+traceback.
+
+**The teacher improvises; it does not decline.** A pet with eight primitives can *act out* far more
+than it can do literally, and the prompt now says so: "покажи фокус" is a spin, a jump and a happy
+face. Before that rule, four of five phrasings of that command came back as "я не умею показывать
+фокусы" — and since `teacher_log` is the miner's only raw material, stage 4 dutifully learned a
+skill that answers "я не умею" for ever, from Laya, with no route left back to the teacher
+(JEB-1547, measured by `scripts/probe_miner_match.py`).
+
+Some commands really are outside the library — the weather, a pizza, a translation. The teacher
+declines those and says so in `handled`, which goes into `teacher_log` and keeps the miner off
+them. A refusal has nothing to do and only something to say, so an empty `actions` is accepted
+there and the reply becomes the `say` step; an empty plan that claims `handled` is a contradiction
+and is retried.
 
 Two clocks bound the wait: 8 s per call (`TIMEOUT_S`) and 12 s across both attempts
 (`TOTAL_DEADLINE_S`), the retry getting whatever is left. The SDK surface the teacher calls is
@@ -110,9 +133,12 @@ pinned (`google-genai>=2.25,<3`) and asserted against the installed package by
 `test_the_sdk_still_has_the_surface_we_call` — a renamed argument would otherwise reach production
 as a fallback plan and a log line.
 
-Every teacher call writes a row to `teacher_log` — state, original command, router confidence, the
-raw model response and the validated plan. That table is the only input stage 4's skill miner has,
-so fallbacks are logged too. `raw_response` is never returned over the API.
+Every teacher call writes a row to `teacher_log` — state, original command, router confidence,
+`handled`, the raw model response and the validated plan. That table is the only input stage 4's
+skill miner has, so fallbacks and refusals are logged too: nothing is dropped here, and "the user
+keeps asking for the weather" is worth reading even though no skill can come of it. Which rows are
+*mineable* is decided one layer up, in `backend/miner/case.py` — a failed call and a declined
+answer are both kept and neither is mined. `raw_response` is never returned over the API.
 
 Without `GEMINI_API_KEY` the app still starts: the teacher is off, a miss answers with a polite
 stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` overrides the model
@@ -122,36 +148,114 @@ stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` ov
 
 Gemini answering a command is not learning; it costs money every single time. Learning is the moment
 a *pattern* in those answers becomes a skill and the command stops reaching Gemini at all. That is
-`backend/miner/`, and it runs on every `MINER_BATCH`-th unmined case (default 5) or on
+`backend/miner/`, and it runs when the `MINER_BATCH`-th *mineable* case arrives (default 5) or on
 `POST /api/mine`:
 
-1. **Cluster.** Sentence vectors come from the Laya checkpoint already in memory
-   (`DecisionEngine.embed`) — local, free, and still no `import laya` outside `engine.py`.
-   Single-link agglomerative clustering on cosine >= `MINER_SIM` (0.88), which is connected
-   components of the similarity graph, in numpy. The default is measured against the real
-   checkpoint: these vectors are anisotropic, so the band that separates "same request" from
-   "different request" sits high and is narrow. Clusters under `MINER_MIN_CLUSTER` (3) stay in the
-   pool and ripen. Without embeddings the commands are grouped by one Gemini call instead — a
-   degraded path, not the default one.
+1. **Cluster.** One Gemini `group` call over the whole pool — one per *run*, not per cluster.
+   Clusters under `MINER_MIN_CLUSTER` (3) stay in the pool and ripen. The local Laya vectors
+   (`DecisionEngine.embed`, single-link on cosine >= `MINER_SIM`) are the fallback for when that
+   call fails, and they are the fallback because they were measured against it on the same pools:
+
+   | grouper | purity | recall | clusters/run |
+   | --- | --- | --- | --- |
+   | Laya cosine @ 0.88 | 1.000 | 0.322 | 0.79 |
+   | one Gemini `group` call | 0.875 | 0.808 | 2.00 |
+
+   The cosine is pure only because it is nearly a duplicate detector — these vectors are
+   anisotropic, and their same-intent and different-intent ranges overlap outright (on the worked
+   example the closest same-intent pair sits at 0.76 and an unrelated pair at 0.85), so no
+   threshold, linkage or normalisation separates them. An impure cluster still has to survive the
+   backtest; a cluster that is never found is a skill that is never learned.
 2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-2.5-flash-lite`,
    $0.30 / $2.50 per 1M) per cluster. Offline, nobody waiting, and what comes back is a schema that
    will route thousands of later commands; raise the model through the env var if drafts start
    failing validation, never loosen the validation. A mined skill carries no
    `questions` and branches only on the robot's own state; it is assembled into a real `Skill`, and
    that is where `validate_plan` refuses anything outside the action library.
-3. **Backtest.** Every case of the cluster is re-routed against `active + candidate`, and a match
-   means the router picked the candidate *and* did what the teacher did (action names only — the
-   teacher never phrases a reply the same way twice). `match_rate` must reach `MINER_MIN_MATCH`
-   (0.8).
+3. **Backtest.** `match_rate` is **the share of the cluster that stops reaching Gemini once the user
+   accepts this skill**: every case is re-routed through `active + candidate` by exactly the call
+   `/api/chat` will make afterwards — step 0, the exact `examples` lookup, included — and a match
+   means the router landed on the candidate above its threshold. It must reach `MINER_MIN_MATCH`
+   (0.8), and it is the only number of the three that gates. Two others are computed beside it,
+   and one of them also reaches the card:
+   - `generalization` — the same share from the `choice` **head alone**, with no `examples` to read:
+     what a phrasing nobody has typed yet would get. `match_rate` used to *be* this number
+     (`use_examples=False`), and that made the gate a measurement of a router production never runs:
+     the generator copies the cluster into `examples` word for word, so those phrases route at 1.0
+     through step 0 after acceptance. Live, the "фокус" cluster was refused at 0.60 three runs out of
+     three on two phrases step 0 routes at 1.0, and one cluster read
+     0.60 / 1.00 / 0.80 / 0.40 / 0.80 / 0.40 over six runs because the head scores the `id` and
+     `description` Gemini rewrites every time. Refusing a candidate on it is also backwards: a weak
+     description still takes the listed commands off Gemini, while a refusal leaves all of them on it
+     (JEB-1562). It is stored on the proposal and shown on the card next to `match_rate`, because
+     `match_rate` is ~1.00 on every live draft and so says nothing when the user has to decide:
+     measured live, `praise_robot` came out 1.00 / 0.667 and the "фокус" cluster 1.00 / 0.60
+     (JEB-1581).
+   - `agreement` — whether the candidate also *did what the teacher did* (action names only; the
+     teacher never phrases a reply the same way twice). It used to gate too, and on live data that
+     made the bar unreachable: five phrasings of one command produce several different teacher plans,
+     so the best any single plan could score was the share of the most common one — and the candidate
+     that scored *highest* on a cluster of refusals was the one that reproduced the refusal
+     (JEB-1547).
+
+   Both are measured by `scripts/probe_miner_match.py`, which is also what the threshold is
+   calibrated with. What keeps a bad candidate out is steps 4 and 5, and the user — who is shown
+   both numbers, with `agreement` deliberately left off the card: it is the spread of the *teacher's*
+   plans, and next to "принять?" it would read as a verdict on the skill.
 4. **Regression check.** A match rate cannot see the damage a new option does to the old ones: stage
    2 measured all 24 orderings of the four starter skills spreading the hit rate over 7/10…9/10, and
    alphabetical order pushing "покорми" under its threshold outright. So one control phrase per
    active skill (`examples[0]`, so the set grows with the library) is routed through the same trial
    registry, and one phrase leaving its own skill kills the proposal.
-5. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
+5. **Over-broad check.** Neither of those looks at commands no skill claims yet — measured live, an
+   accepted `show_trick` pulled "покажи сальто" to itself at 0.78 with every control green. So the
+   rest of the pool is routed too, and a candidate that wins a command it is not for is drafted too
+   wide and is not proposed. Steps 4 and 5 only read which skill won, so they take `pick_skill`
+   (pass 1 alone, and no `examples` lookup to work around) instead of a full `route`, and step 5 runs
+   last because it is the one whose cost grows with the pool — which has no `LIMIT` and does not
+   shrink for a rejected candidate.
+
+   **Which commands count is the whole check** (JEB-1579). Not the whole pool: a cluster that gets a
+   draft on this run copies its own phrases into its own `examples`, so step 0 hands them straight
+   back the moment it is accepted, and a claim on those lasts one mining run. A claim on a command
+   no cluster is going to list lasts for ever — so the control set is the pool minus every cluster
+   being drafted, and only what is left over vetoes.
+
+   "Will anything claim this?" is therefore exactly "will this cluster be drafted?", and the miner
+   answers it in one place (`backend/miner/run.py::_worth_drafting`) for both purposes. Size is only
+   its first term: a case set the user has already rejected never comes back, and one that has spent
+   its draft budget (below) waits for a case that may never arrive — both stay `mined=0` for good, so
+   both are controls. Deciding it a second time from `len(group)` alone let a candidate permanently
+   take a command from exactly the clusters already known to be unlearnable.
+
+   The old rule was "wins **any** outsider", and on two near-synonymous intents it was a symmetric
+   dead end. Measured live, three clusters × three runs: step 3 rejected 0 of 9, step 4 rejected
+   0 of 9, step 5 rejected 6 of 9 — every one of them "фокус" taking "покажи сальто" @0.78 and
+   "сальто" taking "сделай фокус" @0.98. Each refused the other, both stayed in the pool (`mined=1`
+   is set only on publication), the next run redrew the same two drafts and refused them again, and
+   neither intent could ever be learned. Same probe after the fix: **8 of 9 publishable**, all six
+   neighbour claims reported and none vetoing, and one refusal left — a draft that reached for "спой
+   песню" @0.98, a leftover nothing will claim. The trade the narrower rule makes is deliberate: one
+   mis-routed phrase for one run, against an 8-primitive library where every wrong answer is still a
+   jump or a sentence and the user can 👎 it — versus an intent that stays on Gemini for ever, which
+   is the number the project is measured on. The fix is here and not in the grouper on purpose:
+   merging the two clusters would remove this pair and nothing else, since any two near neighbours
+   reproduce it.
+6. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
    `POST /api/proposals/{id}/accept` adds the skill, and it takes effect in the same process, since
    `/api/chat` reads the library on every request. `reject` puts the cases back in the pool and
    remembers the case set, so the same cluster is not offered again.
+
+A cluster that fails any of this stays in the pool on purpose — more cases may arrive and make it
+work — so the same cluster is regrouped and **redrafted** on every later run, at one paid
+`generate` call each time. After `MINER_MAX_ATTEMPTS` (3) refusals of the *identical* case set the
+miner stops redrawing it and the cluster is counted as stuck: skipped before the generator is
+called, reported as `clusters_stuck` in `GET /api/metrics`, and shown in the learning panel when it
+is non-zero. The budget is keyed on the `teacher_log` ids, so a new case joining the cluster is a new
+case set and buys another draft — the same rule a user's rejection is remembered by
+(`backend/miner/attempts.py`) — and the superseded case set is retired with it, or `clusters_stuck`
+would drift from "how many clusters are stuck" to "how many ever were". A stuck cluster is also a
+control for step 5, for the same reason a user-rejected one is: nothing is going to list its phrases.
 
 A mined `description` is a hard 60 characters and a candidate over it is rejected, not trimmed: the
 description *is* the router's option label, and stage 2 measured long ones dropping routing from 6/6
@@ -261,3 +365,19 @@ editable-install gate: JEB-1530 measured an image built with plain `pip install 
 three paths, because `WORKDIR /app` plus uvicorn's default `--app-dir ""` make `/app/backend`
 shadow the site-packages copy either way. Nothing is pushed to a registry — the image is a gate,
 not a deploy.
+
+One gate runs **outside** the PR: `Live Gemini Contract`, nightly at 03:17 UTC and on
+`workflow_dispatch`. Everything above runs against `tests/fakes.py::FakeGeminiClient`, which returns
+bare JSON whatever it is asked — so the teacher and miner paths stay green on fixtures while the
+live path is dead. That is not hypothetical: `interactions.create` + `response_format` does not hold
+structured output on `models/gemini-2.5-flash-lite` (the answer comes back in a ```` ```json ````
+fence), and both halves of the project shipped that call and had to be moved to
+`models.generate_content` + `response_schema`, both times found by hand on a live stand.
+
+So the nightly calls `GeminiTeacher._call` and `GeminiSkillGenerator._call` for real, once each, and
+parses the answers with `TeacherPlan` / `SkillDraft` — no fence-stripping, because the strict parser
+is what makes the break visible. Two `flash-lite` calls a day, on the order of $0.001. It needs the
+`GEMINI_API_KEY` repository secret, which is why it never runs on a PR: a fork PR cannot have it,
+and a green CI must not depend on a key. It is not a required check on any branch — it can go red
+because Google changed something, and that must never block a merge. A failing nightly opens (or
+comments on) an issue labelled `live-gemini-contract`.

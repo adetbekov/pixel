@@ -5,6 +5,13 @@ each one. A row missing its state or its plan is a sample the miner cannot use,
 so every teacher call writes a complete row — the fallback ones included, since
 "the teacher could not answer this either" is itself a signal.
 
+Written for the miner, but not only for the miner: a row the miner skips is still
+a row, and "the user keeps asking for the weather" is worth reading even though no
+skill can come of it. So nothing is dropped here. Which rows are *mineable* is
+decided one layer up, in :func:`backend.miner.case._parse`, and this module keeps
+the two facts that decision needs: ``error`` (the call failed) and ``handled``
+(the teacher answered, and declined).
+
 The table has no timestamp of its own; ``interaction_id`` joins to
 ``interactions.ts`` when one is needed (see ``/api/metrics``).
 """
@@ -28,6 +35,7 @@ def log_case(
     raw_response: str,
     actions: list[dict[str, Any]],
     error: str | None = None,
+    handled: bool = True,
 ) -> int:
     """Record one teacher call. ``actions`` is the plan *after* validation."""
     payload = {
@@ -37,6 +45,9 @@ def log_case(
         # this alone, which is what tells the miner a skill is worth mining.
         "router_confidence": confidence,
         "error": error,
+        # The teacher's own verdict: did it do the thing, or decline? A declined
+        # row is kept and read, but never mined.
+        "handled": handled,
     }
     cursor = conn.execute(
         "INSERT INTO teacher_log"

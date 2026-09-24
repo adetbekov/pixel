@@ -1,8 +1,9 @@
 """The numbers that say whether Pixel is learning.
 
-All of it is queries over ``interactions`` and ``skills`` — there is no metrics
-table, because a second copy of a count can only ever disagree with the rows it
-was derived from.
+All of it is queries over ``interactions``, ``skills`` and — for the one number
+about the miner rather than about the router — ``mining_attempts``. There is no
+metrics table, because a second copy of a count can only ever disagree with the
+rows it was derived from.
 
 Two rules the SQL encodes:
 
@@ -23,6 +24,7 @@ import sqlite3
 from datetime import timedelta
 from typing import Any
 
+from .miner.attempts import stuck_count
 from .state import iso, utcnow
 
 #: The engines a user *command* can be answered by. Buttons are excluded on
@@ -85,4 +87,8 @@ def collect(conn: sqlite3.Connection) -> dict[str, Any]:
         "total_commands": laya_n + gemini_n,
         "gemini_calls_24h": int(recent.get("gemini", 0)),
         "teacher_calls_24h": int(teacher_calls),
+        # Clusters the miner has given up redrawing (JEB-1579). Zero is the
+        # normal reading; anything else is "the pool has a pattern in it that the
+        # backtest will not pass", which used to live only in a log line.
+        "clusters_stuck": stuck_count(conn),
     }

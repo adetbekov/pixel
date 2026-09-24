@@ -3,7 +3,17 @@
 import pytest
 
 from backend.brain.engine import NoulResult, ScoreResult
-from backend.brain.router import UNKNOWN, RouterHit, RouterMiss, route
+from backend.brain.router import (
+    DEFAULT_THRESHOLD,
+    ROUTER_QUESTION,
+    UNKNOWN,
+    RouterHit,
+    RouterMiss,
+    default_threshold,
+    normalize,
+    pick_skill,
+    route,
+)
 from backend.brain.skill import Skill, load_seed_skills, load_skills
 from backend.state import RobotState
 
@@ -28,7 +38,7 @@ def test_seed_skills_load_in_the_measured_order(skills):
 
 
 def test_confident_pick_runs_the_skill(skills):
-    outcome = route(FakeEngine("greet", 0.91), skills, "привет", RESTED)
+    outcome = route(FakeEngine("greet", 0.91), skills, "приветствую", RESTED)
     assert isinstance(outcome, RouterHit)
     assert outcome.skill_id == "greet"
     assert outcome.confidence == pytest.approx(0.91)
@@ -48,8 +58,8 @@ def test_below_threshold_is_a_miss(skills):
 
 def test_threshold_is_per_skill(skills):
     picky = [skill.model_copy(update={"threshold": 0.95}) for skill in skills]
-    assert isinstance(route(FakeEngine("greet", 0.9), skills, "привет", RESTED), RouterHit)
-    assert isinstance(route(FakeEngine("greet", 0.9), picky, "привет", RESTED), RouterMiss)
+    assert isinstance(route(FakeEngine("greet", 0.9), skills, "приветствую", RESTED), RouterHit)
+    assert isinstance(route(FakeEngine("greet", 0.9), picky, "приветствую", RESTED), RouterMiss)
 
 
 def test_no_skills_is_a_miss():
@@ -94,13 +104,13 @@ def test_full_robot_refuses_food(skills):
 
 def test_a_skill_without_questions_costs_one_pass(skills):
     engine = FakeEngine("greet", 0.9)
-    route(engine, skills, "привет", RESTED)
+    route(engine, skills, "приветствую", RESTED)
     assert len(engine.calls) == 1
 
 
 def test_a_skill_with_questions_costs_two_passes_and_batches_them(skills):
     engine = FakeEngine("play", 0.9, {"intensity": ScoreResult(1.0, 0.8, {"1": 0.8})})
-    route(engine, skills, "поиграем", RESTED)
+    route(engine, skills, "давай поиграем", RESTED)
     assert len(engine.calls) == 2
     assert list(engine.calls[1]) == ["intensity"]
 
@@ -108,7 +118,7 @@ def test_a_skill_with_questions_costs_two_passes_and_batches_them(skills):
 def test_router_offers_every_skill_in_order_plus_unknown(skills):
     """Option order changes the answer, so it must be the library's, not a set's."""
     engine = FakeEngine("greet", 0.9)
-    route(engine, skills, "привет", RESTED)
+    route(engine, skills, "приветствую", RESTED)
     assert list(engine.calls[0]["skill"]["criteria"]) == [
         "greet",
         "feed",
@@ -120,7 +130,7 @@ def test_router_offers_every_skill_in_order_plus_unknown(skills):
 
 def test_a_missing_answer_falls_through_to_the_fallback(skills):
     """The engine dropped the question, so its rule must not fire."""
-    outcome = route(FakeEngine("feed", 0.9), skills, "покорми", RESTED)
+    outcome = route(FakeEngine("feed", 0.9), skills, "дай покушать", RESTED)
     assert names(outcome) == ["eat", "say"]
 
 
@@ -145,5 +155,80 @@ def test_long_descriptions_are_trimmed():
         rules=[{"when": {}, "actions": [{"action": "wave"}]}],
     )
     engine = FakeEngine("verbose", 0.9)
-    route(engine, [skill], "привет", RESTED)
+    route(engine, [skill], "приветствую", RESTED)
     assert len(engine.calls[0]["skill"]["criteria"]["verbose"]) == 120
+
+
+def test_a_phrase_the_skill_lists_never_reaches_the_head(skills):
+    """JEB-1548: `хай` is greet's own example and scored 0.22 against the head."""
+    engine = FakeEngine(UNKNOWN, 0.01)
+    outcome = route(engine, skills, "хай", RESTED)
+    assert isinstance(outcome, RouterHit)
+    assert outcome.skill_id == "greet"
+    assert outcome.confidence == 1.0
+    assert engine.calls == []
+
+
+def test_every_example_of_every_seed_skill_routes_to_its_own_skill(skills):
+    """The acceptance criterion, as a test: no phrase a skill claims is a miss."""
+    engine = FakeEngine(UNKNOWN, 0.0)
+    for skill in skills:
+        for example in skill.examples:
+            outcome = route(engine, skills, example, RESTED)
+            assert isinstance(outcome, RouterHit), example
+            assert outcome.skill_id == skill.id, example
+
+
+def test_the_lookup_ignores_case_punctuation_and_yo(skills):
+    assert normalize("  Привет, ёжик!  ") == "привет ежик"
+
+    engine = FakeEngine(UNKNOWN, 0.01)
+    for phrase in ("Привет!", "  привет  ", "поиграем", "ПОЕШЬ..."):
+        assert isinstance(route(engine, skills, phrase, RESTED), RouterHit), phrase
+    # Pass 2 still runs for a skill that has questions; pass 1 never does.
+    assert not any(ROUTER_QUESTION in call for call in engine.calls)
+
+
+def test_a_phrase_nobody_lists_still_goes_to_the_head(skills):
+    engine = FakeEngine("greet", 0.9)
+    assert isinstance(route(engine, skills, "здарова", RESTED), RouterHit)
+    assert len(engine.calls) == 1
+
+
+def test_the_head_alone_is_pick_skill_and_has_no_lookup_to_turn_off(skills):
+    """JEB-1562. `route` used to take `use_examples=False` for the miner's benefit,
+    which let the miner measure a router nobody runs. A caller that wants the head
+    without the lookup asks `pick_skill` instead — and pays one pass, not two."""
+    engine = FakeEngine(UNKNOWN, 0.01)
+    assert pick_skill(engine, skills, "хай") == (None, 0.01)
+    assert len(engine.calls) == 1
+
+    # The same phrase through `route`: step 0 lists it, so `greet` wins at 1.0 and
+    # the head is not asked at all.
+    outcome = route(engine, skills, "хай", RESTED)
+    assert (outcome.skill_id, outcome.confidence) == ("greet", 1.0)
+    assert len(engine.calls) == 1
+
+
+def test_an_earlier_skill_keeps_a_phrase_a_later_one_copies(skills):
+    """A mined skill is appended, so it cannot take a phrase off a seed skill."""
+    thief = Skill(
+        id="thief",
+        name="Thief",
+        description="кража",
+        examples=["привет"],
+        rules=[{"when": {}, "actions": [{"action": "wave"}]}],
+    )
+    outcome = route(FakeEngine(UNKNOWN, 0.01), [*skills, thief], "привет", RESTED)
+    assert outcome.skill_id == "greet"
+
+
+def test_the_default_threshold_is_the_measured_one(monkeypatch):
+    """0.66, calibrated on the live checkpoint in JEB-1548.
+
+    Pinned because it is not a number anybody would guess back: it is the knee
+    where wrong fires drop from 5 to 3 without costing a single hit.
+    """
+    monkeypatch.delenv("ROUTER_THRESHOLD", raising=False)
+    assert DEFAULT_THRESHOLD == 0.66
+    assert default_threshold() == DEFAULT_THRESHOLD

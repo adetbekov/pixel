@@ -40,6 +40,17 @@ class TeacherPlan(BaseModel):
     #: not the guard, though — it would still pass whitespace; the blank check
     #: that actually protects the user lives in :func:`backend.teacher.client._parse`.
     reply: str = Field(min_length=1, max_length=MAX_SAY_LEN)
+
+    #: Did the teacher actually carry the command out, or is this reply a polite
+    #: "I can't do that"? Required, with no default, so it is in the schema the
+    #: model is handed and comes back on every answer — measured live on
+    #: ``models/gemini-2.5-flash-lite``, which fills it correctly on both sides
+    #: (JEB-1547). The miner is the only caller that cares, and it cares a lot:
+    #: a refusal mined into a skill is a skill that answers "I don't understand"
+    #: for ever, from Laya, with no route left to the teacher. Text cannot decide
+    #: this — "меня зовут Pixel" and "я не умею" are the same shape — so the one
+    #: party that knows says so outright. See :func:`backend.miner.case._parse`.
+    handled: bool
     actions: list[TeacherAction] = Field(default_factory=list, max_length=MAX_PLAN_LEN)
 
     @field_validator("reply", mode="before")

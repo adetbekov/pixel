@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS skill_proposals (
     status TEXT,
     created_at TEXT
 );
+
+-- One row per set of cases the miner has drafted and the backtest has refused,
+-- so the same refusal stops costing a Gemini draft on every run and a cluster
+-- that is failing is distinguishable from one that is still ripening. The
+-- ledger is `backend/miner/attempts.py`; `signature` is the cluster's sorted
+-- `teacher_log` ids, the same shape as `skill_proposals.sample_ids`.
+CREATE TABLE IF NOT EXISTS mining_attempts (
+    signature TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_reason TEXT,
+    last_at TEXT
+);
 """
 
 #: Columns added after the schema above was frozen, as ``table -> column -> type``.
@@ -77,6 +89,16 @@ MIGRATIONS: dict[str, dict[str, str]] = {
     "skills": {
         "disabled_at": "TEXT",
         "disabled_reason": "TEXT",
+    },
+    # `match_rate` is the share of the cluster an accepted skill takes off Gemini,
+    # and the generator copies the cluster into `examples` word for word, so it
+    # reads 1.00 on live data almost every time (JEB-1562: 9 runs of 9). The
+    # proposal card is where the user decides, so it also needs the number that
+    # actually moves: `generalization`, what a phrasing nobody listed would get.
+    # NULL on a proposal mined before this column existed — the card then shows
+    # the one number it has rather than inventing a zero (JEB-1581).
+    "skill_proposals": {
+        "generalization": "REAL",
     },
 }
 
