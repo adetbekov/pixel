@@ -9,6 +9,7 @@ import pytest
 
 from backend import metrics
 from backend.main import app
+from backend.state import iso, utcnow
 
 FIELDS = {
     "laya_share",
@@ -36,7 +37,9 @@ async def client(conn):
         yield async_client
 
 
-def log(conn, engine: str, *, latency_ms: int = 10, ts: str = "2026-09-23T10:00:00Z") -> int:
+def log(conn, engine: str, *, latency_ms: int = 10, ts: str | None = None) -> int:
+    """A logged interaction. Default `ts` is *now*, so the row is inside the window."""
+    ts = ts or iso(utcnow())
     cursor = conn.execute(
         "INSERT INTO interactions (ts, user_text, engine, skill_id, confidence, latency_ms,"
         " actions_json, reply_text, feedback) VALUES (?, 'команда', ?, NULL, NULL, ?, '[]', '', NULL)",
@@ -89,10 +92,33 @@ def test_average_latency_is_per_path(conn):
     assert body["avg_latency_gemini_ms"] == 1000.0
 
 
+def test_average_latency_ignores_rows_older_than_the_window(conn):
+    """JEB-1574: one batch of 100 s rows must not poison the average forever.
+
+    The panel says "how fast is the robot", so the averages read over the same
+    24h as the counts next to them — otherwise history from a fixed timeout bug
+    keeps the card showing 98 s while live calls answer in 1.6 s.
+    """
+    old = "2020-01-01T00:00:00Z"
+    log(conn, "gemini", latency_ms=100_000, ts=old)
+    log(conn, "laya", latency_ms=100_000, ts=old)
+
+    body = metrics.collect(conn)
+    assert body["avg_latency_gemini_ms"] == 0.0
+    assert body["avg_latency_laya_ms"] == 0.0
+
+    log(conn, "gemini", latency_ms=1600)
+    log(conn, "laya", latency_ms=40)
+
+    body = metrics.collect(conn)
+    assert body["avg_latency_gemini_ms"] == 1600.0
+    assert body["avg_latency_laya_ms"] == 40.0
+    # The lifetime counts still see the old rows — only the averages are windowed.
+    assert body["total_commands"] == 4
+
+
 def test_the_24h_window_ignores_older_rows(conn):
     """The lifetime share hides today's trend; the windowed one is why it exists."""
-    from backend.state import iso, utcnow
-
     old = "2020-01-01T00:00:00Z"
     now = iso(utcnow())
     log(conn, "gemini", ts=old)

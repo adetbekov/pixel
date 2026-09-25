@@ -223,8 +223,10 @@ function metricCard(label, value, lead = false) {
   return el;
 }
 
-/* null -> карточка покажет «нет данных» мелким шрифтом */
-const ms = (value) => (Number.isFinite(value) ? `${Math.round(value)} мс` : null);
+/* null -> карточка покажет «нет данных» мелким шрифтом.
+   Ноль тоже «нет данных»: латентности считаются за сутки, и 0 мс означает, что
+   за окно такого вызова не было, а не что робот ответил мгновенно. */
+const ms = (value) => (Number.isFinite(value) && value > 0 ? `${Math.round(value)} мс` : null);
 
 const percent = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
 
@@ -264,8 +266,8 @@ function renderMetrics(metrics) {
   const disabled = Number(metrics.skills_disabled) || 0;
   const cards = [
     shareCard(metrics),
-    metricCard('Laya, среднее время', ms(metrics.avg_latency_laya_ms)),
-    metricCard('Gemini, среднее время', ms(metrics.avg_latency_gemini_ms)),
+    metricCard('Laya, среднее время за 24 часа', ms(metrics.avg_latency_laya_ms)),
+    metricCard('Gemini, среднее время за 24 часа', ms(metrics.avg_latency_gemini_ms)),
     metricCard('Активных навыков', String(metrics.skills_active ?? 0)),
   ];
   /* Отключённые показываем, только когда они есть: пустая карточка «0» просто
