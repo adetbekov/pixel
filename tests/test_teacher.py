@@ -18,6 +18,7 @@ from backend.actions import ACTIONS, MAX_SAY_LEN
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
 from backend.main import app
+from backend.miner.case import load_pool
 from backend.state import read_state
 from backend.teacher import (
     FALLBACK_PLAN,
@@ -325,6 +326,34 @@ async def test_an_ordinary_fallback_carries_no_status_either(client, seeded, mis
     body = (await client.post("/api/chat", json={"text": "взломай насу"})).json()
     assert body["reply"] == FALLBACK_REPLY
     assert body["teacher_status"] is None
+
+
+@pytest.mark.anyio
+async def test_a_quota_outage_never_reaches_the_mining_pool(
+    client, conn, seeded, missing, teacher
+):
+    """A billing outage is not an example of anything, so it must not be mined.
+
+    Two checks in `backend/miner/case._parse` hold it — the row has an `error`,
+    and its `handled` is false — and `tests/test_cluster.py` already pins each
+    one on its own, from rows `fill_pool` writes by hand. This asserts the same
+    outcome from the other end: a real `google.genai` 429 through
+    `POST /api/chat`, the row the client actually writes, and `load_pool` on
+    that. Measured on `a1f7917`: drop either check and this stays green (the
+    other still holds it); drop both and it goes red alongside the four
+    `test_cluster` tests.
+
+    So it is not what pins the guards — it is what pins the path from a live
+    429 to the pool, which nothing else covers. What that path protects
+    against: the miner drafting "мой учитель сейчас недоступен" into a
+    permanent Laya skill — a command that then never reaches Gemini again,
+    answered by a lie in 300 ms.
+    """
+    teacher(quota_error())
+    await client.post("/api/chat", json={"text": "покажи фокус"})
+
+    assert len(teacher_rows(conn)) == 1, "the case is still logged — it is a real signal"
+    assert load_pool(conn) == []
 
 
 def test_an_old_database_gains_the_column_instead_of_breaking(tmp_path):
