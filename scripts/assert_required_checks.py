@@ -110,8 +110,11 @@ secret to provision, rotate, or leak.
 
 Exit codes, kept distinct on purpose — an error is NOT "unprotected":
 
-  0  every required context is present, matches its job name, and is reachable
-     by a trigger that fires for PRs into the audited branch
+  0  every required context is present, and every one produced by a workflow job
+     also matches that job's `name:` and is reachable by a trigger that fires for
+     PRs into the audited branch. EXTERNAL_STATUS contexts are asserted for
+     membership only — assertions 2 and 4 are skipped for them, and the success
+     line says so rather than claiming them (JEB-1639)
   1  a real finding: a context is missing from the required list, a context no
      longer matches any job name, a context is declared by a workflow no event
      can start for a PR into that branch, or the branch is not protected
@@ -255,6 +258,34 @@ def contexts_for(branch: str) -> dict[str, Producer]:
 def workflow_producers(asserted: dict[str, Producer]) -> set[str]:
     """The workflow filenames in a context map, without the EXTERNAL_STATUS ones."""
     return {producer for producer in asserted.values() if isinstance(producer, str)}
+
+
+def ok_line(asserted: dict[str, Producer], branch: str) -> str:
+    """The exit-0 line, counting only the contexts each assertion actually ran on.
+
+    Assertions 2 (context <-> job name) and 4 (trigger reachability) ask questions
+    about a workflow file, so they are skipped for EXTERNAL_STATUS entries. A
+    single sentence claiming both for *all* asserted contexts would put the
+    "skipped assertion reads as a pass" shape back in the one line a human
+    auditing the lock actually reads (JEB-1639) — so the two populations are
+    counted separately whenever the map has a membership-only entry.
+    """
+    total = len(asserted)
+    external = sum(1 for producer in asserted.values() if not isinstance(producer, str))
+    unchanged = f"{branch} requires nothing this script does not assert"
+    if not external:
+        return (
+            f"OK: all {total} asserted contexts are required on {branch}, their "
+            f"context strings match their job names, every one of them is reachable "
+            f"by a trigger that fires for PRs into {branch}, and {unchanged}."
+        )
+    return (
+        f"OK: all {total} asserted contexts are required on {branch}; the "
+        f"{total - external} produced by a workflow job match their job names and are "
+        f"reachable by a trigger that fires for PRs into {branch} ({external} "
+        f"{'is' if external == 1 else 'are'} EXTERNAL_STATUS — membership only, "
+        f"assertions 2 and 4 skipped); and {unchanged}."
+    )
 
 
 def describe_producer(producer: Producer) -> str:
@@ -904,12 +935,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"::error::{finding}")
         return EXIT_FINDING
 
-    print(
-        f"OK: all {len(asserted)} asserted contexts are required on {args.branch}, their "
-        f"context strings match their job names, every one of them is reachable by a "
-        f"trigger that fires for PRs into {args.branch}, and {args.branch} requires "
-        f"nothing this script does not assert."
-    )
+    print(ok_line(asserted, args.branch))
     return EXIT_OK
 
 
