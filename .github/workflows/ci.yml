@@ -64,6 +64,44 @@ jobs:
       - name: Tests
         run: pytest -q
 
+  # The nightly live-Gemini gate cannot run on a PR — it needs GEMINI_API_KEY, which
+  # a fork PR cannot be given — and its `schedule:` / `workflow_dispatch` triggers
+  # only resolve from the default branch. So before JEB-1601 that file had never
+  # executed in any form until it executed on `main`, where it died on import: a
+  # numpy it never names, four modules down from `backend.miner.case`.
+  #
+  # This job is the part of it a PR *can* run. It installs exactly what the nightly
+  # installs — same `live_contract_requirements.py`, so the two cannot drift — and
+  # imports the probe without a key and without a network call. It is not a
+  # substitute for the nightly; it only ensures the nightly gets as far as asking.
+  #
+  # `lint + tests` does not cover this: it installs `.[dev]`, which is a superset,
+  # so the nightly's narrower environment is only ever exercised here.
+  live-contract-imports:
+    name: live gemini contract imports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install the dependencies the nightly installs
+        run: |
+          set -euo pipefail
+          python .github/scripts/live_contract_requirements.py > live-contract-requirements.txt
+          cat live-contract-requirements.txt
+          pip install -r live-contract-requirements.txt
+
+      # No GEMINI_API_KEY on purpose: `--check-imports` returns before the key is
+      # read, so this stays green on a fork PR and still fails on a missing import.
+      - name: Probe imports resolve
+        env:
+          PYTHONPATH: .
+        run: python .github/scripts/check_live_gemini_contract.py --check-imports
+
   # `frontend/` ships as bare ES modules with no build step, so nothing but this job
   # ever parses it. ESLint is a CI-only devDependency; production stays dependency-free.
   frontend:

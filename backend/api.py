@@ -21,7 +21,7 @@ from .brain.engine import get_engine
 from .brain.router import RouterHit, route
 from .brain.skill import load_skills, parse_skill
 from .metrics import collect as collect_metrics
-from .miner import mine_once, mining_due
+from .miner import mine_once, mining_due, request_mine
 from .state import apply_actions, iso, read_state, utcnow
 from .teacher import get_teacher, log_case
 
@@ -92,6 +92,14 @@ class Reply(BaseModel):
     confidence: float | None
     latency_ms: int
     state: StateOut
+    #: Why the teacher did not answer, when it did not — `"quota_exhausted"` is
+    #: the only value today (`backend.teacher.client.QUOTA_STATUS`). `None` on
+    #: every ordinary reply, and additive with a default, so a client written
+    #: before this field keeps working and one written after it can tell a
+    #: quota outage from "the model did not understand" without matching on the
+    #: reply text. `engine` stays `"gemini"`: the miss was still routed to the
+    #: teacher, and the metrics count it there (JEB-1603).
+    teacher_status: str | None = None
 
 
 class ChatIn(BaseModel):
@@ -147,12 +155,21 @@ class HistoryItem(BaseModel):
     confidence: float | None = None
     latency_ms: int = 0
     feedback: int | None = None
+    #: The same flag as on `Reply`, so a reloaded chat redraws the quota bubble
+    #: the way it was first shown instead of silently downgrading it.
+    teacher_status: str | None = None
 
 
 class Proposal(BaseModel):
     id: str
     skill: dict[str, Any]
     match_rate: float
+    #: What the `choice` head alone would do with the cluster — i.e. what a phrasing
+    #: nobody has typed yet gets. `match_rate` reads 1.00 on nearly every live draft
+    #: (the generator copies the cluster into `examples`), so this is the number on
+    #: the card that carries information. `None` for a proposal mined before the
+    #: column existed; the card then shows only `match_rate` (JEB-1581).
+    generalization: float | None = None
     sample_ids: list[int]
     status: str
     created_at: str
@@ -179,6 +196,11 @@ class Metrics(BaseModel):
     laya_share_24h: float = 0.0
     gemini_calls_24h: int = 0
     skills_disabled: int = 0
+    #: Case sets the miner has stopped redrawing after `MINER_MAX_ATTEMPTS`
+    #: refused drafts (JEB-1579). It is the one number here that is about
+    #: learning failing rather than learning working, so the panel only shows it
+    #: when it is non-zero.
+    clusters_stuck: int = 0
 
 
 def _log_interaction(
@@ -191,12 +213,13 @@ def _log_interaction(
     latency_ms: int,
     actions: list[Action],
     reply_text: str,
+    teacher_status: str | None = None,
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO interactions"
         " (ts, user_text, engine, skill_id, confidence, latency_ms, actions_json, reply_text,"
-        "  feedback)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        "  feedback, teacher_status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         (
             iso(utcnow()),
             user_text,
@@ -206,6 +229,7 @@ def _log_interaction(
             latency_ms,
             json.dumps([a.to_dict() for a in actions], ensure_ascii=False),
             reply_text,
+            teacher_status,
         ),
     )
     conn.commit()
@@ -228,6 +252,7 @@ def execute_plan(
     skill_id: str | None = None,
     confidence: float | None = None,
     fallback_reply: str = "Готово!",
+    teacher_status: str | None = None,
     now: datetime | None = None,
 ) -> dict:
     """The single execution path: validate, apply, log, and shape a ``Reply``.
@@ -254,6 +279,7 @@ def execute_plan(
             latency_ms=latency_ms,
             actions=actions,
             reply_text=reply,
+            teacher_status=teacher_status,
         )
     return {
         "interaction_id": interaction_id,
@@ -264,6 +290,7 @@ def execute_plan(
         "confidence": confidence,
         "latency_ms": latency_ms,
         "state": state.to_dict(),
+        "teacher_status": teacher_status,
     }
 
 
@@ -353,11 +380,12 @@ def post_chat(payload: ChatIn) -> dict:
         started=started,
         confidence=outcome.confidence,
         fallback_reply=result.reply,
+        teacher_status=result.teacher_status,
         now=now,
     )
 
     with db.lock:
-        log_case(
+        case_id = log_case(
             conn,
             interaction_id=reply["interaction_id"],
             user_text=payload.text,
@@ -367,14 +395,21 @@ def post_chat(payload: ChatIn) -> dict:
             raw_response=result.raw_response,
             actions=reply["actions"],
             error=result.error,
+            handled=result.handled,
         )
-        due = mining_due(conn)
+        # The row this request just wrote, not the pool level: a level stays
+        # true while the pool stands still, and the pool stands still on every
+        # refusal. See `mining_due`.
+        due = mining_due(conn, case_id)
 
-    # Every MINER_BATCH-th miss, the miner runs before this response returns.
-    # It is seconds on a pool this size, and the user who just taught Pixel
-    # something is the one most likely to be looking at the skills panel.
+    # Every MINER_BATCH-th mineable miss asks for a mining run — and does not
+    # wait for it. A run is one Gemini grouping call, a draft per cluster and a
+    # backtest behind the engine lock: seconds, and they used to be added to
+    # this response. The worker owns them now (`backend/miner/worker.py`); the
+    # proposal shows up in the skills panel a few seconds after the answer
+    # instead of before it.
     if due:
-        mine_once()
+        request_mine()
     return reply
 
 
@@ -408,7 +443,7 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
     with db.lock:
         rows = conn.execute(
             "SELECT id, user_text, reply_text, engine, skill_id, confidence, latency_ms,"
-            " feedback FROM interactions ORDER BY id DESC LIMIT ?",
+            " feedback, teacher_status FROM interactions ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [
@@ -421,6 +456,7 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
             "confidence": row["confidence"],
             "latency_ms": row["latency_ms"],
             "feedback": row["feedback"],
+            "teacher_status": row["teacher_status"],
         }
         for row in reversed(rows)
     ]
@@ -479,7 +515,7 @@ def get_proposals() -> list[dict]:
     conn = db.get_conn()
     with db.lock:
         rows = conn.execute(
-            "SELECT id, skill_json, match_rate, sample_ids, status, created_at"
+            "SELECT id, skill_json, match_rate, generalization, sample_ids, status, created_at"
             " FROM skill_proposals WHERE status = 'pending' ORDER BY created_at, rowid"
         ).fetchall()
     return [
@@ -487,6 +523,7 @@ def get_proposals() -> list[dict]:
             "id": row["id"],
             "skill": json.loads(row["skill_json"]),
             "match_rate": row["match_rate"],
+            "generalization": row["generalization"],
             "sample_ids": json.loads(row["sample_ids"]),
             "status": row["status"],
             "created_at": row["created_at"],
@@ -570,7 +607,12 @@ def reject_proposal(proposal_id: str) -> dict:
 
 @router.post("/mine", response_model=MineOut)
 def post_mine() -> dict:
-    """Mine now. An empty pool, or no API key, is `0` proposals — not an error."""
+    """Mine now. An empty pool, or no API key, is `0` proposals — not an error.
+
+    Synchronous on purpose, unlike the automatic trigger in `/api/chat`: this is
+    the manual run and its caller asked for the count, so it gets the count. A
+    run the worker is already doing answers `started: false` rather than queuing.
+    """
     result = mine_once()
     return {"started": result.started, "proposals": result.proposals}
 

@@ -11,6 +11,7 @@ from backend.brain.router import (
     RouterMiss,
     default_threshold,
     normalize,
+    pick_skill,
     route,
 )
 from backend.brain.skill import Skill, load_seed_skills, load_skills
@@ -194,10 +195,18 @@ def test_a_phrase_nobody_lists_still_goes_to_the_head(skills):
     assert len(engine.calls) == 1
 
 
-def test_the_backtest_can_turn_the_lookup_off(skills):
-    """`use_examples=False` is what keeps the miner's backtest honest."""
+def test_the_head_alone_is_pick_skill_and_has_no_lookup_to_turn_off(skills):
+    """JEB-1562. `route` used to take `use_examples=False` for the miner's benefit,
+    which let the miner measure a router nobody runs. A caller that wants the head
+    without the lookup asks `pick_skill` instead — and pays one pass, not two."""
     engine = FakeEngine(UNKNOWN, 0.01)
-    assert route(engine, skills, "хай", RESTED, use_examples=False) == RouterMiss(0.01)
+    assert pick_skill(engine, skills, "хай") == (None, 0.01)
+    assert len(engine.calls) == 1
+
+    # The same phrase through `route`: step 0 lists it, so `greet` wins at 1.0 and
+    # the head is not asked at all.
+    outcome = route(engine, skills, "хай", RESTED)
+    assert (outcome.skill_id, outcome.confidence) == ("greet", 1.0)
     assert len(engine.calls) == 1
 
 

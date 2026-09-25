@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,7 +31,11 @@ sys.modules[spec.name] = contract
 spec.loader.exec_module(contract)
 
 GOOD_PLAN = json.dumps(
-    {"reply": "Кручусь!", "actions": [{"action": "spin"}, {"action": "say", "text": "Кручусь!"}]},
+    {
+        "reply": "Кручусь!",
+        "handled": True,
+        "actions": [{"action": "spin"}, {"action": "say", "text": "Кручусь!"}],
+    },
     ensure_ascii=False,
 )
 
@@ -247,3 +252,129 @@ def test_a_finding_exits_one_and_a_healthy_pair_exits_zero(monkeypatch):
 
     monkeypatch.setattr(contract, "PROBES", (probe(GOOD_PLAN), probe(FENCED_PLAN)))
     assert contract.main() == 1
+
+
+# --- JEB-1601: the gate's own environment -----------------------------------
+#
+# The probe's verdict was tested above; what was not, and what took the nightly
+# down on its first execution ever, is whether the job can reach that verdict at
+# all. `schedule:` and `workflow_dispatch` resolve only from the default branch,
+# so the file first executed on `main` — and died on `import numpy`, four modules
+# below `backend.miner.case`, which the install step's hand-typed list never
+# mentioned because the script never names it.
+
+REQUIREMENTS_SCRIPT = ROOT / ".github" / "scripts" / "live_contract_requirements.py"
+
+_req_spec = importlib.util.spec_from_file_location(
+    "live_contract_requirements", REQUIREMENTS_SCRIPT
+)
+requirements = importlib.util.module_from_spec(_req_spec)
+sys.modules[_req_spec.name] = requirements
+_req_spec.loader.exec_module(requirements)
+
+
+def project_dependencies() -> list[str]:
+    import tomllib
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return pyproject["project"]["dependencies"]
+
+
+def test_the_nightly_installs_every_project_dependency_but_the_excluded_ones():
+    """The list is pyproject's, not a remembered one. numpy is the regression:
+    it is a project dependency, it is imported transitively by the probe, and it
+    was the module the gate died on."""
+    nightly = requirements.requirements(ROOT / "pyproject.toml")
+    installed = {requirements.requirement_name(spec) for spec in nightly}
+    declared = {requirements.requirement_name(spec) for spec in project_dependencies()}
+
+    assert installed == declared - requirements.EXCLUDED
+    assert "numpy" in installed
+    assert "laya" not in installed
+
+
+def test_the_exclusion_list_stays_justified():
+    """Only laya is dropped, and only because torch is a gigabyte. Anything added
+    to EXCLUDED has to be argued from the import graph — this test is the place
+    that stops it from being argued from convenience."""
+    assert requirements.EXCLUDED == frozenset({"laya"})
+
+
+def test_requirement_specifiers_are_passed_through_verbatim():
+    """A pin dropped on the way into the nightly would let it run against an SDK
+    line the app is not on — the drift the old step's comment already worried
+    about. So the strings are copied, not rebuilt from names."""
+    installed = requirements.requirements(ROOT / "pyproject.toml")
+
+    assert [spec for spec in project_dependencies() if not spec.startswith("laya")] == installed
+    assert any(spec.startswith("google-genai>=") for spec in installed)
+
+
+def test_check_imports_resolves_without_a_key(monkeypatch, capsys):
+    """The PR-side mode. It must return before the key is read, or it cannot run
+    on a fork PR — which is the only place it can catch the defect early."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    assert contract.main(["--check-imports"]) == 0
+    assert "imports resolve" in capsys.readouterr().out
+
+
+def test_nothing_the_probe_imports_needs_laya():
+    """Why the nightly may skip laya (and its ~1 GB of torch): no module on the
+    probe's import path says `import laya` at import time. `backend/brain/engine.py`
+    keeps those imports inside the two methods that load a model, and this asserts
+    that invariant from the outside — in a subprocess, because the dev environment
+    has laya installed and would hide a regression here."""
+    blocker = f"""
+import runpy, sys
+from importlib.abc import MetaPathFinder
+
+class Blocked(MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "laya" or name.startswith("laya.") or name == "torch":
+            raise ImportError("the nightly gate does not install " + name)
+        return None
+
+sys.meta_path.insert(0, Blocked())
+sys.argv = [{str(SCRIPT)!r}, "--check-imports"]
+runpy.run_path({str(SCRIPT)!r}, run_name="__main__")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", blocker],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "imports resolve" in result.stdout
+
+
+def test_both_workflows_install_from_the_same_script():
+    """The PR check is only evidence about the nightly while both install the
+    same way. Two copies of an install step drift, and the drift would be
+    invisible until the nightly ran — which is the failure mode itself."""
+    nightly = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    reference = ".github/scripts/live_contract_requirements.py"
+
+    assert reference in nightly
+    assert reference in ci
+    assert "--check-imports" in ci
+
+
+def test_the_nightly_does_not_name_packages_by_hand():
+    """The defect in one line: the install step listed what the author remembered
+    the script imports. If a package name reappears in a `pip install` there, the
+    single source is gone again."""
+    nightly = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
+    install_commands = [
+        line
+        for line in nightly.splitlines()
+        if "pip install" in line and not line.lstrip().startswith("#")
+    ]
+
+    assert install_commands
+    for line in install_commands:
+        assert "-r live-contract-requirements.txt" in line, line

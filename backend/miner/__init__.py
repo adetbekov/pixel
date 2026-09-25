@@ -7,7 +7,7 @@ Gemini at all.
 
 The pipeline, once per run:
 
-``teacher_log (mined=0)`` -> cluster -> generate -> backtest -> proposal
+``teacher_log (mined=0, handled)`` -> cluster -> generate -> backtest -> proposal
 
 and it stops there. **A mined skill is never activated by this package.** Only
 ``POST /api/proposals/{id}/accept`` puts one in the library — that is the
@@ -16,6 +16,7 @@ project's standing invariant, not a policy this module may relax.
 
 from .generate import build_generator, get_generator, set_generator
 from .run import MineResult, mine_once, mining_due
+from .worker import request_mine, stop_worker, wait_idle
 
 __all__ = [
     "MineResult",
@@ -23,5 +24,8 @@ __all__ = [
     "get_generator",
     "mine_once",
     "mining_due",
+    "request_mine",
     "set_generator",
+    "stop_worker",
+    "wait_idle",
 ]

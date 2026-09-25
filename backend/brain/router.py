@@ -18,10 +18,12 @@ Below the skill's threshold, or on ``unknown``, the router reports a
 :class:`RouterMiss` and executes nothing. The miss goes to Gemini, and the
 teacher's answer is what the miner later turns into a skill.
 
-``use_examples=False`` turns step 0 off. The miner needs that: its backtest is
-the one place that has to measure what the *head* does, and a candidate's
-``examples`` are exactly the cluster it is being tested on — the lookup would
-score every candidate 1.0 and prove nothing (see ``backend/miner/backtest.py``).
+There is no switch for step 0. There used to be (``use_examples=False``, JEB-1548)
+because the miner's backtest wanted the head's answer without the lookup, and it
+made every number the miner printed a number about a router nobody runs
+(JEB-1562). A caller that wants the head alone asks :func:`pick_skill`, which has
+no lookup to turn off; a caller that wants to know what *this* module will do
+calls :func:`route` and gets step 0 with it.
 """
 
 from __future__ import annotations
@@ -150,13 +152,11 @@ def route(
     skills: list[Skill],
     text: str,
     state: RobotState,
-    *,
-    use_examples: bool = True,
 ) -> RouterOutcome:
     if not skills:
         return RouterMiss(0.0)
 
-    skill = example_index(skills).get(normalize(text)) if use_examples else None
+    skill = example_index(skills).get(normalize(text))
     confidence = 1.0
 
     if skill is None:

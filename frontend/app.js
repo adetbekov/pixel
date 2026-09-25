@@ -19,6 +19,18 @@ const quickButtons = [...quickEl.querySelectorAll('button')];
 const ENGINE_LABELS = { laya: 'Laya', gemini: 'Gemini', button: 'Кнопка' };
 const ENGINE_CLASSES = { laya: 'badge-laya', gemini: 'badge-gemini', button: 'badge-button' };
 
+/* Почему учитель не ответил, когда не ответил. `engine` отвечает на «кого
+   спросили», и на исчерпанной квоте это по-прежнему `gemini` — значит сказать
+   «ответа не было» он не может, и до JEB-1603 квота выглядела в чате ровно как
+   «модель не поняла команду». Ключ приходит в `teacher_status` (null на любом
+   обычном ответе); по тексту реплики отличать нельзя — первая же правка
+   копирайта или локализация сломала бы это молча. */
+const STATUS_LABELS = { quota_exhausted: 'квота исчерпана' };
+const STATUS_CLASSES = { quota_exhausted: 'badge-quota' };
+const STATUS_TITLES = {
+  quota_exhausted: 'Учитель не ответил: исчерпана квота Gemini. Это не «робот не понял».',
+};
+
 /* ─── Индикаторы ────────────────────────────────────────────────────────── */
 
 function levelClass(value) {
@@ -66,6 +78,20 @@ function engineBadge(engine) {
   return badge;
 }
 
+/* Вторая плашка рядом с движком, а не вместо него: «спросили Gemini» и «ответа
+   не пришло» — два разных факта, и оба нужны. Неизвестный статус не рисуем
+   вовсе — сервер старше фронта отдаёт null, сервер новее может добавить ключ,
+   которого здесь ещё нет, и «неизвестно» в чате хуже, чем ничего. */
+function statusBadge(status) {
+  const key = String(status ?? '');
+  if (!STATUS_LABELS[key]) return null;
+  const badge = document.createElement('span');
+  badge.className = `badge ${STATUS_CLASSES[key]}`;
+  badge.textContent = STATUS_LABELS[key];
+  badge.title = STATUS_TITLES[key];
+  return badge;
+}
+
 function voteButtons(interactionId, current = null) {
   const box = document.createElement('div');
   box.className = 'vote';
@@ -106,6 +132,9 @@ function addReply(reply, vote = null) {
   const meta = document.createElement('div');
   meta.className = 'meta';
   meta.append(engineBadge(reply.engine));
+
+  const status = statusBadge(reply.teacher_status);
+  if (status) meta.append(status);
 
   if (Number.isFinite(reply.latency_ms)) {
     const latency = document.createElement('span');
@@ -240,6 +269,11 @@ function renderMetrics(metrics) {
   /* Отключённые показываем, только когда они есть: пустая карточка «0» просто
      занимала бы место в панели. */
   if (disabled) cards.push(metricCard('Отключено навыков', String(disabled)));
+  /* То же и для застрявших кластеров: ноль — нормальное состояние, а не новость.
+     Ненулевое значение означает, что майнер перестал перерисовывать один и тот
+     же набор случаев — раньше это было видно только в логе (JEB-1579). */
+  const stuck = Number(metrics.clusters_stuck) || 0;
+  if (stuck) cards.push(metricCard('Застрявших кластеров', String(stuck)));
   metricsEl.replaceChildren(...cards);
 }
 

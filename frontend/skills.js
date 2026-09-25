@@ -2,7 +2,7 @@
 
    Карточка предложения — главный экран проекта: это тот момент, когда робот
    научился. Поэтому правила навыка разбираются словами, а не показываются
-   как JSON, и `match_rate` стоит крупно рядом с заголовком.
+   как JSON, а оба числа бэктеста стоят рядом с заголовком (см. `ratesBlock`).
 
    Формы ответов — `SkillCard` и `Proposal` из `backend/api.py`; примеры фраз
    живут в `skill.examples`, отдельного поля у предложения нет. */
@@ -214,12 +214,39 @@ function examplesList(examples) {
   return list;
 }
 
-function matchBlock(rate) {
+/* Два числа бэктеста, и они отвечают на разные вопросы (`backend/miner/backtest.py`):
+
+   `match_rate` — доля команд самой группы, которые после принятия пойдут в навык
+   мимо Gemini; маршрутизируется ровно так, как это сделает `/api/chat`, включая
+   поиск по `examples` (JEB-1562). Генератор копирует группу в `examples` слово в
+   слово, поэтому живьём это почти всегда 100% — как сигнал «принять или нет» оно
+   константа, и одного его на карточке мало (JEB-1581).
+
+   `generalization` — та же доля от одной головы `choice`, без `examples`: что
+   получит формулировка, которой в примерах нет. Это число разбрасывается (0.40…1.00
+   на одной группе между прогонами), поэтому стоит рядом, меньшим кеглем: слабое
+   описание — повод переформулировать навык, а не отклонить его. `null` у
+   предложений, намайненных до появления колонки, — тогда показываем только первое.
+
+   Третье число, `agreement`, на карточку по-прежнему не идёт: это разброс планов
+   учителя, а не качество навыка, и рядом с «принять?» читалось бы как оценка. */
+function ratesBlock(proposal) {
   const box = el('div', 'match');
   box.append(
-    el('b', null, Number.isFinite(Number(rate)) ? percent(rate) : '—'),
-    el('span', null, 'навык повторил решения учителя на прошлых примерах'),
+    el('b', null, Number.isFinite(Number(proposal.match_rate)) ? percent(proposal.match_rate) : '—'),
+    el('span', null, 'команд из этой группы навык заберёт у Gemini'),
   );
+  /* Проверка по типу, а не через Number(): `Number(null)` — это 0, и пустая
+     колонка нарисовалась бы как честные 0%. */
+  const general = proposal.generalization;
+  if (typeof general === 'number' && Number.isFinite(general)) {
+    const second = el('div', 'match-general');
+    second.append(
+      el('b', null, percent(general)),
+      el('span', null, 'узнает и ту формулировку, которой нет в примерах'),
+    );
+    box.append(second);
+  }
   return box;
 }
 
@@ -270,7 +297,7 @@ function proposalCard(proposal) {
 
   const head = el('div', 'proposal-head');
   head.append(el('h3', null, `Новый навык: ${skill.name ?? skill.id ?? 'без имени'}`));
-  head.append(matchBlock(proposal.match_rate));
+  head.append(ratesBlock(proposal));
 
   card.append(head, el('p', 'card-note', skill.description ?? ''));
 

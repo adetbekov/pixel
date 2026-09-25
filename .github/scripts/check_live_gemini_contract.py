@@ -25,6 +25,13 @@ moved, not that a plan was bad.
 Run by `.github/workflows/live-gemini-contract.yml` on a schedule, never on a
 PR: it needs `GEMINI_API_KEY`, which a fork PR cannot have.
 
+`--check-imports` is the part of it that *can* run on a PR: it makes no call
+and needs no key, it only proves this file's import graph resolves under the
+dependencies the nightly installs. That is the whole of JEB-1601 — the gate had
+never executed in any form before it executed on the default branch, and died
+on a numpy it never names, four modules down from `backend.miner.case`. `ci.yml`
+runs this mode on every PR so the next such gap fails a diff instead of a night.
+
 Exit codes, which the workflow's alert step branches on:
 
   0  both shapes answered in a parsable form
@@ -74,10 +81,22 @@ SDK_ENTRY_POINTS = (
 )
 
 #: HTTP status the API uses for "you are out of quota". The project this key
-#: belongs to is on the free tier, where `models/gemini-2.5-flash-lite` allows
-#: 20 `generateContent` requests a DAY and the live stand spends from the same
-#: twenty (JEB-1553) — so an exhausted day is the expected steady state, not an
-#: anomaly. Retrying does not help: the window is daily, measured.
+#: belongs to is on the free tier, where the 20-`generateContent`-a-day allowance
+#: is counted per (project, model) — so this run spends from TWO buckets, one per
+#: probe, and either can be the one that refuses:
+#:
+#: * `models/gemini-2.5-flash-lite` — the teacher's bucket (JEB-1553). The live
+#:   stand's `/api/chat` misses spend from the same twenty, so this one is
+#:   routinely empty by nightfall.
+#: * `models/gemini-3.5-flash` — the miner's bucket since JEB-1606, which moved
+#:   the miner off the teacher's model precisely to stop the two competing.
+#:   `miner_probe()` builds `GeminiSkillGenerator()` with no model argument, so it
+#:   follows `generate.DEFAULT_MODEL` and moved with it. Worth stating plainly:
+#:   this nightly therefore takes 1 of those 20 out of the bucket JEB-1606 freed
+#:   for the miner, which spends ~3 per mining pass.
+#:
+#: An exhausted day is the expected steady state on either bucket, not an anomaly.
+#: Retrying does not help: the window is daily, measured.
 QUOTA_HTTP_CODE = 429
 
 #: The `status` field that comes with it, checked alongside the code because the
@@ -278,7 +297,21 @@ def run(probe: Probe) -> str | None:
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+
+    if "--check-imports" in args:
+        # Reaching this line already is the assertion: every `from backend...`
+        # at the top of this file, and everything those modules pull in
+        # transitively, resolved. `PROBES` is built at module scope too, so the
+        # attributes the probes bind exist as well. Nothing is called, so no key
+        # and no network are involved — which is why a PR can run it.
+        print(
+            f"imports resolve: {len(PROBES)} probe(s) — "
+            + ", ".join(probe.name for probe in PROBES)
+        )
+        return 0
+
     if not os.environ.get("GEMINI_API_KEY"):
         print(
             "GEMINI_API_KEY is not set, so the live contract was not checked. "
