@@ -52,6 +52,18 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def unthrottled_mine(monkeypatch):
+    """`POST /api/mine` is capped at `MINE_RATE_LIMIT` a minute (JEB-1623).
+
+    Several tests here drive the manual mining button `MINER_MAX_ATTEMPTS` times
+    in a row to exhaust a cluster's draft budget — faster than any human, and
+    faster than the guard allows. The guard has its own tests in
+    `tests/test_public_guards.py`; here it is only in the way.
+    """
+    monkeypatch.setenv("MINE_RATE_LIMIT", "1000")
+
+
 @pytest.fixture()
 def miner_engine():
     """The engine the miner and the app share, scripted for the trick cluster."""

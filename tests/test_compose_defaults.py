@@ -39,9 +39,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from backend import db, feedback
+from backend import db, feedback, ratelimit
 from backend.brain import engine, router
 from backend.miner import attempts, backtest, case, cluster, generate, run
+from backend.teacher import budget
 from backend.teacher import client as teacher_client
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,9 @@ CODE_DEFAULTS = {
     "GEMINI_TEACHER_MODEL": teacher_client.DEFAULT_MODEL,
     "GEMINI_MINER_MODEL": generate.DEFAULT_MODEL,
     "PIXEL_DB_PATH": db.DEFAULT_DB_PATH,
+    "TEACHER_DAILY_CAP": budget.DEFAULT_DAILY_CAP,
+    "CHAT_RATE_LIMIT": ratelimit.DEFAULT_CHAT_RATE,
+    "MINE_RATE_LIMIT": ratelimit.DEFAULT_MINE_RATE,
 }
 
 #: Variables with no code default to compare against. Registering one is a
@@ -93,6 +97,9 @@ NO_CODE_DEFAULT = {
     # Diagnostic switch read inline in `backend/main.py` against the literal "1";
     # there is no constant and off is the absence of the flag.
     "PIXEL_SKIP_MODEL": 'diagnostic switch, compared inline against "1"',
+    # Secret, and unset is the supported default: `/api/mine` stays open for
+    # local runs and CI. There is no value to default to (JEB-1623).
+    "MINE_REQUIRE_TOKEN": "secret, no default value exists",
 }
 
 #: (document, variable) -> why that document is *supposed* to say something else.
@@ -271,6 +278,10 @@ def test_every_deliberate_override_still_has_something_to_override():
         ("MINER_SIM", "0.75"),
         ("MINER_BATCH", "9"),
         ("LAYA_DEVICE", "cuda"),
+        # JEB-1623. A compose copy above the free tier's 20 would spend the
+        # bucket the code deliberately stops short of.
+        ("TEACHER_DAILY_CAP", "20"),
+        ("CHAT_RATE_LIMIT", "200"),
     ],
 )
 def test_a_drifted_compose_default_fails(name, drifted):

@@ -25,10 +25,14 @@ const ENGINE_CLASSES = { laya: 'badge-laya', gemini: 'badge-gemini', button: 'ba
    «модель не поняла команду». Ключ приходит в `teacher_status` (null на любом
    обычном ответе); по тексту реплики отличать нельзя — первая же правка
    копирайта или локализация сломала бы это молча. */
-const STATUS_LABELS = { quota_exhausted: 'квота исчерпана' };
-const STATUS_CLASSES = { quota_exhausted: 'badge-quota' };
+const STATUS_LABELS = { quota_exhausted: 'квота исчерпана', daily_cap: 'лимит на сегодня' };
+const STATUS_CLASSES = { quota_exhausted: 'badge-quota', daily_cap: 'badge-quota' };
 const STATUS_TITLES = {
   quota_exhausted: 'Учитель не ответил: исчерпана квота Gemini. Это не «робот не понял».',
+  /* JEB-1623. Не 429: мы сами остановились на TEACHER_DAILY_CAP, не доходя до
+     потолка тира, поэтому и ключ отдельный. Значок тот же — снаружи это одно и
+     то же «учителя сегодня нет», — а подпись говорит, кто именно остановил. */
+  daily_cap: 'Учитель выключен до утра: исчерпан дневной лимит вызовов (TEACHER_DAILY_CAP).',
 };
 
 /* ─── Индикаторы ────────────────────────────────────────────────────────── */
