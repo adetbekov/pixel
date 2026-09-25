@@ -7,12 +7,14 @@ stage already exist here as stubs so the stage-1 frontend is complete.
 
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import time
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, StringConstraints
 
 from . import db, feedback
@@ -22,8 +24,9 @@ from .brain.router import RouterHit, route
 from .brain.skill import load_skills, parse_skill
 from .metrics import collect as collect_metrics
 from .miner import mine_once, mining_due, request_mine
+from .ratelimit import RateLimiter, chat_limiter, client_key, mine_limiter
 from .state import apply_actions, iso, read_state, utcnow
-from .teacher import get_teacher, log_case
+from .teacher import cap_result, get_teacher, log_case, teacher_budget_exhausted
 
 router = APIRouter(prefix="/api")
 
@@ -71,6 +74,47 @@ MISS_PLAN: list[dict[str, Any]] = [
 ]
 
 
+#: The header `POST /api/mine` wants when `MINE_REQUIRE_TOKEN` is set.
+ADMIN_HEADER = "X-Pixel-Admin"
+
+
+def enforce_rate_limit(request: Request, limiter: RateLimiter) -> None:
+    """`429` before anything expensive, or nothing at all.
+
+    Called first in the handler on purpose: past this point `/api/chat` takes the
+    engine's single lock and may spend a unit of a 20-a-day Gemini bucket, and
+    `/api/mine` spends several. `Retry-After` is the seconds until the window's
+    oldest hit expires, so a client that honours it comes back exactly when a
+    slot exists.
+    """
+    retry_after = limiter.take(client_key(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="too many requests",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def enforce_admin_token(request: Request) -> None:
+    """Gate `POST /api/mine` behind a shared secret — when one is configured.
+
+    Unset is the supported default: local runs, CI and the skills panel's own
+    "mine now" button all work exactly as before. Set it on a deployment that is
+    reachable from the internet, where this endpoint is the most expensive thing
+    on offer and the one no visitor has any use for.
+
+    `compare_digest` rather than `==`: the comparison is over a secret, and a
+    cheap constant-time one costs nothing here.
+    """
+    expected = os.environ.get("MINE_REQUIRE_TOKEN", "")
+    if not expected:
+        return
+    supplied = request.headers.get(ADMIN_HEADER, "")
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=403, detail="mining requires an admin token")
+
+
 class StateOut(BaseModel):
     mood: float
     energy: float
@@ -92,9 +136,11 @@ class Reply(BaseModel):
     confidence: float | None
     latency_ms: int
     state: StateOut
-    #: Why the teacher did not answer, when it did not — `"quota_exhausted"` is
-    #: the only value today (`backend.teacher.client.QUOTA_STATUS`). `None` on
-    #: every ordinary reply, and additive with a default, so a client written
+    #: Why the teacher did not answer, when it did not. Two values today:
+    #: `"quota_exhausted"` — Google refused with a 429
+    #: (`backend.teacher.client.QUOTA_STATUS`) — and `"daily_cap"` — we stopped
+    #: short of its ceiling ourselves (`backend.teacher.budget.CAP_STATUS`).
+    #: `None` on every ordinary reply, and additive with a default, so a client written
     #: before this field keeps working and one written after it can tell a
     #: quota outage from "the model did not understand" without matching on the
     #: reply text. `engine` stays `"gemini"`: the miss was still routed to the
@@ -320,7 +366,7 @@ def post_action(payload: ActionIn) -> dict:
 
 
 @router.post("/chat", response_model=Reply)
-def post_chat(payload: ChatIn) -> dict:
+def post_chat(payload: ChatIn, request: Request) -> dict:
     """Laya first, always; Gemini only on a miss.
 
     The order is the product, not an implementation detail: asking both, or
@@ -328,6 +374,7 @@ def post_chat(payload: ChatIn) -> dict:
     learning anything. `started` is taken before the router so `latency_ms`
     covers the miss the user waited through as well as the Gemini call.
     """
+    enforce_rate_limit(request, chat_limiter)
     started = time.perf_counter()
     now = utcnow()
     try:
@@ -367,9 +414,19 @@ def post_chat(payload: ChatIn) -> dict:
             now=now,
         )
 
-    # Deliberately outside every lock: `db.lock` is not reentrant and this is a
-    # network call that can sit for the full TIMEOUT_S.
-    result = teacher.explain(payload.text, state, skills)
+    with db.lock:
+        capped = teacher_budget_exhausted(conn, now)
+
+    if capped:
+        # Today's bucket is spent, so nothing is asked and nothing is paid for.
+        # The row is still written below — a command nobody could answer is
+        # exactly what the miner wants to see, and `daily_cap` in `error` says
+        # why it went unanswered without being mistaken for a 429.
+        result = cap_result()
+    else:
+        # Deliberately outside every lock: `db.lock` is not reentrant and this is
+        # a network call that can sit for the full TIMEOUT_S.
+        result = teacher.explain(payload.text, state, skills)
     reply = execute_plan(
         user_text=payload.text,
         raw_plan=result.raw_plan,
@@ -603,13 +660,19 @@ def reject_proposal(proposal_id: str) -> dict:
 
 
 @router.post("/mine", response_model=MineOut)
-def post_mine() -> dict:
+def post_mine(request: Request) -> dict:
     """Mine now. An empty pool, or no API key, is `0` proposals — not an error.
 
     Synchronous on purpose, unlike the automatic trigger in `/api/chat`: this is
     the manual run and its caller asked for the count, so it gets the count. A
     run the worker is already doing answers `started: false` rather than queuing.
+
+    Both guards run before `mine_once`, in the order a stranger meets them: the
+    token says whether this caller may mine at all, the rate limit bounds how
+    often a caller who may still can.
     """
+    enforce_admin_token(request)
+    enforce_rate_limit(request, mine_limiter)
     result = mine_once()
     return {"started": result.started, "proposals": result.proposals}
 

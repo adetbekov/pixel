@@ -73,6 +73,39 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `MINER_MAX_ATTEMPTS` | `3` | Drafts one *identical* set of cases gets before the miner stops redrawing it and counts it as stuck. A new case in the cluster resets the budget. Floored at 1 — `0` would switch mining off entirely. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
 | `SKILL_MIN_RATED` | `5` | Ratings required before that rule applies at all. |
+| `TEACHER_DAILY_CAP` | `18` | Teacher calls allowed per free-tier bucket — a day from `07:00Z`, not a rolling 24 h. The tier gives 20; the spare two are the nightly live-contract gate's. |
+| `CHAT_RATE_LIMIT` | `20` | Requests a minute, per IP, before `POST /api/chat` answers `429` with `Retry-After`. |
+| `MINE_RATE_LIMIT` | `2` | The same for `POST /api/mine`, which costs a grouping call plus a draft per cluster. |
+| `MINE_REQUIRE_TOKEN` | — | Empty = `/api/mine` is open, which is what local runs and CI want. Set it and the request must carry the same value in an `X-Pixel-Admin` header, or it is a `403`. |
+
+## Public access — what the app defends and what it does not
+
+`https://pixel.yeldos.dev` answers without authentication: the Nginx Proxy Manager route carries no
+Access List, and adding one is the owner's job (JEB-1514). **The Access List is the real boundary.**
+Everything below is the half the app can do for itself, and it stays in force after the route is
+fixed.
+
+The cost of leaving it open is small and exact. The free tier gives **20 requests a day** per
+(project, model) for `models/gemini-2.5-flash-lite`, resetting at `07:00Z`, so twenty commands from
+a stranger switch learning off until the next morning — not "expensive", just off.
+
+* **`TEACHER_DAILY_CAP`** — teacher calls per bucket, counted over `teacher_log` joined to
+  `interactions.ts` from the last `07:00Z`. A bucket, deliberately not a rolling 24 h: the rolling
+  number read `38` against a ceiling of `20` in JEB-1600, because it spans two buckets. Past the cap
+  Pixel answers «На сегодня я больше не могу учиться — давай продолжим завтра», the reply carries
+  `teacher_status: "daily_cap"`, and the `teacher_log` row's `error` names `daily_cap` — distinct
+  from a `429` (`quota_exhausted`) and from a plan that failed to parse.
+* **`CHAT_RATE_LIMIT` / `MINE_RATE_LIMIT`** — a per-IP sliding minute, checked before the engine is
+  touched, so a burst never reaches the single `LayaEngine._lock`. Over the limit is `429` plus
+  `Retry-After`. The key is the first hop of `X-Forwarded-For` (behind the proxy the socket is always
+  the proxy) with `request.client.host` as the fallback. The window lives in the process — there is
+  exactly one worker, so Redis would buy nothing.
+* **`MINE_REQUIRE_TOKEN`** — `/api/mine` is the most expensive endpoint and the only one a visitor
+  has no use for. Set the variable and the caller needs `X-Pixel-Admin: <value>`; leave it unset and
+  nothing changes.
+
+None of this authenticates anybody: `X-Forwarded-For` is client-controlled, so the rate limit is a
+brake on accidental hammering rather than a defence against someone who means it.
 
 ## The fast path
 

@@ -5,9 +5,26 @@ from backend.brain.engine import set_engine
 from backend.brain.skill import seed_db
 from backend.miner import set_generator, stop_worker
 from backend.miner.generate import GeminiSkillGenerator
+from backend.ratelimit import chat_limiter, mine_limiter
 from backend.teacher import GeminiTeacher, set_teacher
 
 from .fakes import FakeEngine, FakeGeminiClient
+
+
+@pytest.fixture(autouse=True)
+def rate_limits():
+    """Every test starts with an empty rate-limit window.
+
+    The limiters are module-level by design — the window has to outlive a single
+    request — and `httpx.ASGITransport` gives every test the same client address,
+    so without this one test's chat requests count against the next one's. That
+    failure would be a suite-order-dependent 429 in a test about something else.
+    """
+    chat_limiter.reset()
+    mine_limiter.reset()
+    yield
+    chat_limiter.reset()
+    mine_limiter.reset()
 
 
 @pytest.fixture()
