@@ -22,6 +22,16 @@ _WORKFLOWS = _ROOT / ".github" / "workflows"
 _AUDIT = _WORKFLOWS / "required-checks-audit.yml"
 
 
+def _workflow_files() -> list[Path]:
+    """Every workflow file in the repo, both extensions GitHub accepts.
+
+    Globbing `*.yml` alone would silently stop covering the day someone adds a
+    `.yaml` workflow, which is exactly the blind spot the "nothing anywhere
+    produces this context" guard cannot afford (JEB-1639).
+    """
+    return sorted(p for p in _WORKFLOWS.iterdir() if p.suffix in {".yml", ".yaml"})
+
+
 def _load():
     """Import the script by path — `scripts/` is not an importable package."""
     spec = importlib.util.spec_from_file_location("assert_required_checks", _SCRIPT)
@@ -218,10 +228,10 @@ def test_external_status_is_never_used_for_a_workflow_job(branch):
     context that IS a job `name:` would retire the rename detection that is
     assertion 2's entire purpose, and it would do so silently. Every workflow in
     the repo is searched, not just the one an entry names — the point is that no
-    file anywhere produces the context.
+    file anywhere produces the context, so `.yaml` counts as much as `.yml`.
     """
     job_names: set[str] = set()
-    for path in _WORKFLOWS.glob("*.yml"):
+    for path in _workflow_files():
         names, unresolved = arc.job_display_names(arc.parse_workflow(path.read_text()))
         job_names |= names | unresolved
     for context, producer in arc.REQUIRED_CONTEXTS[branch].items():
@@ -274,6 +284,54 @@ def test_external_status_never_resolves_a_workflow_file(monkeypatch, tmp_path):
 def test_external_status_producers_are_not_fetched_as_workflow_files():
     """`sorted()` over a mixed set would raise; the sentinel is filtered out."""
     assert arc.workflow_producers(EXTERNAL_MAP) == {"ci.yml"}
+
+
+def test_ok_line_does_not_claim_the_skipped_assertions_for_external_status():
+    """The one line a human reads must not cover contexts it skipped (JEB-1639).
+
+    Assertions 2 and 4 never ran for an EXTERNAL_STATUS entry, so a success line
+    claiming them for every asserted context is false about the exact entry the
+    audit exists to speak for. Pinned here because the next repo to take this
+    script copies the sentence along with it.
+    """
+    line = arc.ok_line(dict(EXTERNAL_MAP), "dev")
+    assert line.startswith("OK: all 3 asserted contexts are required on dev")
+    # Both skipped assertions are scoped to the 2 workflow-backed contexts...
+    assert "the 2 produced by a workflow job match their job names" in line
+    assert "reachable by a trigger that fires for PRs into dev" in line
+    # ...and the membership-only entry is counted, not folded into them.
+    assert "1 is EXTERNAL_STATUS" in line
+    assert "membership only" in line
+    assert "dev requires nothing this script does not assert." in line
+
+
+def test_ok_line_pluralises_several_external_status_entries():
+    asserted = {**EXTERNAL_MAP, "mirror synced": arc.EXTERNAL_STATUS}
+    line = arc.ok_line(asserted, "dev")
+    assert "all 4 asserted contexts" in line
+    assert "the 2 produced by a workflow job" in line
+    assert "2 are EXTERNAL_STATUS" in line
+
+
+def test_ok_line_is_unchanged_when_nothing_is_membership_only():
+    """No sentinel in the map, no caveat — assertions 2 and 4 really did run."""
+    line = arc.ok_line(dict(MAP), "main")
+    assert line == (
+        "OK: all 2 asserted contexts are required on main, their context strings "
+        "match their job names, every one of them is reachable by a trigger that "
+        "fires for PRs into main, and main requires nothing this script does not assert."
+    )
+    assert "EXTERNAL_STATUS" not in line
+
+
+def test_live_dev_ok_line_reflects_the_real_map():
+    """Guards the counts against a future map edit, not just the fixtures."""
+    line = arc.ok_line(arc.REQUIRED_CONTEXTS["dev"], "dev")
+    external = sum(
+        1 for p in arc.REQUIRED_CONTEXTS["dev"].values() if p is arc.EXTERNAL_STATUS
+    )
+    assert external, "dev's map lost its EXTERNAL_STATUS entry — see JEB-1596"
+    assert f"{external} {'is' if external == 1 else 'are'} EXTERNAL_STATUS" in line
 
 
 def test_external_status_is_not_a_string():
