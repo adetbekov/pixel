@@ -106,12 +106,19 @@ def enforce_admin_token(request: Request) -> None:
 
     `compare_digest` rather than `==`: the comparison is over a secret, and a
     cheap constant-time one costs nothing here.
+
+    Compared as bytes, not as `str`: `compare_digest` on `str` refuses anything
+    non-ASCII with a `TypeError`, and Starlette hands header values over decoded
+    as `latin-1` — so a `X-Pixel-Admin: тест` crashed the guard into a `500`
+    instead of refusing it with a `403`. Re-encoding the header with `latin-1`
+    recovers the exact bytes that arrived on the wire, which is what a UTF-8
+    secret from the environment has to be compared against.
     """
     expected = os.environ.get("MINE_REQUIRE_TOKEN", "")
     if not expected:
         return
-    supplied = request.headers.get(ADMIN_HEADER, "")
-    if not hmac.compare_digest(supplied, expected):
+    supplied = request.headers.get(ADMIN_HEADER, "").encode("latin-1", "replace")
+    if not hmac.compare_digest(supplied, expected.encode("utf-8", "surrogateescape")):
         raise HTTPException(status_code=403, detail="mining requires an admin token")
 
 

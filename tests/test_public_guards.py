@@ -236,6 +236,30 @@ async def test_mine_with_the_right_header_runs(client, seeded, monkeypatch):
     assert response.status_code == 200
 
 
+@pytest.mark.anyio
+async def test_a_non_latin_header_is_refused_not_crashed(client, seeded, monkeypatch):
+    """JEB-1624: `compare_digest` on `str` raises on anything non-ASCII.
+
+    The endpoint is public and unauthenticated, so any visitor could turn the
+    guard into a `500` by sending a header the guard was supposed to just refuse.
+    """
+    monkeypatch.setenv("MINE_REQUIRE_TOKEN", "s3cret")
+    response = await client.post("/api/mine", headers={ADMIN_HEADER: "тест".encode()})
+    assert response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_a_non_latin_secret_still_lets_the_right_header_through(
+    client, seeded, monkeypatch
+):
+    # The same trap from the other side: a non-latin MINE_REQUIRE_TOKEN used to
+    # make *every* request a 500, the correct one included.
+    monkeypatch.setenv("MINE_REQUIRE_TOKEN", "секрет")
+    assert (await client.post("/api/mine", headers={ADMIN_HEADER: "секрет".encode()})).status_code == 200
+    wrong = await client.post("/api/mine", headers={ADMIN_HEADER: "пароль".encode()})
+    assert wrong.status_code == 403
+
+
 # --- the daily teacher cap ---------------------------------------------------
 
 
