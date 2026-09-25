@@ -40,6 +40,23 @@ Single-link on a threshold is exactly "connected components of the graph where
 an edge means ``cos >= MINER_SIM``", so that is how it is computed — a union-find
 over an ``n x n`` matrix. The pool is tens of rows; O(n^2) is the cheap option
 here, and sklearn is a very large dependency for thirty lines of numpy.
+
+**Nor can a pairwise ``noul`` question carry a merge pass over Gemini's groups**
+(JEB-1593, same checkpoint). The idea is better shaped than the cosine — a
+binary "these two ask for the same thing?" on a *pair*, which is what Laya is
+good at, over the few group pairs inside one window rather than all command
+pairs — and it fails in the same place. Measured over all 300 labelled pairs of
+five single-intent pools (50 same-intent, 250 across), three question wordings:
+the two populations overlap so hard that the best threshold on the best wording
+keeps 0.48 of the same-intent pairs while dropping 0.84 of the others, and the
+highest-scoring pair of all is "сальто сделай мне" / "обними меня" at 0.986 —
+above the median same-intent pair. The other two wordings ("one skill can do
+both", "the second is a rephrasing of the first") reach 0.72/0.49 and 0.64/0.70.
+Cost, for completeness, since it is not free either: :meth:`DecisionEngine.ask`
+batches questions about **one** input, so a pair is its own ``predict`` — 195-232
+ms each under ``LayaEngine._lock``, which is C(groups, 2) of them per run in
+front of every waiting chat (JEB-1599). So the grouping rule lives in the prompt
+(:mod:`backend.miner.generate`) and there is no second pass.
 """
 
 from __future__ import annotations

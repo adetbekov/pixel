@@ -153,11 +153,29 @@ def _mine() -> int:
         rejected = _rejected_signatures(conn)
 
     if len(cases) < min_cluster_size():
+        # Silent until JEB-1593, like the per-cluster bar below: the two of them
+        # are how almost every zero-proposal run ends, and neither left a trace.
+        log.info(
+            "miner: the pool holds %d cases, fewer than MINER_MIN_CLUSTER (%d)",
+            len(cases),
+            min_cluster_size(),
+        )
         return 0
 
     groups = group_texts(engine, [case.user_text for case in cases], generator.group)
     clusters = [[cases[index] for index in group] for group in groups]
     signatures = [tuple(sorted(case.id for case in cluster)) for cluster in clusters]
+
+    # One line that answers "did the miner work at all" before any per-cluster
+    # verdict: how the grouper cut the window, and how big the pieces are
+    # (JEB-1593). A run where every size is under `MINER_MIN_CLUSTER` is the
+    # defect that looked like silence, and it is visible here in one read.
+    log.info(
+        "miner: the grouper returned %d groups of sizes %s from %d cases",
+        len(clusters),
+        [len(cluster) for cluster in clusters],
+        len(cases),
+    )
 
     # The ledger is pruned against *this run's* grouping, not just against the
     # pool, so a signature a larger cluster has grown past stops being counted as
@@ -258,7 +276,17 @@ def _worth_drafting(
     arrive, so reading size alone called both of them claimable and re-opened
     JEB-1548 for the two kinds of cluster already known to be unlearnable.
     """
-    if len(cluster) < min_cluster_size():
+    minimum = min_cluster_size()
+    if len(cluster) < minimum:
+        # The branch that used to say nothing, and the commonest way a run ends
+        # at `{"started": true, "proposals": 0}`: an empty log there reads as a
+        # broken miner rather than as a pool that has not ripened (JEB-1593).
+        log.info(
+            "miner: cluster %s is smaller than MINER_MIN_CLUSTER (%d < %d)",
+            list(signature),
+            len(cluster),
+            minimum,
+        )
         return False
 
     if signature in rejected:

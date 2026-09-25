@@ -172,16 +172,44 @@ def test_an_old_db_gains_the_generalization_column(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_a_cluster_of_two_is_not_proposed(client, seeded, miner_engine, generator):
+async def test_a_cluster_of_two_is_not_proposed(client, seeded, miner_engine, generator, caplog):
     generator(draft_json())
     fill_pool(seeded, TRICK_COMMANDS[:2])
 
-    assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+    with caplog.at_level("INFO", logger="backend.miner.run"):
+        assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
     assert (await client.get("/api/proposals")).json() == []
     # And the cases stay in the pool — they ripen when more arrive.
     assert (
         seeded.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0").fetchone()["n"] == 2
     )
+    # Said out loud, because this is the commonest way a run ends at zero and an
+    # empty log is indistinguishable from a broken miner (JEB-1593).
+    assert "the pool holds 2 cases, fewer than MINER_MIN_CLUSTER (3)" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_a_pool_the_grouper_split_too_small_says_so(
+    client, seeded, miner_engine, generator, caplog
+):
+    """The JEB-1593 shape: enough cases, and every group under the bar.
+
+    Measured on the live grouper, "сделай сальто" / "умеешь сальто?" / "сальто
+    назад" came back as three groups of 2, 2 and 1 — a run that answers
+    `{"started": true, "proposals": 0}`, writes nothing to the log, and cannot be
+    told apart from a draft that was rejected.
+    """
+    generator(draft_json(), grouping=[[0, 1], [2, 3], [4]])
+    fill_pool(seeded)
+
+    with caplog.at_level("INFO", logger="backend.miner.run"):
+        assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+    ids = [row["id"] for row in seeded.execute("SELECT id FROM teacher_log ORDER BY id")]
+    # The shape of the run first, so "did the grouper work at all" is one read,
+    # then the per-cluster verdicts.
+    assert "the grouper returned 3 groups of sizes [2, 2, 1] from 5 cases" in caplog.text
+    assert f"cluster {[ids[0], ids[1]]} is smaller than MINER_MIN_CLUSTER (2 < 3)" in caplog.text
+    assert f"cluster {[ids[4]]} is smaller than MINER_MIN_CLUSTER (1 < 3)" in caplog.text
 
 
 @pytest.mark.anyio
