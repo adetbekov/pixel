@@ -7,12 +7,14 @@ stage already exist here as stubs so the stage-1 frontend is complete.
 
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import time
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, StringConstraints
 
 from . import db, feedback
@@ -21,9 +23,10 @@ from .brain.engine import get_engine
 from .brain.router import RouterHit, route
 from .brain.skill import load_skills, parse_skill
 from .metrics import collect as collect_metrics
-from .miner import mine_once, mining_due
+from .miner import mine_once, mining_due, request_mine
+from .ratelimit import RateLimiter, chat_limiter, client_key, mine_limiter
 from .state import apply_actions, iso, read_state, utcnow
-from .teacher import get_teacher, log_case
+from .teacher import cap_result, get_teacher, log_case, teacher_budget_exhausted
 
 router = APIRouter(prefix="/api")
 
@@ -71,6 +74,54 @@ MISS_PLAN: list[dict[str, Any]] = [
 ]
 
 
+#: The header `POST /api/mine` wants when `MINE_REQUIRE_TOKEN` is set.
+ADMIN_HEADER = "X-Pixel-Admin"
+
+
+def enforce_rate_limit(request: Request, limiter: RateLimiter) -> None:
+    """`429` before anything expensive, or nothing at all.
+
+    Called first in the handler on purpose: past this point `/api/chat` takes the
+    engine's single lock and may spend a unit of a 20-a-day Gemini bucket, and
+    `/api/mine` spends several. `Retry-After` is the seconds until the window's
+    oldest hit expires, so a client that honours it comes back exactly when a
+    slot exists.
+    """
+    retry_after = limiter.take(client_key(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="too many requests",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def enforce_admin_token(request: Request) -> None:
+    """Gate `POST /api/mine` behind a shared secret — when one is configured.
+
+    Unset is the supported default: local runs, CI and the skills panel's own
+    "mine now" button all work exactly as before. Set it on a deployment that is
+    reachable from the internet, where this endpoint is the most expensive thing
+    on offer and the one no visitor has any use for.
+
+    `compare_digest` rather than `==`: the comparison is over a secret, and a
+    cheap constant-time one costs nothing here.
+
+    Compared as bytes, not as `str`: `compare_digest` on `str` refuses anything
+    non-ASCII with a `TypeError`, and Starlette hands header values over decoded
+    as `latin-1` — so a `X-Pixel-Admin: тест` crashed the guard into a `500`
+    instead of refusing it with a `403`. Re-encoding the header with `latin-1`
+    recovers the exact bytes that arrived on the wire, which is what a UTF-8
+    secret from the environment has to be compared against.
+    """
+    expected = os.environ.get("MINE_REQUIRE_TOKEN", "")
+    if not expected:
+        return
+    supplied = request.headers.get(ADMIN_HEADER, "").encode("latin-1", "replace")
+    if not hmac.compare_digest(supplied, expected.encode("utf-8", "surrogateescape")):
+        raise HTTPException(status_code=403, detail="mining requires an admin token")
+
+
 class StateOut(BaseModel):
     mood: float
     energy: float
@@ -92,6 +143,16 @@ class Reply(BaseModel):
     confidence: float | None
     latency_ms: int
     state: StateOut
+    #: Why the teacher did not answer, when it did not. Two values today:
+    #: `"quota_exhausted"` — Google refused with a 429
+    #: (`backend.teacher.client.QUOTA_STATUS`) — and `"daily_cap"` — we stopped
+    #: short of its ceiling ourselves (`backend.teacher.budget.CAP_STATUS`).
+    #: `None` on every ordinary reply, and additive with a default, so a client written
+    #: before this field keeps working and one written after it can tell a
+    #: quota outage from "the model did not understand" without matching on the
+    #: reply text. `engine` stays `"gemini"`: the miss was still routed to the
+    #: teacher, and the metrics count it there (JEB-1603).
+    teacher_status: str | None = None
 
 
 class ChatIn(BaseModel):
@@ -147,6 +208,9 @@ class HistoryItem(BaseModel):
     confidence: float | None = None
     latency_ms: int = 0
     feedback: int | None = None
+    #: The same flag as on `Reply`, so a reloaded chat redraws the quota bubble
+    #: the way it was first shown instead of silently downgrading it.
+    teacher_status: str | None = None
 
 
 class Proposal(BaseModel):
@@ -166,6 +230,9 @@ class Proposal(BaseModel):
 
 class Metrics(BaseModel):
     laya_share: float
+    #: Average latency per path over the **last 24h**, like every other windowed
+    #: field here — a lifetime average keeps showing a fixed timeout bug for
+    #: weeks after the fix (JEB-1574). `0.0` when the window holds no such call.
     avg_latency_laya_ms: float
     avg_latency_gemini_ms: float
     skills_active: int
@@ -182,6 +249,11 @@ class Metrics(BaseModel):
     laya_share_24h: float = 0.0
     gemini_calls_24h: int = 0
     skills_disabled: int = 0
+    #: Case sets the miner has stopped redrawing after `MINER_MAX_ATTEMPTS`
+    #: refused drafts (JEB-1579). It is the one number here that is about
+    #: learning failing rather than learning working, so the panel only shows it
+    #: when it is non-zero.
+    clusters_stuck: int = 0
 
 
 def _log_interaction(
@@ -194,12 +266,13 @@ def _log_interaction(
     latency_ms: int,
     actions: list[Action],
     reply_text: str,
+    teacher_status: str | None = None,
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO interactions"
         " (ts, user_text, engine, skill_id, confidence, latency_ms, actions_json, reply_text,"
-        "  feedback)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        "  feedback, teacher_status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         (
             iso(utcnow()),
             user_text,
@@ -209,6 +282,7 @@ def _log_interaction(
             latency_ms,
             json.dumps([a.to_dict() for a in actions], ensure_ascii=False),
             reply_text,
+            teacher_status,
         ),
     )
     conn.commit()
@@ -231,6 +305,7 @@ def execute_plan(
     skill_id: str | None = None,
     confidence: float | None = None,
     fallback_reply: str = "Готово!",
+    teacher_status: str | None = None,
     now: datetime | None = None,
 ) -> dict:
     """The single execution path: validate, apply, log, and shape a ``Reply``.
@@ -257,6 +332,7 @@ def execute_plan(
             latency_ms=latency_ms,
             actions=actions,
             reply_text=reply,
+            teacher_status=teacher_status,
         )
     return {
         "interaction_id": interaction_id,
@@ -267,6 +343,7 @@ def execute_plan(
         "confidence": confidence,
         "latency_ms": latency_ms,
         "state": state.to_dict(),
+        "teacher_status": teacher_status,
     }
 
 
@@ -299,7 +376,7 @@ def post_action(payload: ActionIn) -> dict:
 
 
 @router.post("/chat", response_model=Reply)
-def post_chat(payload: ChatIn) -> dict:
+def post_chat(payload: ChatIn, request: Request) -> dict:
     """Laya first, always; Gemini only on a miss.
 
     The order is the product, not an implementation detail: asking both, or
@@ -307,6 +384,7 @@ def post_chat(payload: ChatIn) -> dict:
     learning anything. `started` is taken before the router so `latency_ms`
     covers the miss the user waited through as well as the Gemini call.
     """
+    enforce_rate_limit(request, chat_limiter)
     started = time.perf_counter()
     now = utcnow()
     try:
@@ -346,9 +424,19 @@ def post_chat(payload: ChatIn) -> dict:
             now=now,
         )
 
-    # Deliberately outside every lock: `db.lock` is not reentrant and this is a
-    # network call that can sit for the full TIMEOUT_S.
-    result = teacher.explain(payload.text, state, skills)
+    with db.lock:
+        capped = teacher_budget_exhausted(conn, now)
+
+    if capped:
+        # Today's bucket is spent, so nothing is asked and nothing is paid for.
+        # The row is still written below — a command nobody could answer is
+        # exactly what the miner wants to see, and `daily_cap` in `error` says
+        # why it went unanswered without being mistaken for a 429.
+        result = cap_result()
+    else:
+        # Deliberately outside every lock: `db.lock` is not reentrant and this is
+        # a network call that can sit for the full TIMEOUT_S.
+        result = teacher.explain(payload.text, state, skills)
     reply = execute_plan(
         user_text=payload.text,
         raw_plan=result.raw_plan,
@@ -356,6 +444,7 @@ def post_chat(payload: ChatIn) -> dict:
         started=started,
         confidence=outcome.confidence,
         fallback_reply=result.reply,
+        teacher_status=result.teacher_status,
         now=now,
     )
 
@@ -377,11 +466,14 @@ def post_chat(payload: ChatIn) -> dict:
         # refusal. See `mining_due`.
         due = mining_due(conn, case_id)
 
-    # Every MINER_BATCH-th mineable miss, the miner runs before this response
-    # returns. It is seconds on a pool this size, and the user who just taught
-    # Pixel something is the one most likely to be looking at the skills panel.
+    # Every MINER_BATCH-th mineable miss asks for a mining run — and does not
+    # wait for it. A run is one Gemini grouping call, a draft per cluster and a
+    # backtest behind the engine lock: seconds, and they used to be added to
+    # this response. The worker owns them now (`backend/miner/worker.py`); the
+    # proposal shows up in the skills panel a few seconds after the answer
+    # instead of before it.
     if due:
-        mine_once()
+        request_mine()
     return reply
 
 
@@ -415,7 +507,7 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
     with db.lock:
         rows = conn.execute(
             "SELECT id, user_text, reply_text, engine, skill_id, confidence, latency_ms,"
-            " feedback FROM interactions ORDER BY id DESC LIMIT ?",
+            " feedback, teacher_status FROM interactions ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [
@@ -428,6 +520,7 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
             "confidence": row["confidence"],
             "latency_ms": row["latency_ms"],
             "feedback": row["feedback"],
+            "teacher_status": row["teacher_status"],
         }
         for row in reversed(rows)
     ]
@@ -577,8 +670,19 @@ def reject_proposal(proposal_id: str) -> dict:
 
 
 @router.post("/mine", response_model=MineOut)
-def post_mine() -> dict:
-    """Mine now. An empty pool, or no API key, is `0` proposals — not an error."""
+def post_mine(request: Request) -> dict:
+    """Mine now. An empty pool, or no API key, is `0` proposals — not an error.
+
+    Synchronous on purpose, unlike the automatic trigger in `/api/chat`: this is
+    the manual run and its caller asked for the count, so it gets the count. A
+    run the worker is already doing answers `started: false` rather than queuing.
+
+    Both guards run before `mine_once`, in the order a stranger meets them: the
+    token says whether this caller may mine at all, the rate limit bounds how
+    often a caller who may still can.
+    """
+    enforce_admin_token(request)
+    enforce_rate_limit(request, mine_limiter)
     result = mine_once()
     return {"started": result.started, "proposals": result.proposals}
 

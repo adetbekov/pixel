@@ -4,11 +4,28 @@ This is the offline half of the teacher/miner split. Nobody waits on this call:
 it runs after the fact, once per cluster, and what it produces is a *schema*
 that will route thousands of later commands.
 
-The model is ``models/gemini-2.5-flash-lite`` ($0.30 / $2.50 per 1M) — the same
-cheap tier the receipt parser runs on, so its bill is known. Overridable with
-``GEMINI_MINER_MODEL``: if a noticeable share of drafts dies on the ``Skill``
-validation below, raise the model through the env var rather than loosening the
-validation.
+The model is ``models/gemini-3.5-flash`` — deliberately *not* the teacher's
+``models/gemini-2.5-flash-lite``. A free-tier quota bucket is counted per
+(project, model) pair, and this project's ``GEMINI_API_KEY`` is shared with the
+four ``warmplace`` containers, which all call ``gemini-2.5-flash``. Put the
+miner on the teacher's model and both halves eat one 20-requests-a-day bucket:
+the miner starves, :meth:`GeminiSkillGenerator.propose` returns ``None``
+silently, and the teacher's misses surface as the opaque ``FALLBACK`` "я не
+понял, научи меня по-другому" (JEB-1600). Keeping the two on different models is
+what makes the free tier workable here — do not "simplify" the miner back onto
+the teacher's model.
+
+Its price is **not measured**: no tariff for ``gemini-3.5-flash`` was checked
+when it was picked. Acceptable for now because the miner is offline and spends
+~3 calls per pass, not one per user message; measure before this call shape
+moves anywhere near the request path. A floating alias such as
+``gemini-flash-latest`` is not a substitute — it resolved to
+``gemini-3.8-flash`` on 2026-09-24 and can move buckets again with no commit
+here.
+
+Overridable with ``GEMINI_MINER_MODEL``: if a noticeable share of drafts dies on
+the ``Skill`` validation below, raise the model through the env var rather than
+loosening the validation — but keep it off the teacher's model.
 
 Like the teacher, this never raises at the caller: a bad draft costs one retry
 and then the cluster is left in the pool for the next run.
@@ -41,7 +58,9 @@ from .schema import MAX_DESCRIPTION_LEN, MAX_RULES, Grouping, SkillDraft
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "models/gemini-2.5-flash-lite"
+#: Must stay different from `teacher.client.DEFAULT_MODEL` — see the module
+#: docstring: the free-tier quota bucket is per (project, model).
+DEFAULT_MODEL = "models/gemini-3.5-flash"
 
 TIMEOUT_S = 30.0
 
@@ -113,16 +132,22 @@ SYSTEM_PROMPT = f"""Ты — конструктор навыков для роб
 #: The last paragraph is not decoration (JEB-1593). Without it the model splits
 #: one intent by the *form* of the phrase — imperatives in one group, questions
 #: in another — and every piece can land under ``MINER_MIN_CLUSTER``, so the run
-#: mines nothing and says nothing. Measured on ``models/gemini-2.5-flash-lite``,
-#: five mixed-form pools x 3 runs (``scripts/calibrate_miner_sim.py``, section 7):
-#: whole intent in one group 0/15 -> 14/15, cases mined 48/75 -> 73/75. On the
-#: mixed probe of section 5 (45 simulated pools) the same line moves purity
-#: 0.885 -> 0.826 and recall 0.873 -> 0.899, both inside that probe's noise
-#: (~0.04 s.e.) — it buys the split case and costs nothing measurable elsewhere.
-#: A merge pass over the returned groups was measured instead and dropped: asked
-#: to merge its own answer the model keeps it (3/3 runs unchanged on the
-#: "сальто" pool) unless the same rule is repeated in the merge prompt, and then
-#: it still recovers 4 of the 5 cases — for one extra Gemini call per run.
+#: mines nothing and says nothing. Measured on five mixed-form pools
+#: (``scripts/calibrate_miner_sim.py``, section 7): on
+#: ``models/gemini-2.5-flash-lite``, 3 runs each, whole intent in one group
+#: 0/15 -> 14/15 and cases mined 48/75 -> 73/75; re-checked on the model this
+#: module actually calls, ``models/gemini-3.5-flash``, 1 run each, 1/5 -> 5/5 and
+#: 14/25 -> 25/25. On the mixed probe of section 5 (45 simulated pools) the same
+#: line moves purity 0.885 -> 0.826 and recall 0.873 -> 0.899, both inside that
+#: probe's noise (~0.04 s.e.) — it buys the split case and costs nothing
+#: measurable elsewhere.
+#:
+#: Merging the returned groups in a second pass was measured instead, twice, and
+#: dropped both times. Asked to merge its own answer Gemini keeps it (3/3 runs
+#: unchanged on the "сальто" pool) unless the same rule is repeated in the merge
+#: prompt, and then it still recovers 4 of the 5 cases — for one extra call per
+#: run. The local ``noul`` variant does not separate the two populations at all:
+#: see :mod:`backend.miner.cluster`.
 GROUP_SYSTEM_PROMPT = """Ты группируешь команды пользователя по смыслу.
 
 Тебе дают пронумерованный список команд. Верни группы номеров: в одной группе — команды, \
@@ -192,7 +217,8 @@ class GeminiSkillGenerator:
 
         Not ``interactions.create``, which is what this used to call — the same
         move the teacher made in JEB-1513, for the same measured reason: on
-        ``models/gemini-2.5-flash-lite`` that call shape ignores
+        ``models/gemini-2.5-flash-lite`` (what the miner ran on then) that call
+        shape ignores
         ``response_format`` and answers inside a ```` ```json ```` fence, which
         :func:`_parse` rejects on both attempts. Offline, that failure is
         *silent*: :meth:`propose` returns ``None``, the cluster goes back in the

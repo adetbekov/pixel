@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS skill_proposals (
     status TEXT,
     created_at TEXT
 );
+
+-- One row per set of cases the miner has drafted and the backtest has refused,
+-- so the same refusal stops costing a Gemini draft on every run and a cluster
+-- that is failing is distinguishable from one that is still ripening. The
+-- ledger is `backend/miner/attempts.py`; `signature` is the cluster's sorted
+-- `teacher_log` ids, the same shape as `skill_proposals.sample_ids`.
+CREATE TABLE IF NOT EXISTS mining_attempts (
+    signature TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_reason TEXT,
+    last_at TEXT
+);
 """
 
 #: Columns added after the schema above was frozen, as ``table -> column -> type``.
@@ -87,6 +99,15 @@ MIGRATIONS: dict[str, dict[str, str]] = {
     # the one number it has rather than inventing a zero (JEB-1581).
     "skill_proposals": {
         "generalization": "REAL",
+    },
+    # Why the teacher did not answer, when it did not — `"quota_exhausted"` is
+    # the only value today. `engine` says who was *asked*, and on a quota outage
+    # that is still `gemini`, so it cannot also say the answer came from nobody.
+    # NULL on every ordinary reply and on every row written before this column
+    # existed, which is exactly what `/api/history` then returns for them, so an
+    # old `pixel.db` redraws as it always did (JEB-1603).
+    "interactions": {
+        "teacher_status": "TEXT",
     },
 }
 

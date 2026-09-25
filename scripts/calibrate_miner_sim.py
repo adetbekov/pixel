@@ -431,16 +431,24 @@ def report_mixed_form(engine, runs: int = 3) -> None:
     `MINER_MIN_CLUSTER` and the run mines nothing. Here each pool is one intent,
     so any group but a single one of five is that split.
 
-    Measured on `models/gemini-2.5-flash-lite`, 5 pools x 3 runs, before and
-    after the last paragraph of `GROUP_SYSTEM_PROMPT`:
+    Measured before and after the last paragraph of `GROUP_SYSTEM_PROMPT`, on
+    both models the miner has been pointed at:
 
-        prompt              whole intent   cases mined
-        without the rule        0/15           48/75
-        with it (shipped)      14/15           73/75
+        model                      runs   prompt        whole intent   cases mined
+        gemini-2.5-flash-lite      3 ea.  without rule      0/15          48/75
+        gemini-2.5-flash-lite      3 ea.  with it          14/15          73/75
+        gemini-3.5-flash (shipped) 1 ea.  without rule       1/5           14/25
+        gemini-3.5-flash (shipped) 1 ea.  with it            5/5           25/25
 
-    The one miss was the "сальто" pool coming back 3 + 2; six further runs of
-    that pool on the shipped prompt were 5/5 every time, so it is the sampling
-    noise of a live model, not a second failure mode.
+    Fewer runs on `gemini-3.5-flash` on purpose: the free-tier quota bucket is
+    per (project, model) and the miner shares this project's key, so a probe that
+    empties it starves the real miner for the day (JEB-1600). One run per pool is
+    enough here because the failure it looks for is deterministic — the "сальто"
+    pool splits to exactly the `[[0, 4], [1, 3], [2]]` JEB-1593 reports.
+
+    The one miss on the flash-lite row was the "сальто" pool coming back 3 + 2;
+    six further runs of that pool on the shipped prompt were 5/5 every time, so
+    it is the sampling noise of a live model, not a second failure mode.
     """
     from backend.miner.cluster import group_texts
     from backend.miner.generate import build_generator

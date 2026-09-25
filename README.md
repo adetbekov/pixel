@@ -59,18 +59,53 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | --- | --- | --- |
 | `GEMINI_API_KEY` | — | Empty = teacher and miner are off. A router miss answers with a polite stub. |
 | `GEMINI_TEACHER_MODEL` | `models/gemini-2.5-flash-lite` | Model that answers router misses. |
-| `GEMINI_MINER_MODEL` | `models/gemini-2.5-flash-lite` | Model that drafts new skills, offline. |
+| `GEMINI_MINER_MODEL` | `models/gemini-3.5-flash` | Model that drafts new skills, offline. Deliberately not the teacher's model — the free-tier quota bucket is per (project, model) and the key is shared. |
 | `PIXEL_DB_PATH` | `./pixel.db` | SQLite file. |
 | `LAYA_MODEL` | `multilingual` | Laya subfolder. The English root checkpoint answers Cyrillic confidently and wrongly. |
 | `LAYA_DEVICE` | `cpu` | Where the local model runs. |
 | `PIXEL_SKIP_MODEL` | `0` | `1` = start without Laya; `/api/chat` answers 503. |
 | `ROUTER_THRESHOLD` | `0.66` | Confidence a skill needs to win the router. Below it, the command is a miss. Calibrated on the live checkpoint — see `scripts/calibrate_router.py`. |
-| `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. |
+| `MINER_BATCH` | `5` | Mine on every N-th *mineable* case — a refusal is logged but does not count. The run itself is a background thread. |
+| `MINER_POOL_WINDOW` | `40` | Newest mineable cases one run drafts from. Bounds a run's cost, which otherwise grows with the pool. |
 | `MINER_SIM` | `0.88` | Cosine that joins two commands into one cluster — the **fallback** grouper only, used when the teacher's grouping call fails. Narrow usable band; see `backend/miner/cluster.py`. |
 | `MINER_MIN_CLUSTER` | `3` | Cases below this never become a skill. |
 | `MINER_MIN_MATCH` | `0.8` | Share of its cluster an accepted skill must take off Gemini to be proposed — measured by routing every case the way `/api/chat` will after acceptance. Calibrated on the live checkpoint; see `scripts/probe_miner_match.py`. |
+| `MINER_MAX_ATTEMPTS` | `3` | Drafts one *identical* set of cases gets before the miner stops redrawing it and counts it as stuck. A new case in the cluster resets the budget. Floored at 1 — `0` would switch mining off entirely. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
 | `SKILL_MIN_RATED` | `5` | Ratings required before that rule applies at all. |
+| `TEACHER_DAILY_CAP` | `18` | Teacher calls allowed per free-tier bucket — a day from `07:00Z`, not a rolling 24 h. The tier gives 20; the spare two are the nightly live-contract gate's. |
+| `CHAT_RATE_LIMIT` | `20` | Requests a minute, per IP, before `POST /api/chat` answers `429` with `Retry-After`. |
+| `MINE_RATE_LIMIT` | `2` | The same for `POST /api/mine`, which costs a grouping call plus a draft per cluster. |
+| `MINE_REQUIRE_TOKEN` | — | Empty = `/api/mine` is open, which is what local runs and CI want. Set it and the request must carry the same value in an `X-Pixel-Admin` header, or it is a `403`. |
+
+## Public access — what the app defends and what it does not
+
+`https://pixel.yeldos.dev` answers without authentication: the Nginx Proxy Manager route carries no
+Access List, and adding one is the owner's job (JEB-1514). **The Access List is the real boundary.**
+Everything below is the half the app can do for itself, and it stays in force after the route is
+fixed.
+
+The cost of leaving it open is small and exact. The free tier gives **20 requests a day** per
+(project, model) for `models/gemini-2.5-flash-lite`, resetting at `07:00Z`, so twenty commands from
+a stranger switch learning off until the next morning — not "expensive", just off.
+
+* **`TEACHER_DAILY_CAP`** — teacher calls per bucket, counted over `teacher_log` joined to
+  `interactions.ts` from the last `07:00Z`. A bucket, deliberately not a rolling 24 h: the rolling
+  number read `38` against a ceiling of `20` in JEB-1600, because it spans two buckets. Past the cap
+  Pixel answers «На сегодня я больше не могу учиться — давай продолжим завтра», the reply carries
+  `teacher_status: "daily_cap"`, and the `teacher_log` row's `error` names `daily_cap` — distinct
+  from a `429` (`quota_exhausted`) and from a plan that failed to parse.
+* **`CHAT_RATE_LIMIT` / `MINE_RATE_LIMIT`** — a per-IP sliding minute, checked before the engine is
+  touched, so a burst never reaches the single `LayaEngine._lock`. Over the limit is `429` plus
+  `Retry-After`. The key is the first hop of `X-Forwarded-For` (behind the proxy the socket is always
+  the proxy) with `request.client.host` as the fallback. The window lives in the process — there is
+  exactly one worker, so Redis would buy nothing.
+* **`MINE_REQUIRE_TOKEN`** — `/api/mine` is the most expensive endpoint and the only one a visitor
+  has no use for. Set the variable and the caller needs `X-Pixel-Admin: <value>`; leave it unset and
+  nothing changes.
+
+None of this authenticates anybody: `X-Forwarded-For` is client-controlled, so the rate limit is a
+brake on accidental hammering rather than a defence against someone who means it.
 
 ## The fast path
 
@@ -113,6 +148,17 @@ invalid or carries a blank `reply` is retried once with the reason, and a second
 with a fixed fallback plan; a timeout or an API error does the same. The user never sees a
 traceback.
 
+**One error is never retried: `429 RESOURCE_EXHAUSTED`.** The API names its own `retryDelay` in the
+response that failed — 5–54 s live against a `TOTAL_DEADLINE_S` of 12 — so no second call inside
+this request can land, and the old unconditional retry fired 247 ms later and spent a second unit of
+a 20-per-day quota. That halved the real daily ceiling (JEB-1600). A quota outage also stops looking
+like a misunderstanding: it answers «закончилась квота, попробуй чуть позже» and the reply carries
+`teacher_status: "quota_exhausted"` — on `POST /api/chat` and on `GET /api/history`, so a reload
+redraws it the same way. The chat shows a second badge beside the engine one; matching the reply
+text instead would break on the first copy edit. `engine` stays `gemini`, because it says who was
+*asked* and the metrics count the miss there. The row still lands in `teacher_log` with its `error`,
+which is what keeps it out of the miner's pool — an outage is not something to learn (JEB-1603).
+
 **The teacher improvises; it does not decline.** A pet with eight primitives can *act out* far more
 than it can do literally, and the prompt now says so: "покажи фокус" is a spin, a jump and a happy
 face. Before that rule, four of five phrasings of that command came back as "я не умею показывать
@@ -148,7 +194,26 @@ stub, and `/api/metrics` shows a Gemini share of zero. `GEMINI_TEACHER_MODEL` ov
 Gemini answering a command is not learning; it costs money every single time. Learning is the moment
 a *pattern* in those answers becomes a skill and the command stops reaching Gemini at all. That is
 `backend/miner/`, and it runs when the `MINER_BATCH`-th *mineable* case arrives (default 5) or on
-`POST /api/mine`:
+`POST /api/mine`.
+
+**Nobody waits for it.** The automatic trigger hands the run to a background worker — one daemon
+thread behind a one-slot queue (`backend/miner/worker.py`) — so `POST /api/chat` answers and the
+proposal turns up in the skills panel a few seconds later. It used to run inside the response, which
+made every 5th mineable miss pay for the Gemini grouping call (~0.9 s of network), a draft per
+cluster and a backtest, all behind `LayaEngine._lock`. A trigger arriving while a run is in flight
+and one is already queued is dropped, not buffered: it would re-read the same pool and race the
+first run to the same proposals, and the next mineable case triggers again anyway.
+`POST /api/mine` still runs synchronously — it is the manual run and its caller asked for the count.
+
+One run drafts from the newest `MINER_POOL_WINDOW` cases (default 40), not from the whole pool. A
+case leaves the pool only by being published, so a refused cluster and every one-off miss stay in it
+for good, and every unbounded run would then group and embed more than the last one — the embed
+alone is 430 ms at 20 cases and 2473 ms at 100, against 110 ms for one router pass. A background
+thread hides that growth rather than removing it: the run still holds the engine lock every other
+chat's router pass needs. Cases outside the window are not deleted and not marked mined, and the
+trigger still counts the whole pool.
+
+The pipeline itself, once per run:
 
 1. **Cluster.** One Gemini `group` call over the whole pool — one per *run*, not per cluster.
    Clusters under `MINER_MIN_CLUSTER` (3) stay in the pool and ripen. The local Laya vectors
@@ -165,8 +230,8 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    example the closest same-intent pair sits at 0.76 and an unrelated pair at 0.85), so no
    threshold, linkage or normalisation separates them. An impure cluster still has to survive the
    backtest; a cluster that is never found is a skill that is never learned.
-2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-2.5-flash-lite`,
-   $0.30 / $2.50 per 1M) per cluster. Offline, nobody waiting, and what comes back is a schema that
+2. **Generate.** One call to `GEMINI_MINER_MODEL` (default `models/gemini-3.5-flash`, price not
+   measured — the miner is offline and spends ~3 calls a pass) per cluster. Offline, nobody waiting, and what comes back is a schema that
    will route thousands of later commands; raise the model through the env var if drafts start
    failing validation, never loosen the validation. A mined skill carries no
    `questions` and branches only on the robot's own state; it is assembled into a real `Skill`, and
@@ -208,23 +273,53 @@ a *pattern* in those answers becomes a skill and the command stops reaching Gemi
    registry, and one phrase leaving its own skill kills the proposal.
 5. **Over-broad check.** Neither of those looks at commands no skill claims yet — measured live, an
    accepted `show_trick` pulled "покажи сальто" to itself at 0.78 with every control green. So the
-   rest of the pool, the cases the grouper put in *other* clusters, is routed too: a candidate that
-   wins any of them is drafted too wide and is not proposed. This is the one check whose cost grows
-   with the pool, which has no `LIMIT` and does not shrink for a rejected candidate — so it runs
-   last, only for a candidate steps 3 and 4 have already cleared. Since step 3 stopped rejecting
-   drafts that cover their own cluster, that is now nearly every candidate rather than almost none:
-   one pass-1 per unmined row. Steps 4 and 5 only read which skill won, so they take `pick_skill`
-   (pass 1 alone, and no `examples` lookup to work around) instead of a full `route`.
+   rest of the pool is routed too, and a candidate that wins a command it is not for is drafted too
+   wide and is not proposed. Steps 4 and 5 only read which skill won, so they take `pick_skill`
+   (pass 1 alone, and no `examples` lookup to work around) instead of a full `route`, and step 5 runs
+   last because it is the one whose cost grows with the pool — which has no `LIMIT` and does not
+   shrink for a rejected candidate.
 
-   Which of the three does the work, measured live over three clusters × three runs (JEB-1562):
-   step 3 rejected 0 of 9, step 4 rejected 0 of 9, step 5 rejected 6 of 9 — every one of them the
-   two adjacent clusters "покажи фокус" and "покажи сальто" taking each other's phrases at 0.78…0.98.
-   So the over-broad check is now the gate that decides, and it is deterministic where `match_rate`
-   used to be a coin flip.
+   **Which commands count is the whole check** (JEB-1579). Not the whole pool: a cluster that gets a
+   draft on this run copies its own phrases into its own `examples`, so step 0 hands them straight
+   back the moment it is accepted, and a claim on those lasts one mining run. A claim on a command
+   no cluster is going to list lasts for ever — so the control set is the pool minus every cluster
+   being drafted, and only what is left over vetoes.
+
+   "Will anything claim this?" is therefore exactly "will this cluster be drafted?", and the miner
+   answers it in one place (`backend/miner/run.py::_worth_drafting`) for both purposes. Size is only
+   its first term: a case set the user has already rejected never comes back, and one that has spent
+   its draft budget (below) waits for a case that may never arrive — both stay `mined=0` for good, so
+   both are controls. Deciding it a second time from `len(group)` alone let a candidate permanently
+   take a command from exactly the clusters already known to be unlearnable.
+
+   The old rule was "wins **any** outsider", and on two near-synonymous intents it was a symmetric
+   dead end. Measured live, three clusters × three runs: step 3 rejected 0 of 9, step 4 rejected
+   0 of 9, step 5 rejected 6 of 9 — every one of them "фокус" taking "покажи сальто" @0.78 and
+   "сальто" taking "сделай фокус" @0.98. Each refused the other, both stayed in the pool (`mined=1`
+   is set only on publication), the next run redrew the same two drafts and refused them again, and
+   neither intent could ever be learned. Same probe after the fix: **8 of 9 publishable**, all six
+   neighbour claims reported and none vetoing, and one refusal left — a draft that reached for "спой
+   песню" @0.98, a leftover nothing will claim. The trade the narrower rule makes is deliberate: one
+   mis-routed phrase for one run, against an 8-primitive library where every wrong answer is still a
+   jump or a sentence and the user can 👎 it — versus an intent that stays on Gemini for ever, which
+   is the number the project is measured on. The fix is here and not in the grouper on purpose:
+   merging the two clusters would remove this pair and nothing else, since any two near neighbours
+   reproduce it.
 6. **Propose.** `GET /api/proposals` shows the card. **The miner never activates anything** — only
    `POST /api/proposals/{id}/accept` adds the skill, and it takes effect in the same process, since
    `/api/chat` reads the library on every request. `reject` puts the cases back in the pool and
    remembers the case set, so the same cluster is not offered again.
+
+A cluster that fails any of this stays in the pool on purpose — more cases may arrive and make it
+work — so the same cluster is regrouped and **redrafted** on every later run, at one paid
+`generate` call each time. After `MINER_MAX_ATTEMPTS` (3) refusals of the *identical* case set the
+miner stops redrawing it and the cluster is counted as stuck: skipped before the generator is
+called, reported as `clusters_stuck` in `GET /api/metrics`, and shown in the learning panel when it
+is non-zero. The budget is keyed on the `teacher_log` ids, so a new case joining the cluster is a new
+case set and buys another draft — the same rule a user's rejection is remembered by
+(`backend/miner/attempts.py`) — and the superseded case set is retired with it, or `clusters_stuck`
+would drift from "how many clusters are stuck" to "how many ever were". A stuck cluster is also a
+control for step 5, for the same reason a user-rejected one is: nothing is going to list its phrases.
 
 A mined `description` is a hard 60 characters and a candidate over it is rejected, not trimmed: the
 description *is* the router's option label, and stage 2 measured long ones dropping routing from 6/6
