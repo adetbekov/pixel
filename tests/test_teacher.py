@@ -334,17 +334,20 @@ async def test_a_quota_outage_never_reaches_the_mining_pool(
 ):
     """A billing outage is not an example of anything, so it must not be mined.
 
-    Two separate checks in `backend/miner/case._parse` happen to hold it today —
-    the row has an `error`, and its `handled` is false — and both live in a
-    different module than the one that writes them. Asserting either field here
-    would pass while the outcome broke. So assert the outcome: drop both checks
-    and this test is the only thing in the suite that goes red (verified by
-    doing exactly that), while dropping one leaves it green, which is what makes
-    it a guard rather than a copy of the implementation.
+    Two checks in `backend/miner/case._parse` hold it — the row has an `error`,
+    and its `handled` is false — and `tests/test_cluster.py` already pins each
+    one on its own, from rows `fill_pool` writes by hand. This asserts the same
+    outcome from the other end: a real `google.genai` 429 through
+    `POST /api/chat`, the row the client actually writes, and `load_pool` on
+    that. Measured on `a1f7917`: drop either check and this stays green (the
+    other still holds it); drop both and it goes red alongside the four
+    `test_cluster` tests.
 
-    What it guards against: the miner drafting "мой учитель сейчас недоступен"
-    into a permanent Laya skill — a command that then never reaches Gemini
-    again, answered by a lie in 300 ms.
+    So it is not what pins the guards — it is what pins the path from a live
+    429 to the pool, which nothing else covers. What that path protects
+    against: the miner drafting "мой учитель сейчас недоступен" into a
+    permanent Laya skill — a command that then never reaches Gemini again,
+    answered by a lie in 300 ms.
     """
     teacher(quota_error())
     await client.post("/api/chat", json={"text": "покажи фокус"})
