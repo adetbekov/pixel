@@ -19,6 +19,22 @@ const quickButtons = [...quickEl.querySelectorAll('button')];
 const ENGINE_LABELS = { laya: 'Laya', gemini: 'Gemini', button: 'Кнопка' };
 const ENGINE_CLASSES = { laya: 'badge-laya', gemini: 'badge-gemini', button: 'badge-button' };
 
+/* Почему учитель не ответил, когда не ответил. `engine` отвечает на «кого
+   спросили», и на исчерпанной квоте это по-прежнему `gemini` — значит сказать
+   «ответа не было» он не может, и до JEB-1603 квота выглядела в чате ровно как
+   «модель не поняла команду». Ключ приходит в `teacher_status` (null на любом
+   обычном ответе); по тексту реплики отличать нельзя — первая же правка
+   копирайта или локализация сломала бы это молча. */
+const STATUS_LABELS = { quota_exhausted: 'квота исчерпана', daily_cap: 'лимит на сегодня' };
+const STATUS_CLASSES = { quota_exhausted: 'badge-quota', daily_cap: 'badge-quota' };
+const STATUS_TITLES = {
+  quota_exhausted: 'Учитель не ответил: исчерпана квота Gemini. Это не «робот не понял».',
+  /* JEB-1623. Не 429: мы сами остановились на TEACHER_DAILY_CAP, не доходя до
+     потолка тира, поэтому и ключ отдельный. Значок тот же — снаружи это одно и
+     то же «учителя сегодня нет», — а подпись говорит, кто именно остановил. */
+  daily_cap: 'Учитель выключен до утра: исчерпан дневной лимит вызовов (TEACHER_DAILY_CAP).',
+};
+
 /* ─── Индикаторы ────────────────────────────────────────────────────────── */
 
 function levelClass(value) {
@@ -66,6 +82,20 @@ function engineBadge(engine) {
   return badge;
 }
 
+/* Вторая плашка рядом с движком, а не вместо него: «спросили Gemini» и «ответа
+   не пришло» — два разных факта, и оба нужны. Неизвестный статус не рисуем
+   вовсе — сервер старше фронта отдаёт null, сервер новее может добавить ключ,
+   которого здесь ещё нет, и «неизвестно» в чате хуже, чем ничего. */
+function statusBadge(status) {
+  const key = String(status ?? '');
+  if (!STATUS_LABELS[key]) return null;
+  const badge = document.createElement('span');
+  badge.className = `badge ${STATUS_CLASSES[key]}`;
+  badge.textContent = STATUS_LABELS[key];
+  badge.title = STATUS_TITLES[key];
+  return badge;
+}
+
 function voteButtons(interactionId, current = null) {
   const box = document.createElement('div');
   box.className = 'vote';
@@ -106,6 +136,9 @@ function addReply(reply, vote = null) {
   const meta = document.createElement('div');
   meta.className = 'meta';
   meta.append(engineBadge(reply.engine));
+
+  const status = statusBadge(reply.teacher_status);
+  if (status) meta.append(status);
 
   if (Number.isFinite(reply.latency_ms)) {
     const latency = document.createElement('span');
@@ -190,8 +223,10 @@ function metricCard(label, value, lead = false) {
   return el;
 }
 
-/* null -> карточка покажет «нет данных» мелким шрифтом */
-const ms = (value) => (Number.isFinite(value) ? `${Math.round(value)} мс` : null);
+/* null -> карточка покажет «нет данных» мелким шрифтом.
+   Ноль тоже «нет данных»: латентности считаются за сутки, и 0 мс означает, что
+   за окно такого вызова не было, а не что робот ответил мгновенно. */
+const ms = (value) => (Number.isFinite(value) && value > 0 ? `${Math.round(value)} мс` : null);
 
 const percent = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
 
@@ -231,8 +266,8 @@ function renderMetrics(metrics) {
   const disabled = Number(metrics.skills_disabled) || 0;
   const cards = [
     shareCard(metrics),
-    metricCard('Laya, среднее время', ms(metrics.avg_latency_laya_ms)),
-    metricCard('Gemini, среднее время', ms(metrics.avg_latency_gemini_ms)),
+    metricCard('Laya, среднее время за 24 часа', ms(metrics.avg_latency_laya_ms)),
+    metricCard('Gemini, среднее время за 24 часа', ms(metrics.avg_latency_gemini_ms)),
     metricCard('Активных навыков', String(metrics.skills_active ?? 0)),
   ];
   /* Отключённые показываем, только когда они есть: пустая карточка «0» просто

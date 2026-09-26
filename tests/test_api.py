@@ -32,6 +32,9 @@ REPLY_KEYS = {
     "confidence",
     "latency_ms",
     "state",
+    # Additive and `None` on every reply but a quota outage — a client that has
+    # never heard of it is unaffected, which is the whole point (JEB-1603).
+    "teacher_status",
 }
 
 

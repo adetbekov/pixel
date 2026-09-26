@@ -313,6 +313,10 @@ h2 { font-size: 14px; text-transform: none; margin: 0 0 10px; color: var(--text-
 .badge-laya   { background: rgb(53 198 122 / .16); border-color: rgb(53 198 122 / .5); color: var(--ink-ok); }
 .badge-gemini { background: rgb(87 179 255 / .16); border-color: rgb(87 179 255 / .5); color: var(--ink-accent); }
 .badge-button { background: var(--surface-2); border-color: var(--line); color: var(--text-dim); }
+/* Учитель не ответил по квоте. Та же пара, что у отключённого навыка
+   (`.badge-off`): заливка --bad с альфой плюс отдельный затемнённый --ink-bad,
+   который и держит AA в светлой схеме — сам --bad как текст даёт там 2.6:1. */
+.badge-quota  { background: rgb(239 95 95 / .14); border-color: rgb(239 95 95 / .45); color: var(--ink-bad); }
 
 .vote { display: flex; gap: 4px; margin-left: auto; }
 .vote button {

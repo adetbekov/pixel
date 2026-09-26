@@ -13,11 +13,16 @@ name: Live Gemini Contract
 # Why it is a separate workflow and not a job in ci.yml: it needs GEMINI_API_KEY,
 # which a fork PR cannot be given, and it spends real quota. A PR must stay green
 # without the key — so this never runs on `pull_request`, and `ci.yml` never needs
-# a secret. Cost is two `gemini-2.5-flash-lite` calls a day, on the order of $0.001
-# on a billed project. The key in the secret is not on one: its project is free tier,
-# 20 `generateContent` requests a day on this model, shared with the live stand, so
-# the two calls are usually refused with `429 RESOURCE_EXHAUSTED` (JEB-1553). The probe
-# reports that as exit 2 — "could not be checked" — never as a contract finding.
+# a secret. Cost is two calls a day — one `gemini-2.5-flash-lite` (the teacher probe)
+# and one `gemini-3.5-flash` (the miner probe, which follows `generate.DEFAULT_MODEL`
+# and moved with it in JEB-1606) — on the order of $0.001 on a billed project. The key
+# in the secret is not on one: its project is free tier, and the 20-`generateContent`-
+# a-day allowance is counted per (project, model), so the two calls come out of two
+# separate buckets. The teacher's is shared with the live stand and is usually empty;
+# the miner's is the one JEB-1606 freed for mining, and this nightly takes 1 of its 20
+# against the ~3 a mining pass spends. Either refusal comes back as
+# `429 RESOURCE_EXHAUSTED` (JEB-1553). The probe reports that as exit 2 — "could not be
+# checked" — never as a contract finding.
 #
 # Note on the triggers, same as required-checks-audit.yml: GitHub resolves both
 # `schedule:` and `workflow_dispatch` only from the default branch, which for pixel
@@ -57,23 +62,28 @@ jobs:
           cache: pip
 
       # Deliberately NOT `pip install -e ".[dev]"`: that pulls `laya`, which pulls
-      # ~1 GB of torch, and the probe imports neither — it touches the teacher and
-      # miner modules, pydantic and the SDK, nothing else. The google-genai
-      # requirement is read out of pyproject.toml rather than repeated here, so the
-      # nightly cannot drift onto a different SDK line than the app runs on.
-      - name: Install the SDK this repo pins
+      # ~1 GB of torch, and nothing on the probe's import path reaches it.
+      #
+      # But the list of what IS installed is no longer typed here. It used to be
+      # ("the SDK and pydantic, the probe touches nothing else") and that was
+      # wrong: `backend.miner.case` executes `backend/miner/__init__.py` -> `run`
+      # -> `cluster` -> `import numpy`, which this file never named and no reading
+      # of the script revealed. The gate died on that import on its first
+      # execution ever — which, because `schedule:` and `workflow_dispatch` only
+      # resolve from the default branch, was on `main` (JEB-1601).
+      #
+      # `live_contract_requirements.py` prints pyproject.toml's own dependency
+      # list minus the exclusions it justifies, so this step and `lint + tests`
+      # install from one declaration and a new project dependency arrives here by
+      # itself. `ci.yml`'s `live gemini contract imports` job runs the same script
+      # on every PR, so a gap fails a diff instead of a night.
+      - name: Install the dependencies this repo pins
         run: |
           set -euo pipefail
-          pin=$(python - <<'PY'
-          import pathlib
-          import tomllib
-
-          deps = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["dependencies"]
-          print(next(d for d in deps if d.startswith("google-genai")))
-          PY
-          )
-          echo "installing: ${pin}"
-          pip install "${pin}" "pydantic>=2"
+          python .github/scripts/live_contract_requirements.py > live-contract-requirements.txt
+          echo "installing:"
+          cat live-contract-requirements.txt
+          pip install -r live-contract-requirements.txt
 
       - name: Probe both call shapes against the live model
         id: probe
@@ -134,7 +144,7 @@ jobs:
               TITLE="ci: live Gemini contract COULD NOT BE CHECKED"
               DETAIL="The probe did not run (exit 2): no \`GEMINI_API_KEY\` secret, the SDK failed to install, or the API refused every call on quota (\`429 RESOURCE_EXHAUSTED\`). This is **not** evidence that the contract broke, and not evidence that it holds — the live path is simply unverified until a run exits 0 or 1.
 
-          A quota refusal is the expected steady state while the key's project is on the free tier: \`models/gemini-2.5-flash-lite\` allows 20 \`generateContent\` requests a day and the live stand spends from the same twenty (JEB-1553). Fix is a separate key/project for CI, or billing on the existing one — not a change to the probe."
+          A quota refusal is the expected steady state while the key's project is on the free tier. The 20-\`generateContent\`-a-day allowance is counted per (project, model), so this run draws on two buckets: \`models/gemini-2.5-flash-lite\` for the teacher probe — shared with the live stand's \`/api/chat\` misses (JEB-1553) — and \`models/gemini-3.5-flash\` for the miner probe, the bucket JEB-1606 gave the miner, where this nightly is 1 of 20 beside the ~3 a mining pass spends. Either can be the empty one. Fix is a separate key/project for CI, or billing on the existing one — not a change to the probe."
               ;;
             *)
               TITLE="ci: live Gemini contract run failed before it could probe"

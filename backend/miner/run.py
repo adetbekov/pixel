@@ -1,24 +1,39 @@
 """One mining run, start to finish.
 
-Synchronous inside the request that triggers it, and that is a prototype
-decision, not an architectural one — which is why the whole run is
-:func:`mine_once` and nothing else: moving it to a background worker is a change
-of caller, not of this module.
+The whole run is :func:`mine_once` and nothing else, so *who* calls it is the
+only thing that decides whether anyone waits for it. The automatic trigger does
+not: it goes through :mod:`backend.miner.worker`, off the request path. The
+manual ``POST /api/mine`` calls this directly, because it wants the count back.
 
-What it costs the request it runs inside, measured on the live checkpoint
+What a run costs, measured on the live checkpoint
 (``scripts/calibrate_miner_sim.py``, section 6): a run is roughly one teacher
-grouping call plus a few forward passes per cluster case and per active skill,
-and it holds ``LayaEngine._lock`` for all of them, so every other request's
-router waits. The one term that scales with the *pool* rather than the cluster
-is the backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
+grouping call plus a few forward passes per cluster case and per active skill.
+What a concurrent chat waits for depends on which part of the run holds the
+engine lock, and the two parts differ by 4x (JEB-1599,
+``scripts/bench_router_under_mining.py``, live checkpoint, window 40):
+
+* the **backtest** takes ``LayaEngine._lock`` once per forward pass and holds
+  it 260 ms at p50, so a chat that arrives here waits one pass, not the series;
+* the **grouping step**, when the teacher answers ``[]`` and
+  :func:`backend.miner.cluster.group_texts` falls back to local vectors, is one
+  ``engine.embed`` over the whole window under a single acquisition — held
+  1092 ms at p50 (572 ms at window 20). A chat that lands inside that waits all
+  of it, and the wait grows with ``MINER_POOL_WINDOW`` linearly.
+
+So the window is a latency knob on the fallback path and only a run-length knob
+on the teacher-grouped one.
+
+The one term that scales with the *pool* rather than the cluster is the
+backtest's over-broad check, and :func:`backend.miner.backtest.backtest`
 only reaches it for a candidate no regression has already rejected. Since
 ``match_rate`` became a measure of what production will do (JEB-1562) that is
 nearly every candidate, where it used to be almost none — but it no longer scans
 the whole pool: JEB-1579 narrowed its control set to the rows nothing is going to
 claim, and on a pool the miner has work to do in, most rows belong to a cluster
-that is being drafted right now. The pool still has no ``LIMIT`` and still does
-not shrink for a candidate that was rejected, so those unclaimed rows are the
-term to watch as it grows.
+that is being drafted right now. The pool still does not shrink for a candidate
+that was rejected — what bounds it is ``MINER_POOL_WINDOW``: a run drafts from
+the newest N mineable cases, so the unclaimed rows an older pool keeps
+accumulating no longer make every run slower than the last.
 
 Which rows those are is :func:`_worth_drafting`, and there is deliberately no
 second opinion about it: a cluster gets a draft, or nothing will ever list its
@@ -55,7 +70,7 @@ from ..brain.skill import Skill, load_skills
 from ..state import iso, utcnow
 from . import attempts
 from .backtest import backtest
-from .case import Case, is_mineable, load_pool, pool_size
+from .case import Case, is_mineable, load_pool, pool_ids, pool_size
 from .cluster import group_texts, min_cluster_size
 from .generate import SkillGenerator, get_generator
 
@@ -129,23 +144,45 @@ def _mine() -> int:
     conn = db.get_conn()
     with db.lock:
         cases = load_pool(conn)
+        # The ledger is keyed by case ids and swept against the pool, not against
+        # the window this run drafts from: a case the window left behind is still
+        # unmined, and its cluster's spent budget has to survive with it.
+        mineable = pool_ids(conn)
         active = load_skills(conn, only_active=True)
         taken = _taken_ids(conn)
         rejected = _rejected_signatures(conn)
 
     if len(cases) < min_cluster_size():
+        # Silent until JEB-1593, like the per-cluster bar below: the two of them
+        # are how almost every zero-proposal run ends, and neither left a trace.
+        log.info(
+            "miner: the pool holds %d cases, fewer than MINER_MIN_CLUSTER (%d)",
+            len(cases),
+            min_cluster_size(),
+        )
         return 0
 
     groups = group_texts(engine, [case.user_text for case in cases], generator.group)
     clusters = [[cases[index] for index in group] for group in groups]
     signatures = [tuple(sorted(case.id for case in cluster)) for cluster in clusters]
 
+    # One line that answers "did the miner work at all" before any per-cluster
+    # verdict: how the grouper cut the window, and how big the pieces are
+    # (JEB-1593). A run where every size is under `MINER_MIN_CLUSTER` is the
+    # defect that looked like silence, and it is visible here in one read.
+    log.info(
+        "miner: the grouper returned %d groups of sizes %s from %d cases",
+        len(clusters),
+        [len(cluster) for cluster in clusters],
+        len(cases),
+    )
+
     # The ledger is pruned against *this run's* grouping, not just against the
     # pool, so a signature a larger cluster has grown past stops being counted as
     # stuck (JEB-1579 review). Read after the prune, so `refused` is what the
     # ledger says now.
     with db.lock:
-        attempts.forget(conn, {case.id for case in cases}, signatures)
+        attempts.forget(conn, mineable, signatures)
         refused = attempts.load(conn)
 
     # Whether a cluster gets a draft this run is also the answer to "will anything
@@ -239,7 +276,17 @@ def _worth_drafting(
     arrive, so reading size alone called both of them claimable and re-opened
     JEB-1548 for the two kinds of cluster already known to be unlearnable.
     """
-    if len(cluster) < min_cluster_size():
+    minimum = min_cluster_size()
+    if len(cluster) < minimum:
+        # The branch that used to say nothing, and the commonest way a run ends
+        # at `{"started": true, "proposals": 0}`: an empty log there reads as a
+        # broken miner rather than as a pool that has not ripened (JEB-1593).
+        log.info(
+            "miner: cluster %s is smaller than MINER_MIN_CLUSTER (%d < %d)",
+            list(signature),
+            len(cluster),
+            minimum,
+        )
         return False
 
     if signature in rejected:

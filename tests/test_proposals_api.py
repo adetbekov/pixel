@@ -18,7 +18,7 @@ from backend import db
 from backend.brain.engine import set_engine
 from backend.brain.skill import load_skills
 from backend.main import app
-from backend.miner import MineResult, mine_once, set_generator
+from backend.miner import MineResult, mine_once, set_generator, wait_idle
 from backend.miner.attempts import max_attempts
 from backend.miner.generate import TIMEOUT_S, GeminiSkillGenerator
 from backend.teacher.client import MIN_SERVER_DEADLINE_S
@@ -50,6 +50,18 @@ PROPOSAL_KEYS = {
 @pytest.fixture()
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def unthrottled_mine(monkeypatch):
+    """`POST /api/mine` is capped at `MINE_RATE_LIMIT` a minute (JEB-1623).
+
+    Several tests here drive the manual mining button `MINER_MAX_ATTEMPTS` times
+    in a row to exhaust a cluster's draft budget — faster than any human, and
+    faster than the guard allows. The guard has its own tests in
+    `tests/test_public_guards.py`; here it is only in the way.
+    """
+    monkeypatch.setenv("MINE_RATE_LIMIT", "1000")
 
 
 @pytest.fixture()
@@ -160,16 +172,44 @@ def test_an_old_db_gains_the_generalization_column(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_a_cluster_of_two_is_not_proposed(client, seeded, miner_engine, generator):
+async def test_a_cluster_of_two_is_not_proposed(client, seeded, miner_engine, generator, caplog):
     generator(draft_json())
     fill_pool(seeded, TRICK_COMMANDS[:2])
 
-    assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+    with caplog.at_level("INFO", logger="backend.miner.run"):
+        assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
     assert (await client.get("/api/proposals")).json() == []
     # And the cases stay in the pool — they ripen when more arrive.
     assert (
         seeded.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0").fetchone()["n"] == 2
     )
+    # Said out loud, because this is the commonest way a run ends at zero and an
+    # empty log is indistinguishable from a broken miner (JEB-1593).
+    assert "the pool holds 2 cases, fewer than MINER_MIN_CLUSTER (3)" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_a_pool_the_grouper_split_too_small_says_so(
+    client, seeded, miner_engine, generator, caplog
+):
+    """The JEB-1593 shape: enough cases, and every group under the bar.
+
+    Measured on the live grouper, "сделай сальто" / "умеешь сальто?" / "сальто
+    назад" came back as three groups of 2, 2 and 1 — a run that answers
+    `{"started": true, "proposals": 0}`, writes nothing to the log, and cannot be
+    told apart from a draft that was rejected.
+    """
+    generator(draft_json(), grouping=[[0, 1], [2, 3], [4]])
+    fill_pool(seeded)
+
+    with caplog.at_level("INFO", logger="backend.miner.run"):
+        assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
+    ids = [row["id"] for row in seeded.execute("SELECT id FROM teacher_log ORDER BY id")]
+    # The shape of the run first, so "did the grouper work at all" is one read,
+    # then the per-cluster verdicts.
+    assert "the grouper returned 3 groups of sizes [2, 2, 1] from 5 cases" in caplog.text
+    assert f"cluster {[ids[0], ids[1]]} is smaller than MINER_MIN_CLUSTER (2 < 3)" in caplog.text
+    assert f"cluster {[ids[4]]} is smaller than MINER_MIN_CLUSTER (1 < 3)" in caplog.text
 
 
 @pytest.mark.anyio
@@ -532,6 +572,11 @@ async def test_mining_runs_itself_every_batch_th_case(
 
     # The fifth case arrives the way a real one does — through /api/chat.
     await client.post("/api/chat", json={"text": TRICK_COMMANDS[4]})
+    # The run itself happens on the miner worker, so the answer came back before
+    # the proposal did. Waiting for the thread is what a user does by looking at
+    # the panel a moment later; `tests/test_miner_worker.py` is where the fact
+    # that the answer did not wait is pinned.
+    assert wait_idle(5)
     assert len((await client.get("/api/proposals")).json()) == 1
 
 

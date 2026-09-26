@@ -27,6 +27,18 @@ Four independent assertions, because they fail independently:
      job in the workflow file that is supposed to report it. A required context
      is matched to a check run *by name*: rename the job and the context never
      reports, which leaves every PR into that branch permanently blocked.
+
+     A required context need not come from a workflow job at all: `gates
+     recorded` on `dev` is a **commit status** posted over
+     `POST /repos/.../statuses/<sha>` by the PR auto-merge bot (JEB-1571), and
+     the workflow variant of that publisher (#50) was closed unmerged. Such a
+     context is mapped to the `EXTERNAL_STATUS` sentinel instead of a filename,
+     and assertions 2 and 4 — both of which ask questions about a *workflow
+     file* — are skipped for it. Assertions 1 and 3 are not: membership in the
+     live required list is exactly what must keep being asserted, and that is
+     the whole reason the entry exists. See the comment on REQUIRED_CONTEXTS for
+     the rule that keeps the sentinel from spreading to workflow-backed
+     contexts.
   3. **The reverse direction (JEB-1227).** Every context in the branch's live
      required list is in that branch's map. Assertions 1 and 2 only walk the
      map, so a context required on GitHub but absent from the dict is invisible:
@@ -98,8 +110,11 @@ secret to provision, rotate, or leak.
 
 Exit codes, kept distinct on purpose — an error is NOT "unprotected":
 
-  0  every required context is present, matches its job name, and is reachable
-     by a trigger that fires for PRs into the audited branch
+  0  every required context is present, and every one produced by a workflow job
+     also matches that job's `name:` and is reachable by a trigger that fires for
+     PRs into the audited branch. EXTERNAL_STATUS contexts are asserted for
+     membership only — assertions 2 and 4 are skipped for them, and the success
+     line says so rather than claiming them (JEB-1639)
   1  a real finding: a context is missing from the required list, a context no
      longer matches any job name, a context is declared by a workflow no event
      can start for a PR into that branch, or the branch is not protected
@@ -129,12 +144,39 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOWS = _ROOT / ".github" / "workflows"
 
+
+class _ExternalStatus:
+    """Producer sentinel: required, and deliberately not a workflow job.
+
+    Its own type rather than a magic string, so it can never be mistaken for a
+    filename: `workflows_dir / EXTERNAL_STATUS` raises instead of quietly looking
+    for `.github/workflows/EXTERNAL_STATUS` and reporting the context as orphaned
+    because its imaginary file is absent.
+    """
+
+    def __repr__(self) -> str:
+        return "EXTERNAL_STATUS"
+
+
+EXTERNAL_STATUS = _ExternalStatus()
+
+Producer = str | _ExternalStatus
+
 # Every context required on a protected branch, mapped to the workflow file whose
 # job `name:` must equal it. Adding a required context on GitHub without adding
 # it here leaves the new gate unmonitored (assertion 3 fails on exactly that);
 # removing one here silently retires the assertion, which is the drift this
 # script exists to catch — so **both edits belong in the same PR as the
 # protection change**.
+#
+# A value of EXTERNAL_STATUS instead of a filename means "required, and produced
+# by something other than a workflow job". It is an escape hatch from assertions
+# 2 and 4 only, and it must stay narrow: a context that IS a workflow job name
+# marked EXTERNAL_STATUS would silently stop being checked for renames, which is
+# assertion 2's whole job. `test_external_status_is_never_used_for_a_workflow_job`
+# fails on exactly that — it rejects any EXTERNAL_STATUS context that matches a
+# job `name:` anywhere in .github/workflows/. Every such entry must name its
+# publisher in a comment, so a reader can find the thing that posts it.
 #
 # Keyed by branch, because `main` and `dev` need not gate the same set. The
 # audited branch selects the map; `--branch` names it.
@@ -164,6 +206,16 @@ REQUIRED_CONTEXTS = {
         "lint + tests": "ci.yml",
         "frontend lint": "ci.yml",
         "image build": "ci.yml",
+        # Not a workflow job (JEB-1596): the PR auto-merge bot posts this as a
+        # commit status via POST /repos/adetbekov/pixel/statuses/<sha> once
+        # TechLead APPROVED and the qa_gate comment both match the current head
+        # (JEB-1571). The workflow variant of that publisher, #50, was closed
+        # unmerged, so no .github/workflows/ file declares it and none should be
+        # invented to satisfy this map. Asserted here because PATCH of
+        # .../branches/dev/protection/required_status_checks succeeds on the
+        # studio PAT and leaves no trace on any PR — this audit is the only thing
+        # that would notice the lock being un-armed.
+        "gates recorded": EXTERNAL_STATUS,
     },
 }
 
@@ -180,8 +232,12 @@ class CannotDetermine(Exception):
     """The answer could not be read. Never a synonym for 'not protected'."""
 
 
-def contexts_for(branch: str) -> dict[str, str]:
-    """The `context -> workflow file` map this script asserts for `branch`.
+def contexts_for(branch: str) -> dict[str, Producer]:
+    """The `context -> producer` map this script asserts for `branch`.
+
+    A producer is the workflow filename whose job `name:` must equal the context,
+    or EXTERNAL_STATUS for a context posted by something that is not a workflow
+    job.
 
     An unaudited branch is CannotDetermine, not an empty map: an empty map would
     make every assertion vacuously true and the script would print `OK` for a
@@ -197,6 +253,49 @@ def contexts_for(branch: str) -> dict[str, str]:
             f"Add a {branch!r} entry to REQUIRED_CONTEXTS in the same PR as the "
             f"protection change, or audit one of those branches."
         ) from None
+
+
+def workflow_producers(asserted: dict[str, Producer]) -> set[str]:
+    """The workflow filenames in a context map, without the EXTERNAL_STATUS ones."""
+    return {producer for producer in asserted.values() if isinstance(producer, str)}
+
+
+def ok_line(asserted: dict[str, Producer], branch: str) -> str:
+    """The exit-0 line, counting only the contexts each assertion actually ran on.
+
+    Assertions 2 (context <-> job name) and 4 (trigger reachability) ask questions
+    about a workflow file, so they are skipped for EXTERNAL_STATUS entries. A
+    single sentence claiming both for *all* asserted contexts would put the
+    "skipped assertion reads as a pass" shape back in the one line a human
+    auditing the lock actually reads (JEB-1639) — so the two populations are
+    counted separately whenever the map has a membership-only entry.
+    """
+    total = len(asserted)
+    external = sum(1 for producer in asserted.values() if not isinstance(producer, str))
+    unchanged = f"{branch} requires nothing this script does not assert"
+    if not external:
+        return (
+            f"OK: all {total} asserted contexts are required on {branch}, their "
+            f"context strings match their job names, every one of them is reachable "
+            f"by a trigger that fires for PRs into {branch}, and {unchanged}."
+        )
+    return (
+        f"OK: all {total} asserted contexts are required on {branch}; the "
+        f"{total - external} produced by a workflow job match their job names and are "
+        f"reachable by a trigger that fires for PRs into {branch} ({external} "
+        f"{'is' if external == 1 else 'are'} EXTERNAL_STATUS — membership only, "
+        f"assertions 2 and 4 skipped); and {unchanged}."
+    )
+
+
+def describe_producer(producer: Producer) -> str:
+    """How a finding should refer to whatever is supposed to report a context."""
+    if isinstance(producer, str):
+        return f"produced by .github/workflows/{producer}"
+    return (
+        "posted as a commit status by something other than a workflow job — see the "
+        "comment on its REQUIRED_CONTEXTS entry for the publisher"
+    )
 
 
 def _get(url: str, accept: str, token: str | None) -> str:
@@ -242,11 +341,12 @@ def fetch_base_workflows(repo: str, ref: str, token: str | None) -> dict[str, st
     """`filename -> source-on-ref` for every workflow `ref`'s context map names.
 
     Only the files that declare a required context are fetched — the same set
-    assertions 1 and 2 already walk.
+    assertions 1 and 2 already walk. EXTERNAL_STATUS producers name no file, so
+    they contribute nothing to fetch.
     """
     return {
         filename: fetch_workflow_source(repo, ref, filename, token)
-        for filename in sorted(set(contexts_for(ref).values()))
+        for filename in sorted(workflow_producers(contexts_for(ref)))
     }
 
 
@@ -670,14 +770,24 @@ def check(
         )
 
     present = set(contexts)
-    for context, workflow_file in asserted.items():
+    for context, producer in asserted.items():
         if context not in present:
             findings.append(
                 f"required status check missing from {branch}'s protection: {context!r} "
-                f"(produced by .github/workflows/{workflow_file}). Without it GitHub "
+                f"({describe_producer(producer)}). Without it GitHub "
                 f"allows the merge even when the check is red. Restore it with "
                 f"PATCH /repos/<repo>/branches/{branch}/protection/required_status_checks."
             )
+
+        # Assertions 2 and 4 both ask questions about a workflow file. An
+        # EXTERNAL_STATUS context has none, so they are skipped rather than
+        # answered against an invented filename — membership above is the whole
+        # assertion for these, and assertion 3 below still covers the reverse
+        # direction. Skipping here is what keeps the escape hatch from weakening
+        # anything for the contexts that really are workflow jobs.
+        if not isinstance(producer, str):
+            continue
+        workflow_file = producer
 
         path = workflows_dir / workflow_file
         if not path.exists():
@@ -748,8 +858,9 @@ def check(
             f"{branch}'s required list but missing from REQUIRED_CONTEXTS[{branch!r}] in "
             f"scripts/assert_required_checks.py, so this audit does not monitor it and would "
             f"not notice it being dropped. Add {context!r} to REQUIRED_CONTEXTS[{branch!r}] — "
-            f"mapped to the .github/workflows/ file whose job name produces it — in the same "
-            f"PR as the protection change."
+            f"mapped to the .github/workflows/ file whose job name produces it, or to "
+            f"EXTERNAL_STATUS with a comment naming the publisher if nothing in "
+            f".github/workflows/ produces it — in the same PR as the protection change."
         )
 
     return findings
@@ -824,12 +935,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"::error::{finding}")
         return EXIT_FINDING
 
-    print(
-        f"OK: all {len(asserted)} asserted contexts are required on {args.branch}, their "
-        f"context strings match their job names, every one of them is reachable by a "
-        f"trigger that fires for PRs into {args.branch}, and {args.branch} requires "
-        f"nothing this script does not assert."
-    )
+    print(ok_line(asserted, args.branch))
     return EXIT_OK
 
 
