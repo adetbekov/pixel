@@ -368,7 +368,10 @@ slowly once there is history behind it, so the windowed one is where the learnin
 
 The panel refreshes on load, after every reply, after a vote, and after accept/reject — on events,
 never on a timer. `GET /api/history` redraws the last interactions with their votes after a page
-reload; without it the 👎 survives in the database but vanishes from the screen.
+reload; without it the 👎 survives in the database but vanishes from the screen. Every row also
+carries `ts` — the log time verbatim out of `interactions.ts` — so the 24h window behind
+`laya_share_24h` and `avg_latency_*` can be re-cut over HTTP instead of with `sqlite3` inside the
+container. The chat does not render it.
 
 ## Deploy
 

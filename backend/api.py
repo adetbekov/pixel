@@ -201,6 +201,11 @@ class HistoryItem(BaseModel):
     """One past interaction, enough to redraw its chat bubble and its vote."""
 
     interaction_id: int
+    #: When the row was logged — verbatim from `interactions.ts` (ISO-8601 UTC, the
+    #: way `backend/db.py` writes it). Observability, not chrome: it is what lets the
+    #: 24h window of `metrics.collect` be split out of `/api/history` from outside the
+    #: container, so nobody has to render it. `None` for rows written without a `ts`.
+    ts: str | None = None
     user_text: str
     reply: str
     engine: str
@@ -506,13 +511,14 @@ def get_history(limit: int = DEFAULT_HISTORY) -> list[dict]:
     conn = db.get_conn()
     with db.lock:
         rows = conn.execute(
-            "SELECT id, user_text, reply_text, engine, skill_id, confidence, latency_ms,"
-            " feedback, teacher_status FROM interactions ORDER BY id DESC LIMIT ?",
+            "SELECT id, ts, user_text, reply_text, engine, skill_id, confidence,"
+            " latency_ms, feedback, teacher_status FROM interactions ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [
         {
             "interaction_id": row["id"],
+            "ts": row["ts"],
             "user_text": row["user_text"],
             "reply": row["reply_text"],
             "engine": row["engine"],
