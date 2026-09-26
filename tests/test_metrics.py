@@ -133,6 +133,43 @@ def test_the_24h_window_ignores_older_rows(conn):
     assert body["gemini_calls_24h"] == 1
 
 
+@pytest.mark.anyio
+async def test_history_carries_the_timestamp_the_window_is_cut_by(client, conn):
+    """JEB-1626: the same 24h window has to be re-cuttable from `/api/history`.
+
+    Without `ts` on the row there is no way to tell an in-window line from an
+    out-of-window one over HTTP, so checking `avg_latency_*` after a deploy needed
+    `sqlite3` inside the container — which is where the JEB-1574 verification stopped
+    (JEB-1625).
+    """
+    old = "2020-01-01T00:00:00Z"
+    log(conn, "gemini", latency_ms=100_000, ts=old)
+    log(conn, "gemini", latency_ms=1600)
+    log(conn, "laya", latency_ms=40)
+    # A row from before `ts` was written: the field is optional, so it is `null`
+    # in the response rather than a 500 over the whole history.
+    conn.execute(
+        "INSERT INTO interactions (user_text, engine, latency_ms, reply_text)"
+        " VALUES ('команда', 'laya', 7, '')"
+    )
+    conn.commit()
+
+    history = (await client.get("/api/history")).json()
+    # Verbatim out of the table — the API does not reformat what `db.py` wrote.
+    assert history[0]["ts"] == old
+    assert history[-1]["ts"] is None
+
+    since = iso(utcnow() - metrics.WINDOW)
+    windowed = [item for item in history if item["ts"] and item["ts"] >= since]
+    assert [item["latency_ms"] for item in windowed] == [1600, 40]
+
+    body = metrics.collect(conn)
+    for engine_name in ("laya", "gemini"):
+        latencies = [item["latency_ms"] for item in windowed if item["engine"] == engine_name]
+        assert body[f"avg_latency_{engine_name}_ms"] == round(sum(latencies) / len(latencies), 1)
+    assert body["laya_share_24h"] == 0.5  # one of each inside the window
+
+
 def test_disabled_skills_are_counted_separately(seeded):
     assert metrics.collect(seeded)["skills_active"] == 4
     assert metrics.collect(seeded)["skills_disabled"] == 0
