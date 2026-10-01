@@ -91,8 +91,11 @@ def test_a_retry_covers_one_bad_answer():
 
 
 def test_a_raising_call_is_a_finding_naming_the_exception():
+    """A call that blows up on something other than "the model never answered"
+    is still the call failing on the shape we send it."""
+
     def boom():
-        raise TimeoutError("deadline exceeded")
+        raise ValueError("the SDK rejected the config this repo sends")
 
     finding = contract.run(
         contract.Probe(
@@ -104,7 +107,7 @@ def test_a_raising_call_is_a_finding_naming_the_exception():
     )
 
     assert finding is not None
-    assert "TimeoutError: deadline exceeded" in finding
+    assert "ValueError: the SDK rejected the config this repo sends" in finding
 
 
 def quota_error():
@@ -173,6 +176,287 @@ def test_an_api_error_that_is_not_quota_stays_a_finding():
     assert "ServerError" in finding
 
 
+# --- JEB-1650: exit 1 means a parse finding and nothing else -----------------
+#
+# Two runs on `main` reported "contract broken" having judged no answer at all:
+# 36115530738 died on `import numpy` (a traceback is exit 1 in Python, the code
+# reserved for a finding) and 36801077007 reported a `ReadTimeout` plus a
+# `503 UNAVAILABLE` as "did not return an answer this repo can parse" — which is
+# true only in the sense that nothing was returned. Both now classify as
+# "unchecked", and the alert step can tell the three states apart.
+
+
+def read_timeout():
+    """The transport failure seen on run 36801077007, verbatim message."""
+    httpx = pytest.importorskip("httpx")
+    return httpx.ReadTimeout("The read operation timed out")
+
+
+def overloaded_error():
+    """The other half of that run: the model is up, but has no capacity now."""
+    errors = pytest.importorskip("google.genai.errors")
+    return errors.ServerError(
+        503,
+        {
+            "error": {
+                "code": 503,
+                "status": "UNAVAILABLE",
+                "message": "This model is currently experiencing high demand...",
+            }
+        },
+    )
+
+
+def test_a_transport_timeout_is_not_a_contract_finding():
+    """Nothing came back, so the shape of the answer was never on the table. The
+    old message said the answer "did not parse" about an answer that never was."""
+    with pytest.raises(contract.ProbeUnavailable) as raised:
+        contract.run(raising_probe(read_timeout()))
+
+    reason = str(raised.value)
+    assert "ReadTimeout" in reason
+    assert "unchecked" in reason
+    assert "GeminiTeacher._call" in reason
+
+
+def test_an_overloaded_model_is_not_a_contract_finding():
+    """`503 UNAVAILABLE` is the same class as 429: the call was never served. A
+    500 `INTERNAL` is not — a model took that one and broke on it."""
+    with pytest.raises(contract.ProbeUnavailable) as raised:
+        contract.run(raising_probe(overloaded_error()))
+
+    reason = str(raised.value)
+    assert "503" in reason
+    assert "UNAVAILABLE" in reason
+    assert "no capacity" in reason
+
+
+def test_a_bad_request_stays_a_finding():
+    """The call shape itself being rejected is exactly what this gate watches
+    for, so a 400 must not be swept into "not checked" with the refusals."""
+    errors = pytest.importorskip("google.genai.errors")
+    bad_request = errors.ClientError(
+        400,
+        {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "response_schema"}},
+    )
+
+    finding = contract.run(raising_probe(bad_request))
+
+    assert finding is not None
+    assert "ClientError" in finding
+
+
+def test_a_timeout_is_retried_but_a_quota_refusal_is_not():
+    """Opposite windows: a quota day cannot clear between two calls, a busy
+    minute can. So one is given the second attempt and the other is not."""
+    timeouts: list[int] = []
+    with pytest.raises(contract.ProbeUnavailable):
+        contract.run(raising_probe(read_timeout(), timeouts))
+    assert len(timeouts) == contract.ATTEMPTS
+
+    quota: list[int] = []
+    with pytest.raises(contract.ProbeUnavailable):
+        contract.run(raising_probe(quota_error(), quota))
+    assert len(quota) == 1
+
+
+def test_an_answer_after_a_timeout_is_a_pass():
+    """The retry exists to be used: a timed-out first call followed by a parsable
+    answer is the contract holding, not a degraded result."""
+    outcomes = [read_timeout(), GOOD_PLAN]
+
+    def flaky():
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    probe_with_a_hiccup = contract.Probe(
+        name="GeminiTeacher._call",
+        call=flaky,
+        shape_of=contract.GeminiTeacher._call,
+        parse=contract.TeacherPlan.model_validate_json,
+    )
+
+    assert contract.run(probe_with_a_hiccup) is None
+
+
+def test_one_bad_answer_beside_an_unanswered_call_is_unchecked():
+    """Production retries, so a single fenced answer is a state the app survives
+    — the finding needs both attempts. With the other attempt never answered,
+    there is no second data point, so the verdict is "unchecked", with both
+    attempts still spelled out for the log."""
+    outcomes = [read_timeout(), FENCED_PLAN]
+
+    def flaky():
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    with pytest.raises(contract.ProbeUnavailable) as raised:
+        contract.run(
+            contract.Probe(
+                name="GeminiTeacher._call",
+                call=flaky,
+                shape_of=contract.GeminiTeacher._call,
+                parse=contract.TeacherPlan.model_validate_json,
+            )
+        )
+
+    reason = str(raised.value)
+    assert "ReadTimeout" in reason
+    assert "did not parse" in reason
+
+
+def test_a_timed_out_night_exits_two(monkeypatch, capsys):
+    monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
+    pytest.importorskip("google.genai")
+
+    monkeypatch.setattr(
+        contract, "PROBES", (raising_probe(read_timeout()), raising_probe(overloaded_error()))
+    )
+
+    assert contract.main() == contract.EXIT_UNCHECKED
+    assert "not a pass and not a finding" in capsys.readouterr().err
+
+
+def test_a_crash_in_the_harness_exits_three_not_one(monkeypatch, capsys):
+    """`run` classifies everything the call and the parser can raise, so anything
+    escaping it is this script misbehaving — which says nothing about the model's
+    answers and must not be reported as a finding."""
+    monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
+    pytest.importorskip("google.genai")
+
+    def not_a_parser(_raw):
+        raise TypeError("the harness called the parser wrong")
+
+    broken = contract.Probe(
+        name="GeminiTeacher._call",
+        call=lambda: GOOD_PLAN,
+        shape_of=contract.GeminiTeacher._call,
+        parse=not_a_parser,
+    )
+
+    monkeypatch.setattr(contract, "PROBES", (broken, probe(FENCED_PLAN)))
+
+    assert contract.main() == contract.EXIT_CRASHED
+    err = capsys.readouterr().err
+    assert "THE PROBE ITSELF FAILED" in err
+    assert "TypeError" in err
+
+
+def test_cli_never_lets_a_traceback_leave_as_a_finding(monkeypatch, capsys):
+    """Python's exit code for an unhandled exception is 1 — the code this gate
+    reserves for "a shape's answer no longer parses". `cli` is the remap."""
+
+    def boom(_argv=None):
+        raise RuntimeError("something nobody anticipated")
+
+    monkeypatch.setattr(contract, "main", boom)
+
+    assert contract.cli() == contract.EXIT_CRASHED
+    assert "RuntimeError" in capsys.readouterr().err
+
+
+def test_cli_passes_a_normal_verdict_through(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
+    pytest.importorskip("google.genai")
+
+    monkeypatch.setattr(contract, "PROBES", (probe(GOOD_PLAN),))
+    assert contract.cli() == contract.EXIT_OK
+
+    monkeypatch.setattr(contract, "PROBES", (probe(FENCED_PLAN),))
+    assert contract.cli() == contract.EXIT_FINDING
+
+
+def test_an_unresolved_import_exits_three_not_one():
+    """Case 1, reproduced: run 36115530738 died on `import numpy` four modules
+    below `backend.miner.case` and exited 1, so the alert step opened "a call
+    shape's answer no longer parses" without a call having been placed. The
+    import is fixed (JEB-1601); this asserts the classification, by taking numpy
+    away again in a subprocess."""
+    blocker = f"""
+import runpy, sys
+from importlib.abc import MetaPathFinder
+
+class Blocked(MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "numpy" or name.startswith("numpy."):
+            raise ModuleNotFoundError("No module named 'numpy'")
+        return None
+
+sys.meta_path.insert(0, Blocked())
+sys.argv = [{str(SCRIPT)!r}]
+runpy.run_path({str(SCRIPT)!r}, run_name="__main__")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", blocker],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 3, result.stderr
+    assert "No module named 'numpy'" in result.stderr
+    assert "not a pass and not a finding" in result.stderr
+
+
+def alert_step() -> str:
+    """The body of the workflow step that turns an exit code into an issue."""
+    workflow = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
+    return workflow.split("Open, update or close the alert issue", 1)[1]
+
+
+def test_the_alert_step_routes_exit_three_to_failed_before_it_could_probe():
+    """The script's own "I fell over" code must not share an arm with a finding.
+    It shares one with an empty PROBE_EXIT, which is the same state a step
+    earlier."""
+    step = alert_step()
+    finding_arm = step.split("\n            1)\n", 1)[1].split("\n            2)\n", 1)[0]
+    crash_arm = step.split("\n            3|*)\n", 1)[1].split("\n          esac", 1)[0]
+
+    assert "no longer parses" in finding_arm
+    assert "failed before it could probe" in crash_arm
+
+
+def test_the_exit_two_alert_names_the_timeout_and_the_overload():
+    """A reader of the exit-2 issue needs to know a 503 or a timeout lands here
+    too, or they go looking for a missing key that is not missing."""
+    step = alert_step()
+    branch = step.split("\n            2)\n", 1)[1].split("\n            3|*)\n", 1)[0]
+
+    assert "503" in branch
+    assert "UNAVAILABLE" in branch
+    assert "ReadTimeout" in branch
+
+
+def test_the_alert_issue_is_only_reused_for_the_same_exit_code():
+    """Case 3: the old step reused *any* open issue with the label, so a quota
+    night commented "Still failing" on an issue about a parse finding, and a real
+    finding could only ever arrive as a comment on a false one."""
+    step = alert_step()
+
+    assert 'MARKER="<!-- live-gemini-contract exit=${PROBE_EXIT:-none} -->"' in step
+    # The lookup filters on that marker rather than taking the first open issue.
+    assert "contains(env.MARKER)" in step
+    assert "--json number,body" in step
+
+
+def test_a_green_run_closes_the_open_alert():
+    """An alert that outlives its cause is the failure mode: #71 stayed open
+    through three green nights, blocking any new issue the whole time."""
+    workflow = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
+    step = alert_step()
+
+    # It cannot close anything if it only runs on failure.
+    assert "if: failure() && github.event_name == 'schedule'" not in workflow
+    assert "!cancelled() && github.event_name == 'schedule'" in workflow
+    assert 'if [ "${PROBE_EXIT:-none}" = "0" ]; then' in step
+    assert "gh issue close" in step
+
+
 def test_an_unreachable_model_exits_two_and_a_finding_still_wins(monkeypatch, capsys):
     """Two shapes, two verdicts. Nothing checked is exit 2; one shape proving the
     contract broke is worth alerting on even when the other never ran."""
@@ -195,7 +479,7 @@ def test_the_exit_two_alert_names_the_quota_as_a_cause():
     install for the one cause that is neither — and is the expected one."""
     workflow = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
     # The `2)` arm of the `case` that builds the alert, up to the next arm.
-    branch = workflow.split("\n            2)\n", 1)[1].split("\n            *)\n", 1)[0]
+    branch = workflow.split("\n            2)\n", 1)[1].split("\n            3|*)\n", 1)[0]
 
     assert "429" in branch
     assert "RESOURCE_EXHAUSTED" in branch

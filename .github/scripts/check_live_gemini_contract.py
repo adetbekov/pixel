@@ -32,13 +32,22 @@ never executed in any form before it executed on the default branch, and died
 on a numpy it never names, four modules down from `backend.miner.case`. `ci.yml`
 runs this mode on every PR so the next such gap fails a diff instead of a night.
 
-Exit codes, which the workflow's alert step branches on:
+Exit codes, which the workflow's alert step branches on. Each one has to mean
+exactly one thing, because the alert step turns it into a title a reader trusts
+without opening the log (JEB-1650):
 
   0  both shapes answered in a parsable form
-  1  a real finding — at least one shape's answer did not parse
-  2  the probe could not be run at all (no key, SDK missing, import error, or
-     the API refused every call on quota); this is *not* evidence that the
-     contract broke
+  1  a real finding, and ONLY that — a shape's answer came back and the schema
+     this repo parses it with rejected it
+  2  the contract could not be checked: no key, SDK missing, or the model never
+     answered (quota, 503 UNAVAILABLE, a transport timeout). Not evidence that
+     the contract broke, not evidence that it holds
+  3  this script failed before or outside the probing — an import that does not
+     resolve, a bug in the harness, any unhandled traceback. Python's own exit
+     code for a traceback is 1, which is why this is caught and remapped: the
+     gate's first execution ever died on `import numpy` and opened an issue
+     titled "a call shape's answer no longer parses" having asked nothing
+     (JEB-1601 fixed the import, JEB-1650 the classification)
 """
 
 from __future__ import annotations
@@ -52,15 +61,36 @@ import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from backend.miner.case import Case
-from backend.miner.generate import SYSTEM_PROMPT as MINER_SYSTEM_PROMPT
-from backend.miner.generate import GeminiSkillGenerator
-from backend.miner.generate import build_input as build_miner_input
-from backend.miner.schema import SkillDraft
-from backend.state import RobotState
-from backend.teacher.client import GeminiTeacher
-from backend.teacher.prompt import build_input as build_teacher_input
-from backend.teacher.schema import TeacherPlan
+#: Exit codes, named so the branches below read as what they mean.
+EXIT_OK = 0
+EXIT_FINDING = 1
+EXIT_UNCHECKED = 2
+EXIT_CRASHED = 3
+
+# Guarded, and the guard is the point: these imports run before `main` gets a
+# say, so an unresolved one is a bare traceback — and a bare traceback is exit 1,
+# the code reserved for "a shape's answer no longer parses". That is not a
+# hypothetical either; it is what the nightly did on the only run it had ever
+# made (JEB-1601), and the issue it opened said the contract was broken when no
+# call had been placed. Remapping it here is what makes exit 1 trustworthy.
+try:
+    from backend.miner.case import Case
+    from backend.miner.generate import SYSTEM_PROMPT as MINER_SYSTEM_PROMPT
+    from backend.miner.generate import GeminiSkillGenerator
+    from backend.miner.generate import build_input as build_miner_input
+    from backend.miner.schema import SkillDraft
+    from backend.state import RobotState
+    from backend.teacher.client import GeminiTeacher
+    from backend.teacher.prompt import build_input as build_teacher_input
+    from backend.teacher.schema import TeacherPlan
+except Exception:  # noqa: BLE001 - any import failure, not only ImportError
+    traceback.print_exc()
+    print(
+        "\nThe probe could not even be imported, so nothing was asked of the live "
+        "model. This is not a pass and not a finding — see the traceback above.",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_CRASHED)
 
 #: One first try plus one retry, mirroring `MAX_ATTEMPTS` on both real paths: a
 #: single malformed answer is a retry in production too, so alerting on one
@@ -103,23 +133,48 @@ QUOTA_HTTP_CODE = 429
 #: SDK fills whichever of the two the error envelope carried.
 QUOTA_STATUS = "RESOURCE_EXHAUSTED"
 
+#: The `status` the API sends when the model is reachable but has no capacity to
+#: serve the call right now — "This model is currently experiencing high demand"
+#: (measured on run 36801077007). It arrives as a 503, so the HTTP family alone
+#: cannot separate it from a 500 `INTERNAL`, and the two are opposite verdicts: a
+#: 500 means a model took the call and broke on it, which is worth reporting; a
+#: 503 `UNAVAILABLE` means the call was never served, so the answer's shape was
+#: never on the table (JEB-1650).
+OVERLOADED_STATUS = "UNAVAILABLE"
+
+#: The HTTP status that carries it, accepted on its own: 503 is "Service
+#: Unavailable" by definition, so even an envelope with no `status` field is not
+#: evidence about the contract.
+OVERLOADED_HTTP_CODE = 503
+
+#: Failures where no HTTP response exists at all — the socket timed out, the
+#: connection dropped, the peer hung up mid-body. `httpx.ReadTimeout` is the one
+#: that was seen (run 36801077007) and the one the old message libelled as "did
+#: not return an answer this repo can parse": nothing was returned to parse.
+#: `httpx` is reached through `google-genai`, so it is imported defensively, the
+#: same way the SDK's own error class is.
+TRANSPORT_FAILURES: tuple[type[BaseException], ...] = (TimeoutError, ConnectionError)
+
 
 class ProbeUnavailable(Exception):
     """The API never answered, so there is nothing to judge — exit 2, not 1.
 
-    A quota refusal and a fenced answer are opposite outcomes: one means the
-    model's behaviour moved (a finding), the other means the model was never
-    asked. Collapsing them opens an issue titled "a call shape's answer no
-    longer parses" on a night when no answer existed at all.
+    A refusal and a fenced answer are opposite outcomes: one means the model's
+    behaviour moved (a finding), the other means the model was never asked.
+    Collapsing them opens an issue titled "a call shape's answer no longer
+    parses" on a night when no answer existed at all.
     """
 
 
-def quota_refusal(exc: BaseException) -> str | None:
-    """The reason line when `exc` is the API refusing on quota, else `None`.
+def _api_refusal(
+    exc: BaseException, http_code: int, status_name: str, phrasing: str
+) -> str | None:
+    """The reason line when `exc` is the API answering `http_code`/`status_name`.
 
-    `google.genai` is imported here rather than at module scope on purpose: a
-    missing SDK is itself an exit-2 condition that `main` reports in words, and
-    a top-level import would turn that into an ImportError traceback.
+    Either identifier is enough, because the SDK fills whichever one the error
+    envelope carried. `google.genai` is imported here rather than at module
+    scope on purpose: a missing SDK is itself an exit-2 condition that `main`
+    reports in words, and a top-level import would turn that into a traceback.
     """
     try:
         from google.genai.errors import APIError
@@ -129,10 +184,52 @@ def quota_refusal(exc: BaseException) -> str | None:
         return None
     code = getattr(exc, "code", None)
     status = getattr(exc, "status", None)
-    if code != QUOTA_HTTP_CODE and status != QUOTA_STATUS:
+    if code != http_code and status != status_name:
         return None
     detail = getattr(exc, "message", None) or str(exc)
-    return f"the API refused the call on quota ({code} {status}): {detail}"
+    return f"{phrasing} ({code} {status}): {detail}"
+
+
+def quota_refusal(exc: BaseException) -> str | None:
+    """The reason line when `exc` is the API refusing on quota, else `None`."""
+    return _api_refusal(
+        exc, QUOTA_HTTP_CODE, QUOTA_STATUS, "the API refused the call on quota"
+    )
+
+
+def overloaded_refusal(exc: BaseException) -> str | None:
+    """The reason line when `exc` is the model having no capacity, else `None`."""
+    return _api_refusal(
+        exc, OVERLOADED_HTTP_CODE, OVERLOADED_STATUS, "the model had no capacity for the call"
+    )
+
+
+def transport_refusal(exc: BaseException) -> str | None:
+    """The reason line when no HTTP answer arrived at all, else `None`."""
+    failures = list(TRANSPORT_FAILURES)
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - arrives with google-genai
+        pass
+    else:
+        failures.append(httpx.TransportError)
+    if not isinstance(exc, tuple(failures)):
+        return None
+    return (
+        f"no answer came back to judge — the call failed in transport "
+        f"({type(exc).__name__}: {exc})"
+    )
+
+
+def unanswered(exc: BaseException) -> str | None:
+    """The reason line when `exc` means the model produced no answer, else `None`.
+
+    Everything matched here is exit 2 — "not checked" — because the contract is a
+    statement about the *shape of an answer*, and these are the cases where no
+    answer exists. What is deliberately NOT matched: a 400, a 500, or any other
+    error whose envelope says a model saw the call and rejected or botched it.
+    """
+    return overloaded_refusal(exc) or transport_refusal(exc)
 
 
 def _code_of(func: Callable) -> str:
@@ -263,24 +360,40 @@ def run(probe: Probe) -> str | None:
 
     Raises :class:`ProbeUnavailable` when the call never reached a model answer
     for a reason that says nothing about the contract.
+
+    Every attempt is classified into one of those two buckets, and the verdict
+    needs *every* attempt to be a finding before it reports one. A run where one
+    attempt was never answered has not seen the contract fail twice in a row —
+    and one bad answer alone is a state production survives, since both real
+    paths retry (`MAX_ATTEMPTS`). So a mixed round is "not checked", with all the
+    attempts spelled out in the reason so the log loses nothing.
     """
-    failures = []
+    findings = []
+    refusals = []
     for attempt in range(1, ATTEMPTS + 1):
         try:
             raw = probe.call()
-        except Exception as exc:  # every failure is reportable here
-            refusal = quota_refusal(exc)
-            if refusal:
+        except Exception as exc:  # every failure is classified, none escapes
+            quota = quota_refusal(exc)
+            if quota:
                 # No retry: the quota window is a day, so the second attempt
                 # would fail identically and spend nothing but wall clock.
-                raise ProbeUnavailable(f"{probe.name}: {refusal}") from exc
-            failures.append(f"attempt {attempt}: the call itself raised {type(exc).__name__}: {exc}")
+                raise ProbeUnavailable(f"{probe.name}: {quota}") from exc
+            refusal = unanswered(exc)
+            if refusal:
+                # Retried, unlike quota: a timeout or a busy minute can pass
+                # between two calls, and an answer on the retry is a real pass.
+                refusals.append(f"attempt {attempt}: {refusal}")
+                continue
+            findings.append(
+                f"attempt {attempt}: the call itself raised {type(exc).__name__}: {exc}"
+            )
             continue
 
         try:
             probe.parse(raw)
         except ValueError as exc:
-            failures.append(
+            findings.append(
                 f"attempt {attempt}: answer did not parse — {exc}\n"
                 f"    answer starts: {preview(raw)}\n"
                 f"    {diagnose(raw)}"
@@ -290,9 +403,17 @@ def run(probe: Probe) -> str | None:
         print(f"ok: {probe.name} ({call_shape(probe.shape_of)}) answered in a parsable form")
         return None
 
-    joined = "\n  ".join(failures)
+    shape = call_shape(probe.shape_of)
+    if refusals:
+        joined = "\n  ".join(refusals + findings)
+        raise ProbeUnavailable(
+            f"{probe.name} — called as {shape} — was never answered by the model, so "
+            f"the shape of its answer is unchecked:\n  {joined}"
+        )
+
+    joined = "\n  ".join(findings)
     return (
-        f"{probe.name} — called as {call_shape(probe.shape_of)} — did not return an "
+        f"{probe.name} — called as {shape} — did not return an "
         f"answer this repo can parse, in {ATTEMPTS} attempt(s):\n  {joined}"
     )
 
@@ -310,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             f"imports resolve: {len(PROBES)} probe(s) — "
             + ", ".join(probe.name for probe in PROBES)
         )
-        return 0
+        return EXIT_OK
 
     if not os.environ.get("GEMINI_API_KEY"):
         print(
@@ -318,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
             "This is not a pass and not a finding.",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_UNCHECKED
 
     try:
         import google.genai  # noqa: F401
@@ -328,10 +449,11 @@ def main(argv: list[str] | None = None) -> int:
             "This is not a pass and not a finding.",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_UNCHECKED
 
     findings = []
     unchecked = []
+    crashes = []
     for probe in PROBES:
         # Both shapes are always probed: a teacher finding says nothing about the
         # miner, and half an answer reads like a whole one in the alert issue.
@@ -341,11 +463,27 @@ def main(argv: list[str] | None = None) -> int:
             unchecked.append(str(exc))
             continue
         except Exception:  # noqa: BLE001 — a crash in one probe must not hide the other
+            # Exit 3, not a finding: `run` already classifies everything the call
+            # and the parser can raise, so anything arriving here is this script
+            # misbehaving, which says nothing about the model's answers.
             traceback.print_exc()
-            findings.append(f"{probe.name}: the probe itself crashed, see the traceback above")
+            crashes.append(f"{probe.name}: the probe itself crashed, see the traceback above")
             continue
         if finding:
             findings.append(finding)
+
+    if crashes:
+        # Ranked above a finding on purpose: a harness that crashed on one shape
+        # may well have mis-judged the other, and "the gate is broken" is the
+        # thing to fix first.
+        print("\nTHE PROBE ITSELF FAILED:", file=sys.stderr)
+        for crash in crashes:
+            print(f"- {crash}", file=sys.stderr)
+        for finding in findings:
+            print(f"- (reported, but the run is not trustworthy) {finding}", file=sys.stderr)
+        for reason in unchecked:
+            print(f"- (not checked) {reason}", file=sys.stderr)
+        return EXIT_CRASHED
 
     if findings:
         # A real finding outranks an unchecked shape: one shape proving the
@@ -355,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"- {finding}", file=sys.stderr)
         for reason in unchecked:
             print(f"- (not checked) {reason}", file=sys.stderr)
-        return 1
+        return EXIT_FINDING
 
     if unchecked:
         print("\nNOT CHECKED:", file=sys.stderr)
@@ -366,11 +504,32 @@ def main(argv: list[str] | None = None) -> int:
             "This is not a pass and not a finding.",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_UNCHECKED
 
     print("Both call shapes hold their contract with the live model.")
-    return 0
+    return EXIT_OK
+
+
+def cli(argv: list[str] | None = None) -> int:
+    """`main` with the last escape hatch closed: no traceback leaves as exit 1.
+
+    Python exits 1 on an unhandled exception, and exit 1 here means "a shape's
+    answer no longer parses". Anything this catches is a bug in the gate, not a
+    statement about the model, so it leaves as exit 3 instead (JEB-1650).
+    """
+    try:
+        return main(argv)
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001 - the point is that NOTHING leaves as exit 1
+        traceback.print_exc()
+        print(
+            "\nThis script failed outside the probes, so the live contract was not "
+            "checked. This is not a pass and not a finding — see the traceback above.",
+            file=sys.stderr,
+        )
+        return EXIT_CRASHED
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
