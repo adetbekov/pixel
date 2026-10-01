@@ -448,3 +448,13 @@ is what makes the break visible. Two `flash-lite` calls a day, on the order of $
 and a green CI must not depend on a key. It is not a required check on any branch — it can go red
 because Google changed something, and that must never block a merge. A failing nightly opens (or
 comments on) an issue labelled `live-gemini-contract`.
+
+Which issue it opens is decided by the probe's exit code, and the three mean different things: **1**
+is a finding and only a finding — an answer came back and the schema rejected it; **2** is "not
+checked", where no answer came back at all (no key, quota `429`, a `503 UNAVAILABLE`, a transport
+timeout); **3** is the script itself falling over before it judged anything, including an import
+that does not resolve. Exit 1 is the only one that says the contract broke, so a traceback is
+remapped to 3 rather than inheriting Python's own exit 1 — the gate's first ever run died on `import
+numpy` and opened "a call shape's answer no longer parses" having asked nothing. An alert issue is
+reused only by a run with the *same* exit code, and a run that exits 0 closes the open ones: a
+false alert that outlives its cause blocks the real one from opening (JEB-1650).

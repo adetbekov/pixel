@@ -93,11 +93,12 @@ jobs:
           # The probe imports `backend.*` from the checkout; the project is not
           # installed, on purpose (see the install step above).
           PYTHONPATH: .
-        # Exit 1 (the contract broke) and exit 2 (the probe could not run at all)
-        # mean opposite things and must reach the alert step apart — so the code is
+        # Exit 1 (the contract broke), exit 2 (nothing was answered, so nothing was
+        # checked) and exit 3 (the script fell over before or outside the probing)
+        # mean different things and must reach the alert step apart — so the code is
         # published as a step output *before* the step fails. `set +e` brackets the
         # one command allowed to fail: a `run:` step already executes under `-e`, so
-        # a nonzero exit would otherwise skip the `echo` below and collapse 1 and 2
+        # a nonzero exit would otherwise skip the `echo` below and collapse them all
         # into "crashed before it could assert".
         run: |
           set -uo pipefail
@@ -108,17 +109,26 @@ jobs:
           echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
           exit "$code"
 
-      - name: Open or update an alert issue
+      - name: Open, update or close the alert issue
         # A nightly run has no PR to go red on, so the finding needs somewhere to
         # land. A manual `workflow_dispatch` skips this — whoever pressed the button
         # is already looking at the log.
-        if: failure() && github.event_name == 'schedule'
+        #
+        # Runs on success too, which `failure()` did not: a green night has to be
+        # able to CLOSE the alert, or the issue outlives the condition it reports.
+        # Measured, on #71: opened 2026-09-25 by the import crash, still open on
+        # 2026-09-30 with three green nights in between, and collecting "Still
+        # failing" comments from unrelated exit-2 nights the whole time. While it
+        # is open, a real finding cannot open its own issue — it becomes a comment
+        # on a false one, which is the gate failing at the only job it has
+        # (JEB-1650).
+        if: ${{ !cancelled() && github.event_name == 'schedule' }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Empty when the job died before the probe step ran (checkout, Python
-          # setup or the install).
+          # setup or the install) — handled as exit 3's sibling below.
           PROBE_EXIT: ${{ steps.probe.outputs.exit_code }}
         run: |
           set -euo pipefail
@@ -133,6 +143,25 @@ jobs:
             --description "Alerts from .github/workflows/live-gemini-contract.yml" \
             2>/dev/null || true
 
+          # The dedup key, and it carries the exit code on purpose. Reusing "any
+          # open issue with the label" let a quota night append "Still failing" to
+          # an issue about a parse finding — two different states, one thread, and
+          # a reader who cannot tell which one is current. One issue per exit code,
+          # closed by the run that disproves it.
+          MARKER="<!-- live-gemini-contract exit=${PROBE_EXIT:-none} -->"
+
+          if [ "${PROBE_EXIT:-none}" = "0" ]; then
+            # Both shapes answered and both parsed. Every open alert — whatever it
+            # claimed — is now stale, so close it with the run that disproved it.
+            gh issue list --state open --label "$LABEL" --json number --jq '.[].number' \
+              | while read -r NUMBER; do
+                [ -n "$NUMBER" ] || continue
+                gh issue close "$NUMBER" --reason completed --comment \
+                  "Resolved by a later run: both call shapes were probed and both answered in a parsable form. Run: ${RUN_URL}"
+              done
+            exit 0
+          fi
+
           case "${PROBE_EXIT}" in
             1)
               TITLE="ci: live Gemini contract broken — a call shape's answer no longer parses"
@@ -142,13 +171,20 @@ jobs:
               ;;
             2)
               TITLE="ci: live Gemini contract COULD NOT BE CHECKED"
-              DETAIL="The probe did not run (exit 2): no \`GEMINI_API_KEY\` secret, the SDK failed to install, or the API refused every call on quota (\`429 RESOURCE_EXHAUSTED\`). This is **not** evidence that the contract broke, and not evidence that it holds — the live path is simply unverified until a run exits 0 or 1.
+              DETAIL="No answer came back to judge (exit 2): no \`GEMINI_API_KEY\` secret, the SDK failed to install, or the model never answered — a quota refusal (\`429 RESOURCE_EXHAUSTED\`), no capacity (\`503 UNAVAILABLE\`, \"this model is currently experiencing high demand\") or a transport timeout (\`ReadTimeout\`). This is **not** evidence that the contract broke, and not evidence that it holds — the live path is simply unverified until a run exits 0 or 1.
 
           A quota refusal is the expected steady state while the key's project is on the free tier. The 20-\`generateContent\`-a-day allowance is counted per (project, model), so this run draws on two buckets: \`models/gemini-2.5-flash-lite\` for the teacher probe — shared with the live stand's \`/api/chat\` misses (JEB-1553) — and \`models/gemini-3.5-flash\` for the miner probe, the bucket JEB-1606 gave the miner, where this nightly is 1 of 20 beside the ~3 a mining pass spends. Either can be the empty one. Fix is a separate key/project for CI, or billing on the existing one — not a change to the probe."
               ;;
-            *)
+            3|*)
+              # Exit 3 is the script saying so itself — an unresolved import, a bug
+              # in the harness, any unhandled traceback. An empty PROBE_EXIT is the
+              # same state from one step earlier: checkout, Python setup or install.
+              # Both land here, and neither may ever reach the `1)` arm: a traceback
+              # exits 1 in Python, which is how run 36115530738 opened an issue
+              # titled "a call shape's answer no longer parses" after a
+              # ModuleNotFoundError, having asked the model nothing (JEB-1650).
               TITLE="ci: live Gemini contract run failed before it could probe"
-              DETAIL="The job failed without producing a probe result (exit code: '${PROBE_EXIT:-none}') — checkout, Python setup or dependency install. The state of the live contract is unknown; this is neither a pass nor a finding."
+              DETAIL="The job failed without ever judging a model answer (exit code: '${PROBE_EXIT:-none}') — checkout, Python setup, dependency install, an import the probe's graph does not resolve, or a crash inside the probe harness. The failing step's log has the traceback. The state of the live contract is unknown; this is neither a pass nor a finding."
               ;;
           esac
 
@@ -156,9 +192,13 @@ jobs:
 
           Run: ${RUN_URL}
 
-          <!-- live-gemini-contract -->"
+          ${MARKER}"
 
-          EXISTING=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')
+          # Only an issue whose own marker carries THIS exit code is the same
+          # alert. Anything else gets its own, so a finding is never buried as a
+          # comment on a "could not be checked" thread.
+          EXISTING=$(MARKER="$MARKER" gh issue list --state open --label "$LABEL" --json number,body \
+            --jq 'map(select(.body | contains(env.MARKER))) | .[0].number // empty')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "Still failing (${TITLE}). Run: ${RUN_URL}"
           else
