@@ -9,6 +9,11 @@ name: CI
 # leaves the branch tip itself untested. Without this, "is the tip of `dev` green?"
 # has no answer in the repository at all (step 1 of `jeb-release` needs one).
 # Deliberately NOT added to `required_status_checks`: it runs after the merge.
+#
+# On `push` only `lint + tests` runs (JEB-2010): it is the one job whose verdict
+# depends on the merge commit. The image and the frontend gates are functions of
+# files the PR run already saw — a second build of the same tree was 48% of the
+# repository's CI minutes and never found anything the PR run had not.
 on:
   pull_request:
     branches: [dev, main]
@@ -17,10 +22,12 @@ on:
 
 # Every job only reads the checkout — nothing pushes, comments on the PR or writes
 # packages, and `image build` deliberately never publishes the image it builds.
-# Third-party install scripts (`pip install -e`, `npm ci`) run in the same
-# environment as GITHUB_TOKEN, so it gets the narrowest scope that still works.
+# Third-party install scripts (`uv sync`, `npm ci`) run in the same environment as
+# GITHUB_TOKEN, so it gets the narrowest scope that still works. `pull-requests:
+# read` is for `dorny/paths-filter`, which lists a PR's changed files via the API.
 permissions:
   contents: read
+  pull-requests: read
 
 # On `pull_request` the PR number groups the run, so a new push to the branch
 # supersedes the in-flight one. On `push` `github.event.pull_request` is empty, so
@@ -32,93 +39,81 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Always runs, on every event: a README change is a test input here
+  # (`tests/test_compose_defaults.py` reads the env table), so there is no
+  # docs-only PR this job may skip.
   test:
     name: lint + tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.11"
-          cache: pip
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
 
-      # `laya` depends on torch. The default PyPI wheel is the CUDA build (~1 GB);
-      # CI only ever needs CPU, so pre-seed the CPU wheel and let the editable
-      # install below see the requirement as already satisfied.
-      #
-      # Same file the Dockerfile installs from — this job is only evidence about the
-      # image if both install the same torch, and one file cannot disagree with
-      # itself. The `image build` job below checks the image really got it.
-      - name: Install CPU torch
-        run: pip install -r requirements-torch.txt
-
-      - name: Install project
-        run: pip install -e ".[dev]"
+      # Project + `dev` group from the lockfile, and nothing else: the `engine`
+      # extra (laya + ~200 MB of torch) is the image's, not this job's —
+      # `backend/brain/engine.py` imports laya lazily and every test here runs on a
+      # fake engine. `--frozen` refuses to re-resolve, so what this job tests is
+      # what `uv.lock` records and what the Dockerfile installs.
+      - name: Install project + dev tooling
+        run: uv sync --frozen
 
       - name: Lint
-        run: ruff check .
+        run: uv run --frozen ruff check .
+
+      - name: Format
+        run: uv run --frozen ruff format --check .
 
       # No model weights are downloaded and no GEMINI_API_KEY is required here —
-      # those paths are mocked in tests.
+      # those paths are mocked in tests. The live-contract probe's import graph is
+      # covered too: `test_nothing_the_probe_imports_needs_laya` runs it in a
+      # subprocess with laya and torch blocked, which is the environment the weekly
+      # `Live Gemini Contract` gate installs (`uv sync --frozen --no-dev`).
       - name: Tests
-        run: pytest -q
-
-  # The nightly live-Gemini gate cannot run on a PR — it needs GEMINI_API_KEY, which
-  # a fork PR cannot be given — and its `schedule:` / `workflow_dispatch` triggers
-  # only resolve from the default branch. So before JEB-1601 that file had never
-  # executed in any form until it executed on `main`, where it died on import: a
-  # numpy it never names, four modules down from `backend.miner.case`.
-  #
-  # This job is the part of it a PR *can* run. It installs exactly what the nightly
-  # installs — same `live_contract_requirements.py`, so the two cannot drift — and
-  # imports the probe without a key and without a network call. It is not a
-  # substitute for the nightly; it only ensures the nightly gets as far as asking.
-  #
-  # `lint + tests` does not cover this: it installs `.[dev]`, which is a superset,
-  # so the nightly's narrower environment is only ever exercised here.
-  live-contract-imports:
-    name: live gemini contract imports
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install the dependencies the nightly installs
-        run: |
-          set -euo pipefail
-          python .github/scripts/live_contract_requirements.py > live-contract-requirements.txt
-          cat live-contract-requirements.txt
-          pip install -r live-contract-requirements.txt
-
-      # No GEMINI_API_KEY on purpose: `--check-imports` returns before the key is
-      # read, so this stays green on a fork PR and still fails on a missing import.
-      - name: Probe imports resolve
-        env:
-          PYTHONPATH: .
-        run: python .github/scripts/check_live_gemini_contract.py --check-imports
+        run: uv run --frozen pytest -q
 
   # `frontend/` ships as bare ES modules with no build step, so nothing but this job
   # ever parses it. ESLint is a CI-only devDependency; production stays dependency-free.
+  #
+  # PR-only (see the header), and a required check — so the job must still *report*
+  # on a PR that touches nothing it lints. The steps short-circuit on `paths-filter`
+  # instead of the workflow using `paths:`: a skipped job satisfies a required
+  # context, a workflow that never started does not.
   frontend:
     name: frontend lint
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'eslint.config.mjs'
+              - '.github/scripts/contrast_gate.mjs'
+              - '.github/workflows/ci.yml'
+
       - uses: actions/setup-node@v4
+        if: steps.changes.outputs.frontend == 'true'
         with:
           node-version: "20"
           cache: npm
 
       - name: Install lint toolchain
+        if: steps.changes.outputs.frontend == 'true'
         run: npm ci
 
       - name: Lint JS
+        if: steps.changes.outputs.frontend == 'true'
         run: npx eslint frontend
 
       # JEB-1521: статус отключённого навыка и причина отключения читались на
@@ -126,14 +121,32 @@ jobs:
       # которого карточка и нужна. Считать это глазами нельзя: контраст здесь
       # складывается из альфа-заливок и накопленной opacity предков, поэтому
       # гейт открывает страницу в Chromium и меряет вычисленные стили.
+      #
+      # The browser (~150 MB) is cached on the playwright version the lockfile
+      # pins; only its apt dependencies are reinstalled on a hit.
+      - name: Cache Chromium for the contrast gate
+        if: steps.changes.outputs.frontend == 'true'
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
       - name: Install Chromium for the contrast gate
+        if: steps.changes.outputs.frontend == 'true' && steps.playwright-cache.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
+      - name: Install Chromium's system dependencies (browser restored from cache)
+        if: steps.changes.outputs.frontend == 'true' && steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
       - name: Contrast (WCAG AA)
+        if: steps.changes.outputs.frontend == 'true'
         run: npm run contrast
 
       # Fixtures are fetched verbatim by mock.js — a broken one fails only at runtime.
       - name: Validate mock fixtures
+        if: steps.changes.outputs.frontend == 'true'
         run: |
           shopt -s nullglob
           files=(frontend/mocks/*.json)
@@ -150,9 +163,15 @@ jobs:
   # redeploy is `docker build .` on the NAS — without this job the first real build of
   # a commit happens on production. The image is built, probed and thrown away: this is
   # a gate, not a deploy, so nothing is pushed to a registry.
+  #
+  # PR-only, and short-circuited the same way as `frontend lint` (see there). Two
+  # filters: the compose checks need no image and also read README.md's deploy
+  # block, so they run on a docs change too; the build itself only when something
+  # that reaches the image changed.
   image:
     name: image build
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
     # One tag for the whole job: the build, both verifiers and the smoke run have to
     # be talking about the same image, and three copies of a literal cannot promise it.
     env:
@@ -160,14 +179,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # tomllib needs 3.11+; `packaging` compares the image's laya against the range
-      # in pyproject.toml instead of a second copy of that range living in CI.
-      - uses: actions/setup-python@v5
+      - uses: dorny/paths-filter@v3
+        id: changes
         with:
-          python-version: "3.11"
-
-      - name: Install verifier deps
-        run: pip install packaging
+          filters: |
+            image:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'docker-compose.yml'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'backend/**'
+              - 'frontend/**'
+              - '.github/scripts/verify_image_deps.py'
+              - '.github/workflows/ci.yml'
+            compose:
+              - 'docker-compose.yml'
+              - 'README.md'
+              - '.github/scripts/verify_compose.py'
+              - '.github/workflows/ci.yml'
 
       # JEB-1527: both compose steps run before the build — they need no image, take
       # under a second, and a typo in the stack should not cost a full image build to
@@ -175,20 +205,24 @@ jobs:
       # resolves every `${VAR:-default}`; all of Pixel's have defaults, so nothing is
       # stubbed here and a variable that stops having one fails this step by design.
       - name: docker-compose.yml is valid
+        if: steps.changes.outputs.compose == 'true' || steps.changes.outputs.image == 'true'
         run: docker compose -f docker-compose.yml config -q
 
       # And that it starts *this* repo's image. A valid stack pulling someone else's
       # tag, or building from another context, passes `config` and then breaks the NAS
       # redeploy — where `pull_policy: never` turns a wrong tag into a silent no-op.
       - name: docker-compose.yml runs the image this job builds
-        run: python .github/scripts/verify_compose.py "$IMAGE"
+        if: steps.changes.outputs.compose == 'true' || steps.changes.outputs.image == 'true'
+        run: python3 .github/scripts/verify_compose.py "$IMAGE"
 
       - uses: docker/setup-buildx-action@v3
+        if: steps.changes.outputs.image == 'true'
 
-      # The torch CPU wheel is ~200 MB and its layer changes only when
-      # requirements-torch.txt does, so a code-only PR restores it from cache and
-      # rebuilds just the `pip install -e .` layer and the COPYs after it.
+      # The dependency layer (laya + the ~200 MB CPU torch wheel) is a function of
+      # `pyproject.toml` + `uv.lock` alone, so a code-only PR restores it from cache
+      # and rebuilds just the COPYs and the project install after it.
       - name: Build image
+        if: steps.changes.outputs.image == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -198,19 +232,35 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # tomllib needs 3.11+; `packaging` (dev group) compares the image's versions
+      # against the `engine` extra in pyproject.toml instead of a second copy of
+      # those ranges living in CI. `--only-group dev` installs the tooling and not
+      # the project — this job never imports `backend`.
+      - uses: astral-sh/setup-uv@v6
+        if: steps.changes.outputs.image == 'true'
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+
       # JEB-1516: ci.yml claimed the Dockerfile pinned the same torch while the
       # Dockerfile installed it unpinned, and nothing in CI could tell. This reads the
-      # pin from requirements-torch.txt and asks the built image what it actually has.
-      - name: Image carries the pinned CPU torch and an in-range laya
-        run: python .github/scripts/verify_image_deps.py "$IMAGE"
+      # pins from pyproject.toml's `engine` extra and asks the built image what it
+      # actually has — and, since this is the one environment in CI with laya
+      # installed, that `laya.embed_fn_from_agent` still has the shape
+      # `LayaEngine.embed` calls.
+      - name: Image carries the pinned CPU torch, an in-range laya and the embed helper
+        if: steps.changes.outputs.image == 'true'
+        run: uv run --frozen --only-group dev python .github/scripts/verify_image_deps.py "$IMAGE"
 
       # PIXEL_SKIP_MODEL=1 starts in ~2 s and downloads no weights. `/` and `/app.js`
       # are the load-bearing part: an image that lost the frontend — a dropped
       # `COPY frontend/`, a bad .dockerignore — 404s the whole UI silently, with
       # `/api/state` still answering 200 and not one error in the log. (JEB-1530: the
-      # `-e` in the Dockerfile is *not* what this catches; a non-editable build serves
-      # all three paths fine, because /app/backend shadows site-packages anyway.)
+      # project install in the Dockerfile is *not* what this catches; /app/backend
+      # shadows site-packages anyway.)
       - name: Smoke-run the image
+        if: steps.changes.outputs.image == 'true'
         run: |
           docker run -d --name pixel-ci -e PIXEL_SKIP_MODEL=1 -p 127.0.0.1:8000:8000 "$IMAGE"
           trap 'docker logs pixel-ci; docker rm -f pixel-ci >/dev/null 2>&1 || true' EXIT

@@ -25,20 +25,23 @@ name: Required Checks Audit
 # It reads protection; it must never be able to block the paths it protects.
 #
 # Note on the schedule: GitHub runs `schedule:` only from the default branch,
-# which for pixel is `main`. So the daily half starts working after this file
+# which for pixel is `main`. So the scheduled half starts working after this file
 # reaches `main` with the next dev -> main release; until then only the
 # `pull_request` half is live. "The workflow is in the repository" is not the
-# same statement as "the daily backstop runs".
+# same statement as "the weekly backstop runs".
 
 on:
   schedule:
-    # 07:00 UTC, matching the sibling studio repos so a morning read of the
-    # Actions tab shows the release-invariant monitors together.
-    - cron: "0 7 * * *"
+    # Monday 07:00 UTC, matching the sibling studio repos so a morning read of the
+    # Actions tab shows the release-invariant monitors together. Weekly, not daily
+    # (JEB-2010): protection drifts by a human PATCH, not by the hour, and the
+    # `pull_request` half below catches the diff-borne kind the day it arrives.
+    - cron: "0 7 * * 1"
   workflow_dispatch:
   pull_request:
     branches: [main, dev]
-    types: [opened, reopened, synchronize, edited]
+    # No `edited`: a title or body edit changes nothing this script reads.
+    types: [opened, reopened, synchronize]
     # Only the files that can break an assertion. Everything else would be a
     # full-repo re-run of a check that reads GitHub, not the diff.
     paths:
@@ -57,13 +60,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      # PyYAML comes from the locked `dev` group — the same pin `lint + tests` runs
+      # the script's tests against. `--only-group dev` leaves the project itself
+      # (and its laya/torch extra) out: this job never imports `backend`.
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.11"
-
-      - name: Install PyYAML
-        run: pip install "pyyaml>=6.0"
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
 
       - name: Assert required checks on dev and main
         id: assert
@@ -102,7 +106,7 @@ jobs:
           for branch in dev main; do
             echo "::group::${branch}"
             set +e
-            python3 scripts/assert_required_checks.py \
+            uv run --frozen --only-group dev python3 scripts/assert_required_checks.py \
               --repo "$GITHUB_REPOSITORY" --branch "$branch"
             code=$?
             set -e

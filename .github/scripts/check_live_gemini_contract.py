@@ -122,7 +122,7 @@ SDK_ENTRY_POINTS = (
 #:   the miner off the teacher's model precisely to stop the two competing.
 #:   `miner_probe()` builds `GeminiSkillGenerator()` with no model argument, so it
 #:   follows `generate.DEFAULT_MODEL` and moved with it. Worth stating plainly:
-#:   this nightly therefore takes 1 of those 20 out of the bucket JEB-1606 freed
+#:   this probe therefore takes 1 of those 20 out of the bucket JEB-1606 freed
 #:   for the miner, which spends ~3 per mining pass.
 #:
 #: An exhausted day is the expected steady state on either bucket, not an anomaly.
