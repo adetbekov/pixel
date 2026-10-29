@@ -235,9 +235,7 @@ async def test_a_non_latin_header_is_refused_not_crashed(client, seeded, monkeyp
 
 
 @pytest.mark.anyio
-async def test_a_non_latin_secret_still_lets_the_right_header_through(
-    client, seeded, monkeypatch
-):
+async def test_a_non_latin_secret_still_lets_the_right_header_through(client, seeded, monkeypatch):
     # The same trap from the other side: a non-latin MINE_REQUIRE_TOKEN used to
     # make *every* request a 500, the correct one included.
     monkeypatch.setenv("MINE_REQUIRE_TOKEN", "секрет")

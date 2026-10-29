@@ -166,9 +166,7 @@ class ProbeUnavailable(Exception):
     """
 
 
-def _api_refusal(
-    exc: BaseException, http_code: int, status_name: str, phrasing: str
-) -> str | None:
+def _api_refusal(exc: BaseException, http_code: int, status_name: str, phrasing: str) -> str | None:
     """The reason line when `exc` is the API answering `http_code`/`status_name`.
 
     Either identifier is enough, because the SDK fills whichever one the error
@@ -192,9 +190,7 @@ def _api_refusal(
 
 def quota_refusal(exc: BaseException) -> str | None:
     """The reason line when `exc` is the API refusing on quota, else `None`."""
-    return _api_refusal(
-        exc, QUOTA_HTTP_CODE, QUOTA_STATUS, "the API refused the call on quota"
-    )
+    return _api_refusal(exc, QUOTA_HTTP_CODE, QUOTA_STATUS, "the API refused the call on quota")
 
 
 def overloaded_refusal(exc: BaseException) -> str | None:
@@ -216,8 +212,7 @@ def transport_refusal(exc: BaseException) -> str | None:
     if not isinstance(exc, tuple(failures)):
         return None
     return (
-        f"no answer came back to judge — the call failed in transport "
-        f"({type(exc).__name__}: {exc})"
+        f"no answer came back to judge — the call failed in transport ({type(exc).__name__}: {exc})"
     )
 
 

@@ -176,17 +176,13 @@ def mismatches(environment: dict[str, str], document: str = "docker-compose.yml"
         except ValueError:
             same = False
         if not same:
-            failures.append(
-                f"{name}: {document} default {written!r} != code default {expected!r}"
-            )
+            failures.append(f"{name}: {document} default {written!r} != code default {expected!r}")
     return failures
 
 
 def unaccounted(environment: dict[str, str]) -> list[str]:
     return [
-        name
-        for name in environment
-        if name not in CODE_DEFAULTS and name not in NO_CODE_DEFAULT
+        name for name in environment if name not in CODE_DEFAULTS and name not in NO_CODE_DEFAULT
     ]
 
 

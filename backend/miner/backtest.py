@@ -363,9 +363,7 @@ def backtest(
     )
 
 
-def _head_reaches(
-    engine: DecisionEngine, trial: list[Skill], candidate: Skill, text: str
-) -> bool:
+def _head_reaches(engine: DecisionEngine, trial: list[Skill], candidate: Skill, text: str) -> bool:
     """Would the ``choice`` head land on the candidate with no ``examples`` to read?"""
     picked, _ = pick_skill(engine, trial, text)
     return picked is not None and picked.id == candidate.id

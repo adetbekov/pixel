@@ -64,9 +64,7 @@ def check(config: dict, built: str, ref: str, context: str) -> list[str]:
             "the gate and the NAS are building different images"
         )
     if (ROOT / context).resolve() != ROOT:
-        failures.append(
-            f"README.md builds from {context}, the job builds from the repo root"
-        )
+        failures.append(f"README.md builds from {context}, the job builds from the repo root")
 
     services = config.get("services") or {}
     if not services:

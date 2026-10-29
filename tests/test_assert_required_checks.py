@@ -341,9 +341,7 @@ def test_ok_line_counts_only_the_assertions_that_ran(asserted, branch, present, 
 def test_live_dev_ok_line_reflects_the_real_map():
     """Guards the counts against a future map edit, not just the fixtures."""
     line = arc.ok_line(arc.REQUIRED_CONTEXTS["dev"], "dev")
-    external = sum(
-        1 for p in arc.REQUIRED_CONTEXTS["dev"].values() if p is arc.EXTERNAL_STATUS
-    )
+    external = sum(1 for p in arc.REQUIRED_CONTEXTS["dev"].values() if p is arc.EXTERNAL_STATUS)
     assert external, "dev's map lost its EXTERNAL_STATUS entry — see JEB-1596"
     assert f"{external} {'is' if external == 1 else 'are'} EXTERNAL_STATUS" in line
 
@@ -422,7 +420,7 @@ def test_unparseable_workflow_is_undetermined_not_a_finding(workflows):
 
 
 def test_protected_true_without_a_protection_block_is_undetermined():
-    """"The token cannot see protection" is not "the branch is unprotected"."""
+    """ "The token cannot see protection" is not "the branch is unprotected"."""
     with pytest.raises(arc.CannotDetermine):
         arc.required_contexts({"protected": True})
 

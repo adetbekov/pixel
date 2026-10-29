@@ -742,9 +742,7 @@ async def test_a_stuck_neighbour_is_a_control_the_candidate_may_not_take(
     alone called it claimable and let the candidate keep its command for good:
     JEB-1548, re-opened for exactly the clusters already known to be unlearnable.
     """
-    fake = generator(
-        *([salto_json()] * max_attempts()), draft_json(), grouping=SALTO_THEN_TRICK
-    )
+    fake = generator(*([salto_json()] * max_attempts()), draft_json(), grouping=SALTO_THEN_TRICK)
 
     # The сальто cluster alone, and its draft breaks `feed` — refused every run
     # until its draft budget is gone.
@@ -769,9 +767,7 @@ async def test_a_stuck_neighbour_is_a_control_the_candidate_may_not_take(
 
 
 @pytest.mark.anyio
-async def test_a_user_rejected_neighbour_is_a_control_too(
-    client, seeded, miner_engine, generator
-):
+async def test_a_user_rejected_neighbour_is_a_control_too(client, seeded, miner_engine, generator):
     """The other term of `_worth_drafting`: a rejected case set never comes back.
 
     `reject` returns the cases to the pool at `mined=0` and remembers the set

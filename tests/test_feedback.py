@@ -120,8 +120,9 @@ def test_a_disabled_skill_leaves_the_router_immediately(seeded, engine):
     from backend.state import read_state
 
     state = read_state(seeded)
-    assert not isinstance(route(engine, load_skills(seeded, only_active=True), "привет", state),
-                          RouterMiss)
+    assert not isinstance(
+        route(engine, load_skills(seeded, only_active=True), "привет", state), RouterMiss
+    )
 
     rate(seeded, "greet", [1] * 6 + [-1] * 4)
 
@@ -209,9 +210,10 @@ def test_disabling_lifts_the_rejected_signature_of_the_same_cluster(seeded):
 
     assert (11, 12, 13) not in _rejected_signatures(seeded)
     # The row is retired, not deleted: the history of the decision is kept.
-    assert seeded.execute(
-        "SELECT status FROM skill_proposals WHERE id = 'old'"
-    ).fetchone()["status"] == "retired"
+    assert (
+        seeded.execute("SELECT status FROM skill_proposals WHERE id = 'old'").fetchone()["status"]
+        == "retired"
+    )
 
 
 def test_an_unrelated_rejection_survives(seeded):
@@ -269,9 +271,9 @@ async def test_a_disabled_skill_can_be_mined_and_accepted_again(
     # The user turns out to hate it: 4 dislikes in 10 ratings.
     rate(seeded, "show_trick", [1] * 6 + [-1] * 4)
     assert status_of(seeded, "show_trick") == "disabled"
-    assert seeded.execute(
-        "SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0"
-    ).fetchone()["n"] == 5
+    assert (
+        seeded.execute("SELECT COUNT(*) AS n FROM teacher_log WHERE mined = 0").fetchone()["n"] == 5
+    )
 
     # The miner proposes the same cluster again, under the same obvious id.
     assert (await client.post("/api/mine")).json()["proposals"] == 1

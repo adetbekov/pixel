@@ -542,6 +542,7 @@ def test_a_finding_exits_one_and_a_healthy_pair_exits_zero(monkeypatch):
 # the two tests below pin the two halves of that: nothing on the probe's path
 # needs the `engine` extra it leaves out, and the workflow installs nothing else.
 
+
 def test_check_imports_resolves_without_a_key(monkeypatch, capsys):
     """The PR-side mode. It must return before the key is read, or it cannot run
     on a fork PR — which is the only place it can catch the defect early."""

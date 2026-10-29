@@ -182,6 +182,4 @@ def _lift_rejections(conn: sqlite3.Connection, signature: tuple[int, ...]) -> No
         except (TypeError, ValueError):
             continue
         if rejected == signature:
-            conn.execute(
-                "UPDATE skill_proposals SET status = 'retired' WHERE id = ?", (row["id"],)
-            )
+            conn.execute("UPDATE skill_proposals SET status = 'retired' WHERE id = ?", (row["id"],))

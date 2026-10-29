@@ -60,9 +60,7 @@ HACKED_PLAN = json.dumps(
     ensure_ascii=False,
 )
 
-BLANK_REPLY_PLAN = json.dumps(
-    {"reply": "   ", "handled": True, "actions": [{"action": "jump"}]}
-)
+BLANK_REPLY_PLAN = json.dumps({"reply": "   ", "handled": True, "actions": [{"action": "jump"}]})
 
 #: The teacher answered, and declined: a real plan, a real reply, `handled` false.
 DECLINED_PLAN = json.dumps(
@@ -308,7 +306,7 @@ async def test_an_ordinary_answer_carries_no_status(client, seeded, missing, tea
 
 @pytest.mark.anyio
 async def test_an_ordinary_fallback_carries_no_status_either(client, seeded, missing, teacher):
-    """"Did not understand" is not an outage — `FALLBACK_PLAN` keeps a null flag."""
+    """ "Did not understand" is not an outage — `FALLBACK_PLAN` keeps a null flag."""
     teacher(HACKED_PLAN)
     body = (await client.post("/api/chat", json={"text": "взломай насу"})).json()
     assert body["reply"] == FALLBACK_REPLY
@@ -316,9 +314,7 @@ async def test_an_ordinary_fallback_carries_no_status_either(client, seeded, mis
 
 
 @pytest.mark.anyio
-async def test_a_quota_outage_never_reaches_the_mining_pool(
-    client, conn, seeded, missing, teacher
-):
+async def test_a_quota_outage_never_reaches_the_mining_pool(client, conn, seeded, missing, teacher):
     """A billing outage is not an example of anything, so it must not be mined.
 
     Two checks in `backend/miner/case._parse` hold it — the row has an `error`,
@@ -468,13 +464,9 @@ async def test_a_refusal_with_nothing_to_do_still_speaks(client, seeded, missing
 
 
 @pytest.mark.anyio
-async def test_an_empty_plan_that_claims_to_have_acted_is_retried(
-    client, seeded, missing, teacher
-):
+async def test_an_empty_plan_that_claims_to_have_acted_is_retried(client, seeded, missing, teacher):
     """`handled` true and nothing done is a contradiction, not a refusal."""
-    gemini = teacher(
-        json.dumps({"reply": "Смотри!", "handled": True, "actions": []}), GOOD_PLAN
-    )
+    gemini = teacher(json.dumps({"reply": "Смотри!", "handled": True, "actions": []}), GOOD_PLAN)
     body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
 
     assert len(gemini.calls) == 2
@@ -599,9 +591,7 @@ async def test_a_blank_reply_never_reaches_the_user(client, seeded, missing, tea
     `""` is stopped by `min_length` in the schema and `"   "` only by the strip
     check in `_parse` — both must end up retried, then on the fallback.
     """
-    gemini = teacher(
-        json.dumps({"reply": blank, "handled": True, "actions": [{"action": "jump"}]})
-    )
+    gemini = teacher(json.dumps({"reply": blank, "handled": True, "actions": [{"action": "jump"}]}))
 
     body = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
 
