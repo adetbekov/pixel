@@ -6,18 +6,15 @@ pipeline: the real clustering, the real draft schema, the real backtest and the
 real endpoints.
 """
 
-import inspect
 import json
 import math
 import sqlite3
 
-import httpx
 import pytest
 
 from backend import db
 from backend.brain.engine import set_engine
 from backend.brain.skill import load_skills
-from backend.main import app
 from backend.miner import MineResult, mine_once, set_generator, wait_idle
 from backend.miner.attempts import max_attempts
 from backend.miner.generate import TIMEOUT_S, GeminiSkillGenerator
@@ -47,11 +44,6 @@ PROPOSAL_KEYS = {
 }
 
 
-@pytest.fixture()
-def anyio_backend():
-    return "asyncio"
-
-
 @pytest.fixture(autouse=True)
 def unthrottled_mine(monkeypatch):
     """`POST /api/mine` is capped at `MINE_RATE_LIMIT` a minute (JEB-1623).
@@ -71,13 +63,6 @@ def miner_engine():
     set_engine(fake)
     yield fake
     set_engine(None)
-
-
-@pytest.fixture()
-async def client(seeded):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        yield async_client
 
 
 def refusals(conn) -> int:
@@ -454,42 +439,6 @@ async def test_the_miner_budget_reaches_the_api_in_milliseconds_and_as_a_floor(
     assert http_options["headers"]["X-Server-Timeout"] == str(math.ceil(TIMEOUT_S))
 
 
-def test_the_sdk_still_has_the_surface_the_miner_calls():
-    """That the *real* SDK takes what `GeminiSkillGenerator._call` passes it.
-
-    `FakeGeminiClient` accepts any keyword, so every other test here proves only
-    that the code *sends* the argument. `config` is a plain dict, so a renamed
-    field would not even raise — it would ride along to the API, the draft would
-    come back fenced, `propose` would return `None`, and the miner would go
-    silent with CI still green. That is exactly the defect JEB-1513 found in the
-    teacher and this task's sibling of it. Constructing the client needs no
-    network and no real key.
-    """
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key="not-a-real-key-and-never-sent")
-    parameters = inspect.signature(type(client.models).generate_content).parameters
-    assert {"model", "contents", "config"} <= set(parameters)
-
-    assert {
-        "system_instruction",
-        "response_mime_type",
-        "response_schema",
-        "http_options",
-    } <= set(types.GenerateContentConfig.model_fields)
-    assert {"timeout", "headers"} <= set(types.HttpOptions.model_fields)
-    assert hasattr(types.GenerateContentResponse, "text")
-
-    # The floor only holds because the SDK fills `X-Server-Timeout` from the
-    # timeout *only* when we have not set it ourselves.
-    from google.genai._api_client import populate_server_timeout_header
-
-    headers = {"X-Server-Timeout": "30"}
-    populate_server_timeout_header(headers, 30.0)
-    assert headers["X-Server-Timeout"] == "30"
-
-
 @pytest.mark.anyio
 async def test_a_fenced_draft_is_not_parsed(client, seeded, miner_engine, generator, caplog):
     """The fences stay a failure here too, deliberately.
@@ -613,7 +562,7 @@ async def test_a_refusal_does_not_re_trigger_a_parked_pool(
 
 
 @pytest.mark.anyio
-async def test_mine_on_an_empty_pool_is_200_not_500(client):
+async def test_mine_on_an_empty_pool_is_200_not_500(client, seeded):
     assert (await client.post("/api/mine")).status_code == 200
     assert (await client.post("/api/mine")).json() == {"started": True, "proposals": 0}
     assert (await client.get("/api/proposals")).json() == []
@@ -718,7 +667,9 @@ async def test_a_refused_cluster_stops_costing_a_draft_per_run(
     case set nothing about has changed. After `MINER_MAX_ATTEMPTS` refusals it is
     skipped before the generator is called.
     """
-    thief = FakeEngine(routes={**TRICK_ROUTES, "покорми": "show_trick"}, embeddings=TRICK_EMBEDDINGS)
+    thief = FakeEngine(
+        routes={**TRICK_ROUTES, "покорми": "show_trick"}, embeddings=TRICK_EMBEDDINGS
+    )
     set_engine(thief)
     try:
         fake = generator(draft_json())
@@ -748,7 +699,9 @@ async def test_a_new_case_buys_the_stuck_cluster_another_draft(
     growing cluster ever gained, until the panel's "stuck now" quietly became
     "stuck ever".
     """
-    thief = FakeEngine(routes={**TRICK_ROUTES, "покорми": "show_trick"}, embeddings=TRICK_EMBEDDINGS)
+    thief = FakeEngine(
+        routes={**TRICK_ROUTES, "покорми": "show_trick"}, embeddings=TRICK_EMBEDDINGS
+    )
     set_engine(thief)
     try:
         fake = generator(draft_json())
@@ -866,7 +819,9 @@ def test_the_draft_budget_is_configurable_but_never_zero(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_a_budget_of_one_still_drafts_once(client, seeded, miner_engine, generator, monkeypatch):
+async def test_a_budget_of_one_still_drafts_once(
+    client, seeded, miner_engine, generator, monkeypatch
+):
     monkeypatch.setenv("MINER_MAX_ATTEMPTS", "0")
     fake = generator(draft_json())
     fill_pool(seeded)

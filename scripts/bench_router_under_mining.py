@@ -260,7 +260,7 @@ def seed_pool(conn, size: int) -> list[str]:
     texts.extend((f"noise:{phrase}", phrase) for phrase in NOISE)
     texts = texts[:size]
 
-    for label, text in texts:
+    for _label, text in texts:
         payload = {"user_text": text, "state": state, "handled": True, "error": None}
         conn.execute(
             "INSERT INTO teacher_log (interaction_id, state_json, raw_response, actions_json,"

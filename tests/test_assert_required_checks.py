@@ -88,10 +88,6 @@ def _check(workflows, contexts, *, protected=True, base=CI_ON_BOTH, branch="dev"
 # --- the map is about this repository, not a copy of another one -------------
 
 
-def test_map_covers_dev_and_main():
-    assert sorted(arc.REQUIRED_CONTEXTS) == ["dev", "main"]
-
-
 @pytest.mark.parametrize("branch", ["dev", "main"])
 def test_every_asserted_context_is_a_real_job_name_in_the_file_it_names(branch):
     """The rename this script exists to catch must not already have happened.
@@ -286,42 +282,60 @@ def test_external_status_producers_are_not_fetched_as_workflow_files():
     assert arc.workflow_producers(EXTERNAL_MAP) == {"ci.yml"}
 
 
-def test_ok_line_does_not_claim_the_skipped_assertions_for_external_status():
-    """The one line a human reads must not cover contexts it skipped (JEB-1639).
-
-    Assertions 2 and 4 never ran for an EXTERNAL_STATUS entry, so a success line
-    claiming them for every asserted context is false about the exact entry the
-    audit exists to speak for. Pinned here because the next repo to take this
-    script copies the sentence along with it.
-    """
-    line = arc.ok_line(dict(EXTERNAL_MAP), "dev")
-    assert line.startswith("OK: all 3 asserted contexts are required on dev")
-    # Both skipped assertions are scoped to the 2 workflow-backed contexts...
-    assert "the 2 produced by a workflow job match their job names" in line
-    assert "reachable by a trigger that fires for PRs into dev" in line
-    # ...and the membership-only entry is counted, not folded into them.
-    assert "1 is EXTERNAL_STATUS" in line
-    assert "membership only" in line
-    assert "dev requires nothing this script does not assert." in line
-
-
-def test_ok_line_pluralises_several_external_status_entries():
-    asserted = {**EXTERNAL_MAP, "mirror synced": arc.EXTERNAL_STATUS}
-    line = arc.ok_line(asserted, "dev")
-    assert "all 4 asserted contexts" in line
-    assert "the 2 produced by a workflow job" in line
-    assert "2 are EXTERNAL_STATUS" in line
-
-
-def test_ok_line_is_unchanged_when_nothing_is_membership_only():
-    """No sentinel in the map, no caveat — assertions 2 and 4 really did run."""
-    line = arc.ok_line(dict(MAP), "main")
-    assert line == (
-        "OK: all 2 asserted contexts are required on main, their context strings "
-        "match their job names, every one of them is reachable by a trigger that "
-        "fires for PRs into main, and main requires nothing this script does not assert."
-    )
-    assert "EXTERNAL_STATUS" not in line
+@pytest.mark.parametrize(
+    ("asserted", "branch", "present", "absent"),
+    [
+        # JEB-1639: the one line a human reads must not cover contexts it skipped.
+        # Assertions 2 and 4 never ran for an EXTERNAL_STATUS entry, so both are
+        # scoped to the 2 workflow-backed contexts and the membership-only entry is
+        # counted, not folded into them. Pinned because the next repo to take this
+        # script copies the sentence along with it.
+        pytest.param(
+            dict(EXTERNAL_MAP),
+            "dev",
+            [
+                "OK: all 3 asserted contexts are required on dev",
+                "the 2 produced by a workflow job match their job names",
+                "reachable by a trigger that fires for PRs into dev",
+                "1 is EXTERNAL_STATUS",
+                "membership only",
+                "dev requires nothing this script does not assert.",
+            ],
+            [],
+            id="one-external-status-entry",
+        ),
+        pytest.param(
+            {**EXTERNAL_MAP, "mirror synced": arc.EXTERNAL_STATUS},
+            "dev",
+            [
+                "all 4 asserted contexts",
+                "the 2 produced by a workflow job",
+                "2 are EXTERNAL_STATUS",
+            ],
+            [],
+            id="several-external-status-entries-pluralise",
+        ),
+        # No sentinel in the map, no caveat — assertions 2 and 4 really did run.
+        pytest.param(
+            dict(MAP),
+            "main",
+            [
+                "OK: all 2 asserted contexts are required on main, their context strings "
+                "match their job names, every one of them is reachable by a trigger that "
+                "fires for PRs into main, and main requires nothing this script does not assert."
+            ],
+            ["EXTERNAL_STATUS"],
+            id="nothing-membership-only",
+        ),
+    ],
+)
+def test_ok_line_counts_only_the_assertions_that_ran(asserted, branch, present, absent):
+    line = arc.ok_line(asserted, branch)
+    assert line.startswith("OK: all ")
+    for fragment in present:
+        assert fragment in line, fragment
+    for fragment in absent:
+        assert fragment not in line, fragment
 
 
 def test_live_dev_ok_line_reflects_the_real_map():

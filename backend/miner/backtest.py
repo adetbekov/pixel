@@ -269,7 +269,9 @@ def check_overreach(
     for case in outsiders:
         picked, confidence = pick_skill(engine, trial, case.user_text)
         if picked is not None and picked.id == candidate.id:
-            return f'"{case.user_text}" (nothing will claim it) -> {candidate.id} @ {confidence:.2f}'
+            return (
+                f'"{case.user_text}" (nothing will claim it) -> {candidate.id} @ {confidence:.2f}'
+            )
     return None
 
 

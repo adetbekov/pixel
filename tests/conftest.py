@@ -1,8 +1,10 @@
+import httpx
 import pytest
 
 from backend import db
 from backend.brain.engine import set_engine
 from backend.brain.skill import seed_db
+from backend.main import app
 from backend.miner import set_generator, stop_worker
 from backend.miner.generate import GeminiSkillGenerator
 from backend.ratelimit import chat_limiter, mine_limiter
@@ -43,6 +45,25 @@ def seeded(conn):
     """The four starter skills, loaded into the test database."""
     seed_db(conn)
     return conn
+
+
+@pytest.fixture()
+def anyio_backend():
+    """asyncio only — the app has no trio path and one backend keeps the suite half the size."""
+    return "asyncio"
+
+
+@pytest.fixture()
+async def client(conn):
+    """An in-process HTTP client over the ASGI app, on the test database.
+
+    `conn` already pointed the module-level connection at a tmp database, so the
+    app's lifespan is deliberately not run here. Tests that need the starter
+    skills request `seeded` alongside.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        yield async_client
 
 
 @pytest.fixture()

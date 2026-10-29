@@ -8,30 +8,16 @@ comes back with it.
 import json
 import uuid
 
-import httpx
 import pytest
 
 from backend import db, feedback
 from backend.brain.engine import set_engine
 from backend.brain.router import RouterMiss, route
 from backend.brain.skill import load_skills
-from backend.main import app
 from backend.state import iso, utcnow
 
 from .fakes import FakeEngine
 from .trick_cluster import TRICK_EMBEDDINGS, TRICK_ROUTES, draft_json, fill_pool
-
-
-@pytest.fixture()
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture()
-async def client(conn):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        yield async_client
 
 
 @pytest.fixture()
@@ -56,7 +42,7 @@ def rate(conn, skill_id: str, votes: list[int]) -> list[int]:
     somebody else's life.
     """
     ids = []
-    for value in votes:
+    for _value in votes:
         cursor = conn.execute(
             "INSERT INTO interactions (ts, user_text, engine, skill_id, confidence,"
             " latency_ms, actions_json, reply_text, feedback)"
@@ -332,7 +318,9 @@ async def test_a_disabled_skill_can_be_mined_and_accepted_again(
     # A 👎 of the new life is judged on the new life alone — one rating is under
     # `SKILL_MIN_RATED`, so it does not disable anything either.
     second = (await client.post("/api/chat", json={"text": "покажи фокус"})).json()
-    await client.post("/api/feedback", json={"interaction_id": second["interaction_id"], "value": -1})
+    await client.post(
+        "/api/feedback", json={"interaction_id": second["interaction_id"], "value": -1}
+    )
     assert status_of(seeded, "show_trick") == "active"
 
 

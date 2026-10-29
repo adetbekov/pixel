@@ -17,7 +17,6 @@ from backend import db
 from backend.actions import ACTIONS, MAX_SAY_LEN
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.skill import load_skills
-from backend.main import app
 from backend.miner.case import load_pool
 from backend.state import read_state
 from backend.teacher import (
@@ -102,18 +101,6 @@ class TimingOutClient:
         self.budgets.append(budget)
         self.now += budget + self._overshoot
         raise httpx.TimeoutException("deadline exceeded")
-
-
-@pytest.fixture()
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture()
-async def client(conn):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        yield async_client
 
 
 @pytest.fixture()
@@ -716,7 +703,9 @@ def test_the_env_still_overrides_the_default_model(monkeypatch):
 
 def test_the_sdk_still_has_the_surface_we_call():
     """The one check CI could not make before: that the *real* SDK takes what
-    `GeminiTeacher._call` passes it.
+    `GeminiTeacher._call` and `GeminiSkillGenerator._call` pass it — both call
+    `models.generate_content` with the same `config` keys and the same
+    `http_options`, so one test speaks for the miner too.
 
     `FakeGeminiClient` accepts any keyword, so every other test here proves only
     that the code *sends* the argument. `config` is a plain dict, so a renamed

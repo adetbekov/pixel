@@ -271,50 +271,40 @@ def test_every_deliberate_override_still_has_something_to_override():
     assert not stale, f"exemptions that no longer apply: {stale}"
 
 
+def drifted_compose(name: str, value: str) -> list[str]:
+    return mismatches(compose_environment() | {name: f"${{{name}:-{value}}}"})
+
+
+def drifted_env_example(name: str, value: str) -> list[str]:
+    return mismatches(env_example_environment() | {name: value}, ".env.example")
+
+
+def drifted_readme(name: str, value: str) -> list[str]:
+    return mismatches(readme_environment() | {name: value}, "README.md")
+
+
 @pytest.mark.parametrize(
-    ("name", "drifted"),
+    ("drift", "name", "drifted"),
     [
-        ("ROUTER_THRESHOLD", "0.6"),  # the JEB-1602 value, verbatim
-        ("MINER_SIM", "0.75"),
-        ("MINER_BATCH", "9"),
-        ("LAYA_DEVICE", "cuda"),
+        (drifted_compose, "ROUTER_THRESHOLD", "0.6"),  # the JEB-1602 value, verbatim
+        (drifted_compose, "MINER_SIM", "0.75"),
+        (drifted_compose, "MINER_BATCH", "9"),
+        (drifted_compose, "LAYA_DEVICE", "cuda"),
         # JEB-1623. A compose copy above the free tier's 20 would spend the
         # bucket the code deliberately stops short of.
-        ("TEACHER_DAILY_CAP", "20"),
-        ("CHAT_RATE_LIMIT", "200"),
-    ],
-)
-def test_a_drifted_compose_default_fails(name, drifted):
-    environment = compose_environment() | {name: f"${{{name}:-{drifted}}}"}
-    failures = mismatches(environment)
-    assert any(name in failure for failure in failures)
-
-
-@pytest.mark.parametrize(
-    ("name", "drifted"),
-    [
+        (drifted_compose, "TEACHER_DAILY_CAP", "20"),
+        (drifted_compose, "CHAT_RATE_LIMIT", "200"),
         # The JEB-1606 case verbatim: the code moved, `.env.example` did not.
-        ("GEMINI_MINER_MODEL", "models/gemini-2.5-flash-lite"),
-        ("ROUTER_THRESHOLD", "0.6"),
-        ("PIXEL_DB_PATH", "/data/pixel.db"),
+        (drifted_env_example, "GEMINI_MINER_MODEL", "models/gemini-2.5-flash-lite"),
+        (drifted_env_example, "ROUTER_THRESHOLD", "0.6"),
+        (drifted_env_example, "PIXEL_DB_PATH", "/data/pixel.db"),
+        (drifted_readme, "GEMINI_MINER_MODEL", "models/gemini-2.5-flash-lite"),
+        (drifted_readme, "MINER_MAX_ATTEMPTS", "5"),
     ],
+    ids=lambda v: v.__name__.removeprefix("drifted_") if callable(v) else v,
 )
-def test_a_drifted_env_example_default_fails(name, drifted):
-    environment = env_example_environment() | {name: drifted}
-    failures = mismatches(environment, ".env.example")
-    assert any(name in failure for failure in failures)
-
-
-@pytest.mark.parametrize(
-    ("name", "drifted"),
-    [
-        ("GEMINI_MINER_MODEL", "models/gemini-2.5-flash-lite"),
-        ("MINER_MAX_ATTEMPTS", "5"),
-    ],
-)
-def test_a_drifted_readme_default_fails(name, drifted):
-    environment = readme_environment() | {name: drifted}
-    failures = mismatches(environment, "README.md")
+def test_a_drifted_default_fails_in_every_gated_document(drift, name, drifted):
+    failures = drift(name, drifted)
     assert any(name in failure for failure in failures)
 
 

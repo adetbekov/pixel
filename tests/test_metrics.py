@@ -4,11 +4,9 @@
 counting button clicks, and dividing by zero — are what these tests pin.
 """
 
-import httpx
 import pytest
 
 from backend import metrics
-from backend.main import app
 from backend.state import iso, utcnow
 
 FIELDS = {
@@ -25,24 +23,13 @@ FIELDS = {
 }
 
 
-@pytest.fixture()
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture()
-async def client(conn):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        yield async_client
-
-
 def log(conn, engine: str, *, latency_ms: int = 10, ts: str | None = None) -> int:
     """A logged interaction. Default `ts` is *now*, so the row is inside the window."""
     ts = ts or iso(utcnow())
     cursor = conn.execute(
         "INSERT INTO interactions (ts, user_text, engine, skill_id, confidence, latency_ms,"
-        " actions_json, reply_text, feedback) VALUES (?, 'команда', ?, NULL, NULL, ?, '[]', '', NULL)",
+        " actions_json, reply_text, feedback)"
+        " VALUES (?, 'команда', ?, NULL, NULL, ?, '[]', '', NULL)",
         (ts, engine, latency_ms),
     )
     conn.commit()
