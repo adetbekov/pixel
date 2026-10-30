@@ -35,15 +35,10 @@ name: Live Gemini Contract
 # This job is deliberately NOT a required status check on any branch: it can go red
 # because Google changed something, and that must never be able to block a merge.
 
-# Weekly, not nightly (JEB-2010): the free-tier key answered 9 of 35 nights with a
-# quota refusal and the alert issue (#81) sat red for weeks with nobody acting on
-# it — a daily signal nobody reads costs quota and attention and buys nothing a
-# weekly one does not. `workflow_dispatch` is the on-demand path after an SDK or
-# model change.
 on:
   schedule:
-    # Monday 03:17 UTC — off the hour, where every other repository's cron queues up.
-    - cron: "17 3 * * 1"
+    # 03:17 UTC — off the hour, where every other repository's cron queues up.
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:

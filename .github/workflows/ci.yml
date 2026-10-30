@@ -189,6 +189,9 @@ jobs:
               - 'docker-compose.yml'
               - 'pyproject.toml'
               - 'uv.lock'
+              # `readme = "README.md"` in pyproject.toml: the project build in the
+              # Dockerfile copies it, so a README-only PR still rebuilds the image.
+              - 'README.md'
               - 'backend/**'
               - 'frontend/**'
               - '.github/scripts/verify_image_deps.py'
