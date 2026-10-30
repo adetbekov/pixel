@@ -1,0 +1,81 @@
+name: Live Laya Router
+
+# Routes commands the starter library does not have through the real Laya
+# checkpoint and fails if a starter skill takes one, or if fewer than
+# MINER_BATCH of a topic reach the teacher — the learning loop's first step.
+# The rationale, the phrase sets and the exit codes live in
+# .github/scripts/check_router_foreign_commands.py (JEB-1561).
+#
+# Why this cannot be a step in `lint + tests`: there every route goes through
+# `tests/fakes.py::FakeEngine`, and that is by design — no weights, no torch,
+# seconds per run. The price is that real confidences against the real library
+# were checked nowhere, which is how `покажи сальто` -> `play` @0.605 survived
+# to QA (JEB-1547). This job pays for the `engine` extra (~200 MB CPU torch) and
+# the `multilingual` checkpoint (~650 MB) instead, so it is its own workflow,
+# like live-gemini-contract.yml.
+#
+# Unlike that one it needs no secret and spends no quota, so it runs on pull
+# requests — but only those that can move a routing confidence: the router, the
+# engine, the seed library, the verbaliser, the laya/torch pins, the miner's
+# batch size, and this gate itself.
+#
+# No cache for the weights, on purpose: `LayaEngine` loads the checkpoint
+# without a pinned revision, and so does every `docker build .` of the image.
+# A cached copy would keep this gate green on weights production no longer gets.
+#
+# Not a required status check: making it one is a branch-protection change on
+# dev/main, outside this file.
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - "backend/brain/**"
+      - "backend/miner/run.py"
+      - "backend/state.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/scripts/check_router_foreign_commands.py"
+      - ".github/workflows/live-laya-router.yml"
+  push:
+    branches: [dev, main]
+    paths:
+      - "backend/brain/**"
+      - "backend/miner/run.py"
+      - "backend/state.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/scripts/check_router_foreign_commands.py"
+      - ".github/workflows/live-laya-router.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-laya-router-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  foreign-commands:
+    name: unfamiliar commands reach the teacher
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+
+      # The project, the `engine` extra (laya + CPU torch from the pinned index)
+      # and nothing from `dev` — the same set the image installs.
+      - name: Install the locked project with the engine extra
+        run: uv sync --frozen --no-dev --extra engine
+
+      - name: Route unfamiliar commands through the live checkpoint
+        env:
+          PYTHONPATH: .
+        run: uv run --frozen --no-dev --extra engine python .github/scripts/check_router_foreign_commands.py
