@@ -395,9 +395,7 @@ def _parse(raw: str) -> tuple[TeacherResult | None, str]:
 
     raw_plan = _with_reply([a.to_dict() for a in actions], plan.reply)
     return (
-        TeacherResult(
-            raw_plan=raw_plan, reply=plan.reply, raw_response=raw, handled=plan.handled
-        ),
+        TeacherResult(raw_plan=raw_plan, reply=plan.reply, raw_response=raw, handled=plan.handled),
         "",
     )
 

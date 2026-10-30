@@ -1,0 +1,26 @@
+# `uvx pre-commit install` once; then every commit runs what CI's `lint + tests` and
+# `frontend lint` run. The ruff rev equals the `ruff==` pin in pyproject.toml's dev
+# group — bump both together.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+  - repo: local
+    hooks:
+      # The frontend ships as bare ES modules; eslint is the CI-only devDependency
+      # `npm ci` installs. `language: system` reuses that install instead of a second one.
+      - id: eslint
+        name: eslint (frontend)
+        entry: npx eslint
+        language: system
+        files: ^frontend/.*\.js$

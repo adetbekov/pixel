@@ -31,10 +31,9 @@ handled without Gemini, which is the number the whole project is measured on.
 ## Run it
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"            # CPU torch first if you are on a GPU-less box, see CI
-cp .env.example .env               # then fill GEMINI_API_KEY, or leave it empty
-uvicorn backend.main:app --reload  # http://127.0.0.1:8000
+uv sync --extra engine                    # locked deps + dev tooling; `engine` = laya + CPU torch
+cp .env.example .env                      # then fill GEMINI_API_KEY, or leave it empty
+uv run uvicorn backend.main:app --reload  # http://127.0.0.1:8000
 ```
 
 The first run downloads the Laya weights (~650 MB) into `HF_HOME`. Two shortcuts while developing:
@@ -73,7 +72,7 @@ then runs on Laya alone. Defaults are in `.env.example`.
 | `MINER_MAX_ATTEMPTS` | `3` | Drafts one *identical* set of cases gets before the miner stops redrawing it and counts it as stuck. A new case in the cluster resets the budget. Floored at 1 — `0` would switch mining off entirely. |
 | `SKILL_DISLIKE_LIMIT` | `0.30` | Dislike share above which a skill is switched off (strictly greater). |
 | `SKILL_MIN_RATED` | `5` | Ratings required before that rule applies at all. |
-| `TEACHER_DAILY_CAP` | `18` | Teacher calls allowed per free-tier bucket — a day from `07:00Z`, not a rolling 24 h. The tier gives 20; the spare two are the nightly live-contract gate's. |
+| `TEACHER_DAILY_CAP` | `18` | Teacher calls allowed per free-tier bucket — a day from `07:00Z`, not a rolling 24 h. The tier gives 20; the spare two are the live-contract gate's. |
 | `CHAT_RATE_LIMIT` | `20` | Requests a minute, per IP, before `POST /api/chat` answers `429` with `Retry-After`. |
 | `MINE_RATE_LIMIT` | `2` | The same for `POST /api/mine`, which costs a grouping call plus a draft per cluster. |
 | `MINE_REQUIRE_TOKEN` | — | Empty = `/api/mine` is open, which is what local runs and CI want. Set it and the request must carry the same value in an `X-Pixel-Admin` header, or it is a `403`. |
@@ -368,7 +367,10 @@ slowly once there is history behind it, so the windowed one is where the learnin
 
 The panel refreshes on load, after every reply, after a vote, and after accept/reject — on events,
 never on a timer. `GET /api/history` redraws the last interactions with their votes after a page
-reload; without it the 👎 survives in the database but vanishes from the screen.
+reload; without it the 👎 survives in the database but vanishes from the screen. Every row also
+carries `ts` — the log time verbatim out of `interactions.ts` — so the 24h window behind
+`laya_share_24h` and `avg_latency_*` can be re-cut over HTTP instead of with `sqlite3` inside the
+container. The chat does not render it.
 
 ## Deploy
 
@@ -420,8 +422,9 @@ otherwise first executed on production.
 
 Then it builds the same `Dockerfile` the NAS redeploy builds, so a broken image fails the PR
 instead of the stand. It asks the built image what it actually installed: torch must equal the
-pin in `requirements-torch.txt` — the one file the image *and* the test job install from — it must
-not be a CUDA wheel, and `laya` must land inside the range in `pyproject.toml`. Then it smoke-runs
+pin in `pyproject.toml`'s `engine` extra — the one declaration the image installs, from `uv.lock` —
+it must not be a CUDA wheel, `laya` must land inside the range next to it, and
+`laya.embed_fn_from_agent` must still have the shape `LayaEngine.embed` calls. Then it smoke-runs
 the container with `PIXEL_SKIP_MODEL=1` and asserts 200 from `/api/state`, `/` and `/app.js`. The
 last two are the missing-frontend regression: an image that lost `frontend/` — a dropped `COPY`, a
 bad `.dockerignore` — 404s the whole UI while `/api/state` still answers 200. It is *not* an
@@ -430,7 +433,7 @@ three paths, because `WORKDIR /app` plus uvicorn's default `--app-dir ""` make `
 shadow the site-packages copy either way. Nothing is pushed to a registry — the image is a gate,
 not a deploy.
 
-One gate runs **outside** the PR: `Live Gemini Contract`, nightly at 03:17 UTC and on
+One gate runs **outside** the PR: `Live Gemini Contract`, weekly (Monday 03:17 UTC) and on
 `workflow_dispatch`. Everything above runs against `tests/fakes.py::FakeGeminiClient`, which returns
 bare JSON whatever it is asked — so the teacher and miner paths stay green on fixtures while the
 live path is dead. That is not hypothetical: `interactions.create` + `response_format` does not hold
@@ -438,10 +441,20 @@ structured output on `models/gemini-2.5-flash-lite` (the answer comes back in a 
 fence), and both halves of the project shipped that call and had to be moved to
 `models.generate_content` + `response_schema`, both times found by hand on a live stand.
 
-So the nightly calls `GeminiTeacher._call` and `GeminiSkillGenerator._call` for real, once each, and
+So the weekly run calls `GeminiTeacher._call` and `GeminiSkillGenerator._call` for real, once each, and
 parses the answers with `TeacherPlan` / `SkillDraft` — no fence-stripping, because the strict parser
-is what makes the break visible. Two `flash-lite` calls a day, on the order of $0.001. It needs the
+is what makes the break visible. Two calls a week, on the order of $0.001. It needs the
 `GEMINI_API_KEY` repository secret, which is why it never runs on a PR: a fork PR cannot have it,
 and a green CI must not depend on a key. It is not a required check on any branch — it can go red
-because Google changed something, and that must never block a merge. A failing nightly opens (or
+because Google changed something, and that must never block a merge. A failing run opens (or
 comments on) an issue labelled `live-gemini-contract`.
+
+Which issue it opens is decided by the probe's exit code, and the three mean different things: **1**
+is a finding and only a finding — an answer came back and the schema rejected it; **2** is "not
+checked", where no answer came back at all (no key, quota `429`, a `503 UNAVAILABLE`, a transport
+timeout); **3** is the script itself falling over before it judged anything, including an import
+that does not resolve. Exit 1 is the only one that says the contract broke, so a traceback is
+remapped to 3 rather than inheriting Python's own exit 1 — the gate's first ever run died on `import
+numpy` and opened "a call shape's answer no longer parses" having asked nothing. An alert issue is
+reused only by a run with the *same* exit code, and a run that exits 0 closes the open ones: a
+false alert that outlives its cause blocks the real one from opening (JEB-1650).

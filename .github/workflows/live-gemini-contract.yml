@@ -1,6 +1,6 @@
 name: Live Gemini Contract
 
-# Asks the real model, once a night, whether it still answers in the shape our
+# Asks the real model, once a week, whether it still answers in the shape our
 # parsers demand. The rationale, the exit codes and the probes themselves live in
 # .github/scripts/check_live_gemini_contract.py (JEB-1552).
 #
@@ -13,13 +13,13 @@ name: Live Gemini Contract
 # Why it is a separate workflow and not a job in ci.yml: it needs GEMINI_API_KEY,
 # which a fork PR cannot be given, and it spends real quota. A PR must stay green
 # without the key — so this never runs on `pull_request`, and `ci.yml` never needs
-# a secret. Cost is two calls a day — one `gemini-2.5-flash-lite` (the teacher probe)
+# a secret. Cost is two calls a week — one `gemini-2.5-flash-lite` (the teacher probe)
 # and one `gemini-3.5-flash` (the miner probe, which follows `generate.DEFAULT_MODEL`
 # and moved with it in JEB-1606) — on the order of $0.001 on a billed project. The key
 # in the secret is not on one: its project is free tier, and the 20-`generateContent`-
 # a-day allowance is counted per (project, model), so the two calls come out of two
 # separate buckets. The teacher's is shared with the live stand and is usually empty;
-# the miner's is the one JEB-1606 freed for mining, and this nightly takes 1 of its 20
+# the miner's is the one JEB-1606 freed for mining, and this probe takes 1 of its 20
 # against the ~3 a mining pass spends. Either refusal comes back as
 # `429 RESOURCE_EXHAUSTED` (JEB-1553). The probe reports that as exit 2 — "could not be
 # checked" — never as a contract finding.
@@ -27,7 +27,7 @@ name: Live Gemini Contract
 # Note on the triggers, same as required-checks-audit.yml: GitHub resolves both
 # `schedule:` and `workflow_dispatch` only from the default branch, which for pixel
 # is `main`. Until this file reaches `main` with a release, neither trigger works —
-# the nightly does not exist, and a manual start is refused with
+# the schedule does not exist, and a manual start is refused with
 # `HTTP 404: workflow live-gemini-contract.yml not found on the default branch`
 # even when `--ref` names a branch that has the file (measured, JEB-1553).
 # "The workflow is in the repository" is not "the workflow can run".
@@ -56,82 +56,103 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.11"
-          cache: pip
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
 
-      # Deliberately NOT `pip install -e ".[dev]"`: that pulls `laya`, which pulls
-      # ~1 GB of torch, and nothing on the probe's import path reaches it.
+      # `--no-dev` and no extras: exactly `[project].dependencies` out of the
+      # lockfile — the SDK, pydantic, numpy and the rest — and NOT the `engine`
+      # extra, whose laya pulls ~1 GB of torch that nothing on the probe's import
+      # path reaches (`backend/brain/engine.py` imports it lazily; asserted by
+      # `tests/test_live_gemini_contract.py::test_nothing_the_probe_imports_needs_laya`).
       #
-      # But the list of what IS installed is no longer typed here. It used to be
-      # ("the SDK and pydantic, the probe touches nothing else") and that was
-      # wrong: `backend.miner.case` executes `backend/miner/__init__.py` -> `run`
-      # -> `cluster` -> `import numpy`, which this file never named and no reading
-      # of the script revealed. The gate died on that import on its first
+      # Nothing is typed by hand here. It used to be ("the SDK and pydantic, the
+      # probe touches nothing else") and that was wrong: `backend.miner.case`
+      # executes `backend/miner/__init__.py` -> `run` -> `cluster` -> `import numpy`,
+      # which that list never named. The gate died on that import on its first
       # execution ever — which, because `schedule:` and `workflow_dispatch` only
-      # resolve from the default branch, was on `main` (JEB-1601).
-      #
-      # `live_contract_requirements.py` prints pyproject.toml's own dependency
-      # list minus the exclusions it justifies, so this step and `lint + tests`
-      # install from one declaration and a new project dependency arrives here by
-      # itself. `ci.yml`'s `live gemini contract imports` job runs the same script
-      # on every PR, so a gap fails a diff instead of a night.
-      - name: Install the dependencies this repo pins
-        run: |
-          set -euo pipefail
-          python .github/scripts/live_contract_requirements.py > live-contract-requirements.txt
-          echo "installing:"
-          cat live-contract-requirements.txt
-          pip install -r live-contract-requirements.txt
+      # resolve from the default branch, was on `main` (JEB-1601). A dependency
+      # added to pyproject.toml now reaches this job through `uv.lock`, by itself.
+      - name: Install the locked project dependencies
+        run: uv sync --frozen --no-dev
 
       - name: Probe both call shapes against the live model
         id: probe
         shell: bash
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # The probe imports `backend.*` from the checkout; the project is not
-          # installed, on purpose (see the install step above).
+          # The probe imports `backend.*` from the checkout.
           PYTHONPATH: .
-        # Exit 1 (the contract broke) and exit 2 (the probe could not run at all)
-        # mean opposite things and must reach the alert step apart — so the code is
+        # Exit 1 (the contract broke), exit 2 (nothing was answered, so nothing was
+        # checked) and exit 3 (the script fell over before or outside the probing)
+        # mean different things and must reach the alert step apart — so the code is
         # published as a step output *before* the step fails. `set +e` brackets the
         # one command allowed to fail: a `run:` step already executes under `-e`, so
-        # a nonzero exit would otherwise skip the `echo` below and collapse 1 and 2
+        # a nonzero exit would otherwise skip the `echo` below and collapse them all
         # into "crashed before it could assert".
         run: |
           set -uo pipefail
           set +e
-          python3 .github/scripts/check_live_gemini_contract.py
+          uv run --frozen --no-dev python3 .github/scripts/check_live_gemini_contract.py
           code=$?
           set -e
           echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
           exit "$code"
 
-      - name: Open or update an alert issue
-        # A nightly run has no PR to go red on, so the finding needs somewhere to
+      - name: Open, update or close the alert issue
+        # A scheduled run has no PR to go red on, so the finding needs somewhere to
         # land. A manual `workflow_dispatch` skips this — whoever pressed the button
         # is already looking at the log.
-        if: failure() && github.event_name == 'schedule'
+        #
+        # Runs on success too, which `failure()` did not: a green run has to be
+        # able to CLOSE the alert, or the issue outlives the condition it reports.
+        # Measured, on #71: opened 2026-09-25 by the import crash, still open on
+        # 2026-09-30 with three green nights in between, and collecting "Still
+        # failing" comments from unrelated exit-2 nights the whole time. While it
+        # is open, a real finding cannot open its own issue — it becomes a comment
+        # on a false one, which is the gate failing at the only job it has
+        # (JEB-1650).
+        if: ${{ !cancelled() && github.event_name == 'schedule' }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Empty when the job died before the probe step ran (checkout, Python
-          # setup or the install).
+          # setup or the install) — handled as exit 3's sibling below.
           PROBE_EXIT: ${{ steps.probe.outputs.exit_code }}
         run: |
           set -euo pipefail
 
           # A stable label, not a title search: `gh issue list --search` uses the
           # code-search grammar, where a title beginning `ci:` reads as a qualifier
-          # and matches nothing — so every nightly would open a fresh issue while
+          # and matches nothing — so every scheduled run would open a fresh issue while
           # the contract stayed broken.
           LABEL="live-gemini-contract"
           gh label create "$LABEL" \
             --color B60205 \
             --description "Alerts from .github/workflows/live-gemini-contract.yml" \
             2>/dev/null || true
+
+          # The dedup key, and it carries the exit code on purpose. Reusing "any
+          # open issue with the label" let a quota run append "Still failing" to
+          # an issue about a parse finding — two different states, one thread, and
+          # a reader who cannot tell which one is current. One issue per exit code,
+          # closed by the run that disproves it.
+          MARKER="<!-- live-gemini-contract exit=${PROBE_EXIT:-none} -->"
+
+          if [ "${PROBE_EXIT:-none}" = "0" ]; then
+            # Both shapes answered and both parsed. Every open alert — whatever it
+            # claimed — is now stale, so close it with the run that disproved it.
+            gh issue list --state open --label "$LABEL" --json number --jq '.[].number' \
+              | while read -r NUMBER; do
+                [ -n "$NUMBER" ] || continue
+                gh issue close "$NUMBER" --reason completed --comment \
+                  "Resolved by a later run: both call shapes were probed and both answered in a parsable form. Run: ${RUN_URL}"
+              done
+            exit 0
+          fi
 
           case "${PROBE_EXIT}" in
             1)
@@ -142,13 +163,20 @@ jobs:
               ;;
             2)
               TITLE="ci: live Gemini contract COULD NOT BE CHECKED"
-              DETAIL="The probe did not run (exit 2): no \`GEMINI_API_KEY\` secret, the SDK failed to install, or the API refused every call on quota (\`429 RESOURCE_EXHAUSTED\`). This is **not** evidence that the contract broke, and not evidence that it holds — the live path is simply unverified until a run exits 0 or 1.
+              DETAIL="No answer came back to judge (exit 2): no \`GEMINI_API_KEY\` secret, the SDK failed to install, or the model never answered — a quota refusal (\`429 RESOURCE_EXHAUSTED\`), no capacity (\`503 UNAVAILABLE\`, \"this model is currently experiencing high demand\") or a transport timeout (\`ReadTimeout\`). This is **not** evidence that the contract broke, and not evidence that it holds — the live path is simply unverified until a run exits 0 or 1.
 
-          A quota refusal is the expected steady state while the key's project is on the free tier. The 20-\`generateContent\`-a-day allowance is counted per (project, model), so this run draws on two buckets: \`models/gemini-2.5-flash-lite\` for the teacher probe — shared with the live stand's \`/api/chat\` misses (JEB-1553) — and \`models/gemini-3.5-flash\` for the miner probe, the bucket JEB-1606 gave the miner, where this nightly is 1 of 20 beside the ~3 a mining pass spends. Either can be the empty one. Fix is a separate key/project for CI, or billing on the existing one — not a change to the probe."
+          A quota refusal is the expected steady state while the key's project is on the free tier. The 20-\`generateContent\`-a-day allowance is counted per (project, model), so this run draws on two buckets: \`models/gemini-2.5-flash-lite\` for the teacher probe — shared with the live stand's \`/api/chat\` misses (JEB-1553) — and \`models/gemini-3.5-flash\` for the miner probe, the bucket JEB-1606 gave the miner, where this probe is 1 of 20 beside the ~3 a mining pass spends. Either can be the empty one. Fix is a separate key/project for CI, or billing on the existing one — not a change to the probe."
               ;;
-            *)
+            3|*)
+              # Exit 3 is the script saying so itself — an unresolved import, a bug
+              # in the harness, any unhandled traceback. An empty PROBE_EXIT is the
+              # same state from one step earlier: checkout, Python setup or install.
+              # Both land here, and neither may ever reach the `1)` arm: a traceback
+              # exits 1 in Python, which is how run 36115530738 opened an issue
+              # titled "a call shape's answer no longer parses" after a
+              # ModuleNotFoundError, having asked the model nothing (JEB-1650).
               TITLE="ci: live Gemini contract run failed before it could probe"
-              DETAIL="The job failed without producing a probe result (exit code: '${PROBE_EXIT:-none}') — checkout, Python setup or dependency install. The state of the live contract is unknown; this is neither a pass nor a finding."
+              DETAIL="The job failed without ever judging a model answer (exit code: '${PROBE_EXIT:-none}') — checkout, Python setup, dependency install, an import the probe's graph does not resolve, or a crash inside the probe harness. The failing step's log has the traceback. The state of the live contract is unknown; this is neither a pass nor a finding."
               ;;
           esac
 
@@ -156,9 +184,13 @@ jobs:
 
           Run: ${RUN_URL}
 
-          <!-- live-gemini-contract -->"
+          ${MARKER}"
 
-          EXISTING=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')
+          # Only an issue whose own marker carries THIS exit code is the same
+          # alert. Anything else gets its own, so a finding is never buried as a
+          # comment on a "could not be checked" thread.
+          EXISTING=$(MARKER="$MARKER" gh issue list --state open --label "$LABEL" --json number,body \
+            --jq 'map(select(.body | contains(env.MARKER))) | .[0].number // empty')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "Still failing (${TITLE}). Run: ${RUN_URL}"
           else

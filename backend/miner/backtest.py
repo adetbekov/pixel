@@ -269,7 +269,9 @@ def check_overreach(
     for case in outsiders:
         picked, confidence = pick_skill(engine, trial, case.user_text)
         if picked is not None and picked.id == candidate.id:
-            return f'"{case.user_text}" (nothing will claim it) -> {candidate.id} @ {confidence:.2f}'
+            return (
+                f'"{case.user_text}" (nothing will claim it) -> {candidate.id} @ {confidence:.2f}'
+            )
     return None
 
 
@@ -361,9 +363,7 @@ def backtest(
     )
 
 
-def _head_reaches(
-    engine: DecisionEngine, trial: list[Skill], candidate: Skill, text: str
-) -> bool:
+def _head_reaches(engine: DecisionEngine, trial: list[Skill], candidate: Skill, text: str) -> bool:
     """Would the ``choice`` head land on the candidate with no ``examples`` to read?"""
     picked, _ = pick_skill(engine, trial, text)
     return picked is not None and picked.id == candidate.id

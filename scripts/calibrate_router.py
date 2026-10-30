@@ -138,7 +138,7 @@ def ask(engine, skills: list[Skill], text: str) -> tuple[str, float]:
 def report_confidences(measured: list[tuple[str, str, str, str, float]]) -> None:
     print("\n=== 1. pass-1 confidences ===")
     for group in ("example", "paraphrase", "foreign"):
-        rows = sorted((c, t, w, l) for t, w, g, l, c in measured if g == group)
+        rows = sorted((c, t, w, lbl) for t, w, g, lbl, c in measured if g == group)
         print(f"  -- {group} ({len(rows)})")
         for confidence, text, want, label in rows:
             verdict = "ok" if label == (want or UNKNOWN) else "WRONG"

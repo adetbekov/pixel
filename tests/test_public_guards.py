@@ -15,11 +15,9 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
-import httpx
 import pytest
 
 from backend.api import ADMIN_HEADER
-from backend.main import app
 from backend.ratelimit import RateLimiter, client_key
 from backend.teacher import CAP_REPLY, CAP_STATUS
 from backend.teacher.budget import (
@@ -37,18 +35,6 @@ GOOD_PLAN = json.dumps(
         "actions": [{"action": "spin", "args": {}}],
     }
 )
-
-
-@pytest.fixture()
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture()
-async def client(conn):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        yield async_client
 
 
 @pytest.fixture()
@@ -249,13 +235,12 @@ async def test_a_non_latin_header_is_refused_not_crashed(client, seeded, monkeyp
 
 
 @pytest.mark.anyio
-async def test_a_non_latin_secret_still_lets_the_right_header_through(
-    client, seeded, monkeypatch
-):
+async def test_a_non_latin_secret_still_lets_the_right_header_through(client, seeded, monkeypatch):
     # The same trap from the other side: a non-latin MINE_REQUIRE_TOKEN used to
     # make *every* request a 500, the correct one included.
     monkeypatch.setenv("MINE_REQUIRE_TOKEN", "секрет")
-    assert (await client.post("/api/mine", headers={ADMIN_HEADER: "секрет".encode()})).status_code == 200
+    right = await client.post("/api/mine", headers={ADMIN_HEADER: "секрет".encode()})
+    assert right.status_code == 200
     wrong = await client.post("/api/mine", headers={ADMIN_HEADER: "пароль".encode()})
     assert wrong.status_code == 403
 
@@ -364,7 +349,7 @@ async def test_under_the_cap_nothing_changes(client, seeded, missing, teacher):
 
 
 def test_the_shipped_cap_leaves_the_live_contract_gate_its_two_calls():
-    # The free tier gives 20 per (project, model); the nightly gate (JEB-1552)
+    # The free tier gives 20 per (project, model); the live-contract gate (JEB-1552)
     # makes two live calls and must not be locked out by a day of ordinary use.
     assert DEFAULT_DAILY_CAP == 18
     assert daily_cap() == DEFAULT_DAILY_CAP
