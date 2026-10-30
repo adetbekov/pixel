@@ -3,14 +3,12 @@
 import itertools
 from datetime import timedelta
 
-import httpx
 import pytest
 
 from backend import api as api_module
 from backend import state as state_module
 from backend.api import MAX_CHAT_TEXT
 from backend.brain.engine import ScoreResult
-from backend.main import app
 from backend.state import (
     EFFECTS,
     RobotState,
@@ -36,20 +34,6 @@ REPLY_KEYS = {
     # never heard of it is unaffected, which is the whole point (JEB-1603).
     "teacher_status",
 }
-
-
-@pytest.fixture()
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture()
-async def client(conn):
-    # The `conn` fixture already pointed the module-level connection at a tmp
-    # database, so the app's lifespan is deliberately not run here.
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        yield async_client
 
 
 def assert_reply(body: dict, engine: str) -> None:

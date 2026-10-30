@@ -18,7 +18,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
+from google.genai import errors
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github" / "scripts" / "check_live_gemini_contract.py"
@@ -112,7 +114,6 @@ def test_a_raising_call_is_a_finding_naming_the_exception():
 
 def quota_error():
     """The exact refusal the free tier answers with once the day is spent."""
-    errors = pytest.importorskip("google.genai.errors")
     return errors.ClientError(
         429,
         {
@@ -167,7 +168,6 @@ def test_a_quota_refusal_is_not_retried():
 def test_an_api_error_that_is_not_quota_stays_a_finding():
     """Only the quota refusal is exempt: a 500 or a 400 on the shape we call is
     still the call failing, and the gate must keep saying so."""
-    errors = pytest.importorskip("google.genai.errors")
     server_error = errors.ServerError(500, {"error": {"code": 500, "status": "INTERNAL"}})
 
     finding = contract.run(raising_probe(server_error))
@@ -188,13 +188,11 @@ def test_an_api_error_that_is_not_quota_stays_a_finding():
 
 def read_timeout():
     """The transport failure seen on run 36801077007, verbatim message."""
-    httpx = pytest.importorskip("httpx")
     return httpx.ReadTimeout("The read operation timed out")
 
 
 def overloaded_error():
     """The other half of that run: the model is up, but has no capacity now."""
-    errors = pytest.importorskip("google.genai.errors")
     return errors.ServerError(
         503,
         {
@@ -234,7 +232,6 @@ def test_an_overloaded_model_is_not_a_contract_finding():
 def test_a_bad_request_stays_a_finding():
     """The call shape itself being rejected is exactly what this gate watches
     for, so a 400 must not be swept into "not checked" with the refusals."""
-    errors = pytest.importorskip("google.genai.errors")
     bad_request = errors.ClientError(
         400,
         {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "response_schema"}},
@@ -311,7 +308,6 @@ def test_one_bad_answer_beside_an_unanswered_call_is_unchecked():
 
 def test_a_timed_out_night_exits_two(monkeypatch, capsys):
     monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
-    pytest.importorskip("google.genai")
 
     monkeypatch.setattr(
         contract, "PROBES", (raising_probe(read_timeout()), raising_probe(overloaded_error()))
@@ -326,7 +322,6 @@ def test_a_crash_in_the_harness_exits_three_not_one(monkeypatch, capsys):
     escaping it is this script misbehaving — which says nothing about the model's
     answers and must not be reported as a finding."""
     monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
-    pytest.importorskip("google.genai")
 
     def not_a_parser(_raw):
         raise TypeError("the harness called the parser wrong")
@@ -361,7 +356,6 @@ def test_cli_never_lets_a_traceback_leave_as_a_finding(monkeypatch, capsys):
 
 def test_cli_passes_a_normal_verdict_through(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
-    pytest.importorskip("google.genai")
 
     monkeypatch.setattr(contract, "PROBES", (probe(GOOD_PLAN),))
     assert contract.cli() == contract.EXIT_OK
@@ -461,7 +455,6 @@ def test_an_unreachable_model_exits_two_and_a_finding_still_wins(monkeypatch, ca
     """Two shapes, two verdicts. Nothing checked is exit 2; one shape proving the
     contract broke is worth alerting on even when the other never ran."""
     monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
-    pytest.importorskip("google.genai")
 
     monkeypatch.setattr(contract, "PROBES", (raising_probe(quota_error()),))
     assert contract.main() == 2
@@ -529,7 +522,6 @@ def test_a_finding_exits_one_and_a_healthy_pair_exits_zero(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key-and-never-sent")
     # `google-genai` is a runtime dependency of this repo, so the import guard in
     # `main` is satisfied here without a network or a real key.
-    pytest.importorskip("google.genai")
 
     monkeypatch.setattr(contract, "PROBES", (probe(GOOD_PLAN),))
     assert contract.main() == 0
@@ -540,58 +532,15 @@ def test_a_finding_exits_one_and_a_healthy_pair_exits_zero(monkeypatch):
 
 # --- JEB-1601: the gate's own environment -----------------------------------
 #
-# The probe's verdict was tested above; what was not, and what took the nightly
+# The probe's verdict was tested above; what was not, and what took the gate
 # down on its first execution ever, is whether the job can reach that verdict at
 # all. `schedule:` and `workflow_dispatch` resolve only from the default branch,
 # so the file first executed on `main` — and died on `import numpy`, four modules
 # below `backend.miner.case`, which the install step's hand-typed list never
-# mentioned because the script never names it.
-
-REQUIREMENTS_SCRIPT = ROOT / ".github" / "scripts" / "live_contract_requirements.py"
-
-_req_spec = importlib.util.spec_from_file_location(
-    "live_contract_requirements", REQUIREMENTS_SCRIPT
-)
-requirements = importlib.util.module_from_spec(_req_spec)
-sys.modules[_req_spec.name] = requirements
-_req_spec.loader.exec_module(requirements)
-
-
-def project_dependencies() -> list[str]:
-    import tomllib
-
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    return pyproject["project"]["dependencies"]
-
-
-def test_the_nightly_installs_every_project_dependency_but_the_excluded_ones():
-    """The list is pyproject's, not a remembered one. numpy is the regression:
-    it is a project dependency, it is imported transitively by the probe, and it
-    was the module the gate died on."""
-    nightly = requirements.requirements(ROOT / "pyproject.toml")
-    installed = {requirements.requirement_name(spec) for spec in nightly}
-    declared = {requirements.requirement_name(spec) for spec in project_dependencies()}
-
-    assert installed == declared - requirements.EXCLUDED
-    assert "numpy" in installed
-    assert "laya" not in installed
-
-
-def test_the_exclusion_list_stays_justified():
-    """Only laya is dropped, and only because torch is a gigabyte. Anything added
-    to EXCLUDED has to be argued from the import graph — this test is the place
-    that stops it from being argued from convenience."""
-    assert requirements.EXCLUDED == frozenset({"laya"})
-
-
-def test_requirement_specifiers_are_passed_through_verbatim():
-    """A pin dropped on the way into the nightly would let it run against an SDK
-    line the app is not on — the drift the old step's comment already worried
-    about. So the strings are copied, not rebuilt from names."""
-    installed = requirements.requirements(ROOT / "pyproject.toml")
-
-    assert [spec for spec in project_dependencies() if not spec.startswith("laya")] == installed
-    assert any(spec.startswith("google-genai>=") for spec in installed)
+# mentioned because the script never names it. The install is `uv sync --frozen
+# --no-dev` now — the locked project dependencies, nothing typed by hand — and
+# the two tests below pin the two halves of that: nothing on the probe's path
+# needs the `engine` extra it leaves out, and the workflow installs nothing else.
 
 
 def test_check_imports_resolves_without_a_key(monkeypatch, capsys):
@@ -604,7 +553,7 @@ def test_check_imports_resolves_without_a_key(monkeypatch, capsys):
 
 
 def test_nothing_the_probe_imports_needs_laya():
-    """Why the nightly may skip laya (and its ~1 GB of torch): no module on the
+    """Why the gate may skip laya (and its ~1 GB of torch): no module on the
     probe's import path says `import laya` at import time. `backend/brain/engine.py`
     keeps those imports inside the two methods that load a model, and this asserts
     that invariant from the outside — in a subprocess, because the dev environment
@@ -635,30 +584,17 @@ runpy.run_path({str(SCRIPT)!r}, run_name="__main__")
     assert "imports resolve" in result.stdout
 
 
-def test_both_workflows_install_from_the_same_script():
-    """The PR check is only evidence about the nightly while both install the
-    same way. Two copies of an install step drift, and the drift would be
-    invisible until the nightly ran — which is the failure mode itself."""
-    nightly = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
-    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
-    reference = ".github/scripts/live_contract_requirements.py"
-
-    assert reference in nightly
-    assert reference in ci
-    assert "--check-imports" in ci
-
-
-def test_the_nightly_does_not_name_packages_by_hand():
+def test_the_gate_installs_the_locked_project_and_names_no_package_by_hand():
     """The defect in one line: the install step listed what the author remembered
-    the script imports. If a package name reappears in a `pip install` there, the
-    single source is gone again."""
-    nightly = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
-    install_commands = [
-        line
-        for line in nightly.splitlines()
-        if "pip install" in line and not line.lstrip().startswith("#")
+    the script imports. The lockfile is the single source now — so the only
+    install in the workflow is `uv sync --frozen --no-dev` (project dependencies,
+    no `engine` extra), and no `pip install` or extra name reappears beside it."""
+    workflow = (ROOT / ".github" / "workflows" / "live-gemini-contract.yml").read_text()
+    commands = [
+        line.strip()
+        for line in workflow.splitlines()
+        if ("install" in line or "uv sync" in line) and not line.lstrip().startswith("#")
     ]
 
-    assert install_commands
-    for line in install_commands:
-        assert "-r live-contract-requirements.txt" in line, line
+    assert "run: uv sync --frozen --no-dev" in commands
+    assert not [c for c in commands if "pip install" in c or "--extra" in c], commands

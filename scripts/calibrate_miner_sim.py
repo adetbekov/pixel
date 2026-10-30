@@ -233,8 +233,7 @@ def report_sweep(vectors: np.ndarray, labels: list[str], trials: int = 200) -> N
         purity = f"{tally['pure'] / tally['groups']:.3f}" if tally["groups"] else "  -  "
         recall = tally["found"] / tally["present"] if tally["present"] else 0.0
         print(
-            f"  {threshold:.2f}   {purity}   {recall:.3f}   "
-            f"{tally['groups'] / tally['runs']:.2f}"
+            f"  {threshold:.2f}   {purity}   {recall:.3f}   {tally['groups'] / tally['runs']:.2f}"
         )
     print("  pick the lowest threshold whose purity is 1.0: below it the miner pays for mistakes")
 

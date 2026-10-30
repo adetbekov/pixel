@@ -394,7 +394,8 @@ def _taken_ids(conn: sqlite3.Connection) -> set[str]:
     `accept_proposal` overwrites the disabled row when the retry is accepted.
     """
     # `IS NOT`, not `!=`: a row with a NULL status must read as taken, not free.
-    ids = {row["id"] for row in conn.execute("SELECT id FROM skills WHERE status IS NOT 'disabled'")}
+    live = conn.execute("SELECT id FROM skills WHERE status IS NOT 'disabled'")
+    ids = {row["id"] for row in live}
     for row in conn.execute("SELECT skill_json FROM skill_proposals WHERE status = 'pending'"):
         try:
             ids.add(json.loads(row["skill_json"])["id"])

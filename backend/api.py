@@ -492,9 +492,7 @@ def post_feedback(payload: FeedbackIn) -> dict:
     """
     conn = db.get_conn()
     with db.lock:
-        known = feedback.record(
-            conn, interaction_id=payload.interaction_id, value=payload.value
-        )
+        known = feedback.record(conn, interaction_id=payload.interaction_id, value=payload.value)
     if not known:
         raise HTTPException(status_code=404, detail="unknown interaction_id")
     return {"ok": True}
@@ -631,9 +629,7 @@ def accept_proposal(proposal_id: str) -> dict:
             raise HTTPException(status_code=422, detail="the proposed skill no longer validates")
         # Only a row that says `disabled` may be overwritten — a NULL status is
         # not a free id, it is a row nobody can vouch for.
-        existing = conn.execute(
-            "SELECT status FROM skills WHERE id = ?", (skill.id,)
-        ).fetchone()
+        existing = conn.execute("SELECT status FROM skills WHERE id = ?", (skill.id,)).fetchone()
         if existing is not None and existing["status"] != "disabled":
             raise HTTPException(status_code=409, detail=f"skill {skill.id} already exists")
 

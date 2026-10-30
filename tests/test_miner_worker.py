@@ -8,11 +8,9 @@ parked is an answer that did not wait for it. No sleeps, no thresholds.
 import json
 import threading
 
-import httpx
 import pytest
 
 from backend.brain.engine import set_engine
-from backend.main import app
 from backend.miner import MineResult, request_mine, stop_worker, wait_idle
 from backend.miner import worker as miner_worker
 from backend.miner.case import (
@@ -46,18 +44,6 @@ TEACHER_REPLY = json.dumps(
     },
     ensure_ascii=False,
 )
-
-
-@pytest.fixture()
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture()
-async def client(seeded):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        yield async_client
 
 
 @pytest.fixture()

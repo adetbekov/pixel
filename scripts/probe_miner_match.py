@@ -296,9 +296,7 @@ def main() -> None:
                 for case in group
             ]
             results[name].append(
-                report_backtest(
-                    engine, active, candidate, cases, taught["leftovers"], neighbours
-                )
+                report_backtest(engine, active, candidate, cases, taught["leftovers"], neighbours)
             )
 
     report_calibration(results)
